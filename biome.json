@@ -1,0 +1,5 @@
+{
+  "files": { "includes": ["src/**/*.ts", "test/**/*.ts", "client/**/*.ts"] },
+  "linter": { "enabled": true },
+  "formatter": { "enabled": true }
+}

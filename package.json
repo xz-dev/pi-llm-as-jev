@@ -1,0 +1,35 @@
+{
+  "name": "pi-llm-as-jev",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "description": "Shared Jev-compatible judgment service and LLM classifier for Pi extensions.",
+  "engines": { "node": ">=22.19.0" },
+  "keywords": ["pi-package", "pi-extension", "classifier"],
+  "pi": { "extensions": ["./src/index.ts"] },
+  "files": ["src", "client", "README.md"],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.check.json",
+    "lint": "biome check src test",
+    "format": "biome format --write src test",
+    "test": "tsx --test",
+    "check": "npm run lint && npm run typecheck && npm run test && npm run build"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "1.0.0",
+    "@earendil-works/pi-coding-agent": "1.0.0",
+    "@earendil-works/pi-tui": "1.0.0",
+    "@biomejs/biome": "^2.5.12",
+    "@types/node": "^26.5.0",
+    "tsx": "^4.23.13",
+    "typebox": "^1.3.7",
+    "typescript": "^7.0.2"
+  }
+}

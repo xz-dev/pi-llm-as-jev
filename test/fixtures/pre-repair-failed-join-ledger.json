@@ -1,0 +1,35 @@
+[
+  {
+    "kind": "diag",
+    "backend": "classifier",
+    "model": "native/kev",
+    "hits": 0,
+    "joined": 0,
+    "sent": 1,
+    "inputTokens": 0,
+    "outputTokens": 0,
+    "outcome": "error"
+  },
+  {
+    "kind": "judgment",
+    "key": "96e6eb128ea71284d40385498e9f1d34d18b78440519f47391b3486953cdc018",
+    "answer": {
+      "type": "bool",
+      "probability": 0.9
+    },
+    "backend": "classifier",
+    "model": "native/kev",
+    "thinkingLevel": "none"
+  },
+  {
+    "kind": "diag",
+    "backend": "classifier",
+    "model": "native/kev",
+    "hits": 0,
+    "joined": 1,
+    "sent": 0,
+    "inputTokens": 0,
+    "outputTokens": 0,
+    "outcome": "stop"
+  }
+]

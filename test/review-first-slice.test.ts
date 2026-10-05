@@ -1,27 +1,21 @@
 /**
- * Focused first-slice regressions for the additive native review path
- * (`reviewVersion: 1` / `review()`), tasks 1.1/1.2/2.1/2.2/3.3 (slice):
- * two evidence stages succeed, the third fails; a same-branch reload
- * processes only unresolved work; a failed review returns empty final
- * answers; honest attempt diagnostics come from the adapter's actual
- * observation contract (start/end + result.observation), with per-field
- * missing usage kept unknown; durable stage checkpoints are acknowledged
- * only after validated answer writes; legacy `judge` stays unchanged.
+ * Review lifecycle unit tests through a scripted public fetch/classify port.
+ * These fixtures do not implement cache, subdivision or recovery. Actual Pi
+ * transport evidence lives in the source-linked audit suites and host smoke.
  */
-
 import assert from "node:assert/strict";
 import test from "node:test";
-import type {
-	ClassifierAnswer,
-	JudgeRequest,
-} from "../client/judgment-client.ts";
+import type { JudgeRequest } from "../client/judgment-client.ts";
 import { validateConfig } from "../src/config.ts";
 import { LEDGER_TYPE, type LedgerRecord } from "../src/ledger.ts";
 import { createJudgmentService, type ServiceRegistry } from "../src/service.ts";
 
 type AnyClassifierModel = Parameters<ServiceRegistry["classify"]>[0];
 type NativeResult = Awaited<ReturnType<ServiceRegistry["classify"]>>;
-
+type WireContext = {
+	state: Record<string, unknown>;
+	questions: Record<string, unknown>;
+};
 const q = {
 	type: "bool" as const,
 	instructions: "condition?",
@@ -38,51 +32,29 @@ const model: AnyClassifierModel = {
 	contextWindow: 100000,
 	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 };
-const ans: ClassifierAnswer = { type: "bool", probability: 0.9 };
+const answered = (ids: string[]): NativeResult => ({
+	api: model.api,
+	provider: model.provider,
+	model: model.id,
+	answers: Object.fromEntries(
+		ids.map((id) => [id, { type: "bool" as const, probability: 0.9 }]),
+	),
+	stopReason: "stop",
+	timestamp: Date.now(),
+});
+const response = (ids: string[], usage?: Record<string, number>) =>
+	Response.json({
+		answers: Object.fromEntries(
+			ids.map((id) => [id, { type: "noul", noul: 0.9 }]),
+		),
+		...(usage ? { usage } : {}),
+	});
 
-/** Shape mirroring the verified Pi observation contract (types.ts v1). */
-interface ObservedNativeResult extends NativeResult {
-	observation?: {
-		version: 1;
-		attempts: number;
-		partialAnswers: Record<string, ClassifierAnswer>;
-		unresolved: string[];
-	};
-}
-
-interface AttemptEvent {
-	version: 1;
-	phase: "start" | "end";
-	attempt: number;
-	outcome?: "response" | "network" | "timeout" | "aborted";
-	status?: number;
-	model?: string;
-	inputTokensPresent?: boolean;
-	outputTokensPresent?: boolean;
-	costUsdPresent?: boolean;
-	inputTokens?: number;
-	outputTokens?: number;
-	costUsd?: number;
-	errorCategory?: string;
-	complete?: boolean;
-	partialAnswers?: Record<string, ClassifierAnswer>;
-	unresolved?: string[];
-}
-
-/**
- * Harness with a scriptable classify that emulates the patched Pi adapter:
- * forwards observe/onAttempt through a request-owned collector and returns
- * result.observation. `review()` must consume BOTH.
- */
 function harness(setup: {
-	classify: (
-		model: AnyClassifierModel,
-		context: {
-			state: Record<string, unknown>;
-			questions: Record<string, unknown>;
-		},
-		options: { onAttempt?: (event: AttemptEvent) => void; observe?: true },
-	) => Promise<ObservedNativeResult>;
+	reply?: (context: WireContext) => Response | Promise<Response>;
+	ignoreFetch?: boolean;
+	api?: AnyClassifierModel["api"];
+	onAppend?: (row: LedgerRecord) => void;
 }) {
 	const config = validateConfig({
 		mode: "classifier",
@@ -90,33 +62,78 @@ function harness(setup: {
 		timeoutMs: 1000,
 	}).config;
 	const rows: LedgerRecord[] = [];
-	const events: AttemptEvent[] = [];
 	let branch: unknown[] = [];
+	const nativeFetch: typeof globalThis.fetch = async (url, init) => {
+		assert.equal(String(url), "https://fixture.invalid/systemone");
+		return setup.reply?.(JSON.parse(String(init?.body))) ?? response([]);
+	};
 	const registry: ServiceRegistry = {
-		getAvailableOfType: async () => [model],
+		getAvailableOfType: async () => [{ ...model, api: setup.api ?? model.api }],
 		getModel: () => undefined,
 		getAuth: async () => undefined,
 		getProviders: () => [],
-		// The review path must pass observe/onAttempt through to the adapter
-		// (options the structural registry type does not know about).
-		classify: async (m, ctx, options) =>
-			(await setup.classify(
-				m as never,
-				ctx as never,
-				options as never,
-			)) as never,
+		classify: async (_model, context, options) => {
+			assert.equal(Object.hasOwn(options ?? {}, "observe"), false);
+			assert.equal(Object.hasOwn(options ?? {}, "onAttempt"), false);
+			const ids = Object.keys(context.questions);
+			if (setup.ignoreFetch)
+				return {
+					...answered(ids),
+					observation: { version: 1, attempts: 0, partialAnswers: {} },
+				} as NativeResult;
+			const request = {
+				...context,
+				questions: Object.fromEntries(
+					Object.entries(context.questions).map(([id, question]) => [
+						id,
+						question.type === "bool" ? { ...question, type: "noul" } : question,
+					]),
+				),
+			};
+			const http = await (options?.fetch ?? nativeFetch)(
+				"https://fixture.invalid/systemone",
+				{
+					method: "POST",
+					body: JSON.stringify(request),
+					signal: options?.signal,
+				},
+			);
+			if (!http.ok) {
+				const body = JSON.parse(await http.text());
+				return {
+					...answered([]),
+					stopReason: "error",
+					errorMessage: String(body.error?.code ?? "provider error"),
+				};
+			}
+			const body = await http.json();
+			const complete = ids.every((id) => Object.hasOwn(body.answers ?? {}, id));
+			return complete
+				? answered(ids)
+				: {
+						...answered([]),
+						stopReason: "error",
+						errorMessage: "missing answer",
+					};
+		},
 		streamSimple: () => {
 			throw new Error("offline native fixture must not stream");
 		},
 	};
 	const service = createJudgmentService({
 		registry,
+		nativeFetch,
 		config: () => config,
-		ledger: { append: (_t, row) => rows.push(row), branch: () => branch },
+		ledger: {
+			append: (_type, row) => {
+				setup.onAppend?.(row);
+				rows.push(row);
+			},
+			branch: () => branch,
+		},
 	});
 	return {
 		service,
-		events,
 		rows,
 		setBranch: (entries: unknown[]) => {
 			branch = entries;
@@ -124,26 +141,7 @@ function harness(setup: {
 	};
 }
 
-const evidence = (id: string): { id: string; text: string } => ({
-	id,
-	text: `${id} recorded findings`,
-});
-
-const answered = (
-	ids: string[],
-	extra: Partial<ObservedNativeResult> = {},
-): ObservedNativeResult => ({
-	api: model.api,
-	provider: model.provider,
-	model: model.id,
-	answers: Object.fromEntries(ids.map((id) => [id, ans])),
-	stopReason: "stop",
-	timestamp: Date.now(),
-	observation: { version: 1, attempts: 1, partialAnswers: {}, unresolved: [] },
-	...extra,
-});
-
-/** Build a three-stage request where the third stage fails once. */
+const evidence = (id: string) => ({ id, text: `${id} recorded findings` });
 function threeStageRequest(): JudgeRequest {
 	return {
 		state: { task: "parser" },
@@ -157,105 +155,39 @@ function threeStageRequest(): JudgeRequest {
 }
 
 test("review: discovery is separately visible and judge keeps version 1 behavior", async () => {
-	const h = harness({
-		classify: async (_m, ctx) => {
-			const ids = Object.keys(ctx.questions);
-			return answered(ids);
-		},
-	});
-	const service = h.service as unknown as {
-		version: number;
-		reviewVersion?: number;
-		judge: unknown;
-		review: unknown;
-	};
-	assert.equal(service.version, 1);
-	assert.equal(service.reviewVersion, 1);
-	assert.equal(typeof service.judge, "function");
-	assert.equal(typeof service.review, "function");
+	const h = harness({ reply: (ctx) => response(Object.keys(ctx.questions)) });
+	assert.equal(h.service.version, 1);
+	assert.equal(h.service.reviewVersion, 1);
+	assert.equal(typeof h.service.judge, "function");
+	assert.equal(typeof h.service.review, "function");
 });
 
 test("review: failed stage returns empty final answers, keeps durable committed stages, reload sends only unresolved", async () => {
 	let failThird = true;
 	const requests: string[][] = [];
 	const h = harness({
-		classify: async (_m, ctx, options) => {
-			const ids = Object.keys(ctx.questions);
-			const evidence =
+		reply: (ctx) => {
+			const frames =
 				(ctx.state as { evidence?: { id: string }[] }).evidence ?? [];
-			const idsSeen = evidence.map((e) => e.id);
+			const idsSeen = frames.map((e) => e.id);
 			requests.push(idsSeen);
-			if (idsSeen.length > 1) {
-				options.onAttempt?.({ version: 1, phase: "start", attempt: 1 });
-				options.onAttempt?.({
-					version: 1,
-					phase: "end",
-					attempt: 1,
-					outcome: "response",
-					status: 400,
-					errorCategory: "overflow",
-				});
-				return answered([], {
-					stopReason: "error",
-					errorMessage: "context_length_exceeded",
-				});
-			}
-			const third = idsSeen.some((id) => id.startsWith("stage-three"));
-			if (failThird && third) {
-				options.onAttempt?.({ version: 1, phase: "start", attempt: 1 });
-				options.onAttempt?.({
-					version: 1,
-					phase: "end",
-					attempt: 1,
-					outcome: "response",
-					status: 400,
-					inputTokensPresent: true,
-					outputTokensPresent: false,
-					costUsdPresent: false,
-					inputTokens: 7,
-					errorCategory: "validation",
-					complete: false,
-					partialAnswers: {},
-					unresolved: ids,
-				});
-				return {
-					api: model.api,
-					provider: model.provider,
-					model: model.id,
-					answers: {},
-					stopReason: "error" as const,
-					errorMessage:
-						'System One API error (400): {"error":{"code":"invalid_payload"}}',
-					timestamp: Date.now(),
-					observation: {
-						version: 1,
-						attempts: 1,
-						partialAnswers: {},
-						unresolved: ids,
-					},
-				};
-			}
-			options.onAttempt?.({ version: 1, phase: "start", attempt: 1 });
-			options.onAttempt?.({
-				version: 1,
-				phase: "end",
-				attempt: 1,
-				outcome: "response",
-				status: 200,
-				inputTokensPresent: true,
-				outputTokensPresent: true,
-				costUsdPresent: false,
-				inputTokens: 10,
-				outputTokens: 2,
-				complete: true,
-				partialAnswers: Object.fromEntries(ids.map((id) => [id, ans])),
-				unresolved: [],
+			if (idsSeen.length > 1)
+				return Response.json(
+					{ error: { code: "context_length_exceeded" } },
+					{ status: 400 },
+				);
+			if (failThird && idsSeen.some((id) => id.startsWith("stage-three")))
+				return Response.json(
+					{ error: { code: "invalid_payload" }, usage: { input_tokens: 7 } },
+					{ status: 400 },
+				);
+			return response(Object.keys(ctx.questions), {
+				input_tokens: 10,
+				output_tokens: 2,
 			});
-			return answered(ids);
 		},
 	});
 	const first = await h.service.review(threeStageRequest());
-	// Explicit provider overflow creates stages; the service must not impose record quotas.
 	assert.equal(first.stopReason, "error");
 	assert.deepEqual(first.answers, {});
 	assert.ok(
@@ -268,8 +200,6 @@ test("review: failed stage returns empty final answers, keeps durable committed 
 		first.diagnostics.attemptCount,
 	);
 	assert.ok(first.diagnostics.attemptCount >= 3);
-
-	// Reload: durable progress restored from the branch; only stage-three dispatches.
 	h.setBranch(
 		h.rows.map((data) => ({ type: "custom", customType: LEDGER_TYPE, data })),
 	);
@@ -299,28 +229,11 @@ test("review: failed stage returns empty final answers, keeps durable committed 
 test("review: diagnostics report actual attempts with per-field known sums and missing counts", async () => {
 	let calls = 0;
 	const h = harness({
-		classify: async (_m, ctx, options) => {
+		reply: (ctx) => {
 			calls++;
-			const ids = Object.keys(ctx.questions);
-			options.onAttempt?.({ version: 1, phase: "start", attempt: 1 });
-			options.onAttempt?.({
-				version: 1,
-				phase: "end",
-				attempt: 1,
-				outcome: "response",
-				status: 200,
-				inputTokensPresent: true,
-				outputTokensPresent: false,
-				costUsdPresent: false,
-				inputTokens: 10,
-				complete: true,
-				partialAnswers: Object.fromEntries(ids.map((id) => [id, ans])),
-				unresolved: [],
-			});
-			return answered(ids);
+			return response(Object.keys(ctx.questions), { input_tokens: 10 });
 		},
 	});
-	// Two questions in one batch distinguish question sends from transport attempts.
 	const result = await h.service.review({
 		state: {},
 		questions: { q, second: q },
@@ -336,102 +249,139 @@ test("review: diagnostics report actual attempts with per-field known sums and m
 	);
 	assert.equal(usage.outputTokens.knownSum, 0);
 	assert.equal(usage.costUsd.missing, 1);
-	// reuse.sent counts questions, never transport attempts.
 	assert.equal(result.diagnostics.attemptCount, 1);
 	assert.notEqual(result.reuse.sent, result.diagnostics.attemptCount);
 });
 
-test("review: adapter without observation support fails explicitly with no fake counts", async () => {
-	const h = harness({
-		classify: async (_m, ctx) => {
-			const ids = Object.keys(ctx.questions);
-			// Unpatched adapter: no observation, no onAttempt acknowledgement.
-			const { observation: _drop, ...rest } = answered(ids);
-			void _drop;
-			return rest as ObservedNativeResult;
-		},
-	});
+for (const status of [200, 400]) {
+	for (const envelope of [
+		"direct-failed",
+		"nested-failed",
+		"failed-state",
+		"running-state",
+	]) {
+		for (const input of [17, undefined]) {
+			test(`review: Cloudflare ${envelope} HTTP ${status} retains metering (${input}) without answers or coverage`, async () => {
+				let calls = 0;
+				const h = harness({
+					api: "cloudflare-workers-ai-system-one",
+					reply: () => {
+						calls++;
+						const payload = {
+							model: "jev-reported",
+							answers: { q: { type: "noul", noul: 0.9 } },
+							usage: { input_tokens: input, output_tokens: 0, cost: 0.004 },
+						};
+						return Response.json(
+							{
+								success:
+									envelope === "failed-state" || envelope === "running-state",
+								result:
+									envelope === "direct-failed"
+										? payload
+										: {
+												state:
+													envelope === "running-state" ? "Running" : "Failed",
+												result: payload,
+											},
+								errors: [{ code: "invalid_request" }],
+							},
+							{ status },
+						);
+					},
+				});
+				const request = { state: {}, questions: { q } };
+				const result = await h.service.review(request);
+				assert.equal(result.stopReason, "error");
+				assert.deepEqual(result.answers, {});
+				assert.deepEqual(result.unresolved, ["q"]);
+				assert.deepEqual(result.progress.stages, []);
+				assert.equal(result.diagnostics.attemptCount, 1);
+				assert.deepEqual(result.diagnostics.usage.inputTokens, {
+					knownSum: input ?? 0,
+					missing: input === undefined ? 1 : 0,
+				});
+				assert.deepEqual(result.diagnostics.usage.outputTokens, {
+					knownSum: 0,
+					missing: 0,
+				});
+				assert.deepEqual(result.diagnostics.usage.costUsd, {
+					knownSum: 0.004,
+					missing: 0,
+				});
+				const row = h.rows.find(
+					(row) => row.kind === "review-attempt" && row.attempt.phase === "end",
+				);
+				assert.ok(row?.kind === "review-attempt");
+				assert.equal(row.attempt.model, "jev-reported");
+				assert.equal(row.attempt.inputTokens, input);
+				assert.equal(row.attempt.outputTokens, 0);
+				assert.equal(row.attempt.costUsd, 0.004);
+				assert.ok(!h.rows.some((row) => row.kind === "review-stage"));
+				h.setBranch(
+					h.rows.map((data) => ({
+						type: "custom",
+						customType: LEDGER_TYPE,
+						data,
+					})),
+				);
+				h.service.refreshBranch();
+				const repeated = await h.service.review(request);
+				assert.equal(repeated.reuse.hits, 0);
+				assert.deepEqual(repeated.answers, {});
+				assert.equal(
+					calls,
+					2,
+					"failed-envelope answers cannot become cached raw judgments",
+				);
+			});
+		}
+	}
+}
+
+test("review: adapter ignoring public fetch fails explicitly with no fake counts", async () => {
+	const h = harness({ ignoreFetch: true });
 	const result = await h.service.review({ state: {}, questions: { q } });
 	assert.equal(result.stopReason, "error");
 	assert.deepEqual(result.answers, {});
-	assert.match(result.errorMessage ?? "", /observation|capabilit/i);
+	assert.match(result.errorMessage ?? "", /observable|fetch/i);
 	assert.equal(result.diagnostics.attemptCount, 0);
 	assert.deepEqual(result.diagnostics.attempts, []);
 	assert.equal(result.diagnostics.observationCoverage, "unavailable");
 });
 
 test("review: stage append failure is not acknowledged as durable progress", async () => {
-	let appendFails = false;
-	const config = validateConfig({
-		mode: "classifier",
-		classifierModel: "native/kev",
-		timeoutMs: 1000,
-	}).config;
-	const rows: LedgerRecord[] = [];
-	const registry: ServiceRegistry = {
-		getAvailableOfType: async () => [model],
-		getModel: () => undefined,
-		getAuth: async () => undefined,
-		getProviders: () => [],
-		classify: async (_m, ctx, options) => {
-			const ids = Object.keys(ctx.questions);
-			const observer = (
-				options as unknown as { onAttempt?: (e: AttemptEvent) => void }
-			).onAttempt;
-			observer?.({ version: 1, phase: "start", attempt: 1 });
-			observer?.({
-				version: 1,
-				phase: "end",
-				attempt: 1,
-				outcome: "response",
-				status: 200,
-			});
-			return answered(ids) as never;
-		},
-		streamSimple: () => {
-			throw new Error("unused");
-		},
-	};
-	const service = createJudgmentService({
-		registry,
-		config: () => config,
-		ledger: {
-			append: (_t, row) => {
-				if (appendFails && row.kind === "review-stage")
-					throw new Error("append denied");
-				rows.push(row);
-			},
-			branch: () => [],
+	const h = harness({
+		reply: (ctx) => response(Object.keys(ctx.questions)),
+		onAppend: (row) => {
+			if (row.kind === "review-stage") throw new Error("append denied");
 		},
 	});
-	appendFails = true;
-	const result = await service.review(threeStageRequest());
-	// No stage may be published as durable when its checkpoint append failed.
+	const result = await h.service.review(threeStageRequest());
 	assert.ok(
 		result.progress.stages.length > 0,
 		"the completed stage is visible but volatile",
 	);
-	assert.ok(result.progress.stages.every((s) => s.durable !== true));
+	assert.ok(result.progress.stages.every((stage) => stage.durable !== true));
 });
 
 test("review: legacy judge keeps final-only answers and records no stage progress", async () => {
 	let calls = 0;
 	const h = harness({
-		classify: async (_m, ctx) => {
+		reply: (ctx) => {
 			const frames = (ctx.state as { evidence?: unknown[] }).evidence ?? [];
 			if (frames.length > 1)
-				return answered([], {
-					stopReason: "error",
-					errorMessage: "context_length_exceeded",
-				});
+				return Response.json(
+					{ error: { code: "context_length_exceeded" } },
+					{ status: 400 },
+				);
 			calls++;
-			const ids = Object.keys(ctx.questions);
-			return answered(ids);
+			return response(Object.keys(ctx.questions));
 		},
 	});
 	const result = await h.service.judge(threeStageRequest());
 	assert.equal(calls, 3, "judge runs its existing ordered stages");
 	assert.equal(result.stopReason, "stop");
 	assert.ok(!("progress" in result) || result.progress === undefined);
-	assert.ok(!h.rows.some((r) => r.kind === "review-stage"));
+	assert.ok(!h.rows.some((row) => row.kind === "review-stage"));
 });

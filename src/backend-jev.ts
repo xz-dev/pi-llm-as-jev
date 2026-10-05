@@ -20,6 +20,7 @@ import type {
 	ClassifierContext,
 	ClassifierResult,
 } from "@earendil-works/pi-ai";
+import { observeNativeFetch } from "./native-observations.js";
 import { EMULATED_PROVIDER_ID } from "./provider.js";
 
 /** Any classifier model regardless of api. */
@@ -46,7 +47,11 @@ export interface JevRegistry {
 	classify(
 		model: AnyClassifierModel,
 		context: ClassifierContext,
-		options?: { signal?: AbortSignal; timeoutMs?: number },
+		options?: {
+			signal?: AbortSignal;
+			timeoutMs?: number;
+			fetch?: typeof globalThis.fetch;
+		},
 	): Promise<ClassifierResult>;
 }
 
@@ -57,15 +62,12 @@ export interface JevClassifyOptions {
 	signal?: AbortSignal;
 	/** Deadline shared across discovery and classification, not reset per leaf. */
 	timeoutMs?: number;
-	/**
-	 * Review-only adapter observation passthrough (reviewVersion 1): opts
-	 * into Pi's versioned attempt-observation contract. Legacy `judge`
-	 * dispatches never set these. Structural optional fields keep this
-	 * compatible with the pinned peer type surface.
-	 */
+	/** Plugin-owned review metadata. These fields are never sent to Pi. */
 	observe?: true;
-	/** Synchronous adapter observation callback; failures stay isolated. */
+	/** Synchronous diagnostic callback; failures stay isolated. */
 	onAttempt?: (event: never) => void;
+	/** Public HTTP transport seam; defaults to global fetch. */
+	fetch?: typeof globalThis.fetch;
 }
 
 /**
@@ -482,15 +484,35 @@ async function classifySelected(
 	const remaining =
 		deadline !== null ? deadline - Date.now() : Number.POSITIVE_INFINITY;
 	if (expired() || remaining <= 0) return timeoutError();
+	if (options?.observe) {
+		const observed = observeNativeFetch(model, context, { ...options, signal });
+		try {
+			return observed.finish(
+				await classifySelected(
+					registry,
+					model,
+					context,
+					{
+						...options,
+						observe: undefined,
+						onAttempt: undefined,
+						fetch: observed.fetch,
+					},
+					deadline,
+					signal,
+					expired,
+				),
+			);
+		} finally {
+			observed.close();
+		}
+	}
 	let classification: Promise<ClassifierResult>;
 	try {
 		classification = registry.classify(model, context, {
 			signal,
 			timeoutMs: Number.isFinite(remaining) ? remaining : undefined,
-			...(options?.observe !== undefined ? { observe: options.observe } : {}),
-			...(options?.onAttempt !== undefined
-				? { onAttempt: options.onAttempt as never }
-				: {}),
+			...(options?.fetch ? { fetch: options.fetch } : {}),
 		});
 	} catch (error) {
 		if (options?.signal?.aborted) {

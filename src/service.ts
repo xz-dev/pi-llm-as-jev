@@ -126,6 +126,8 @@ export interface ServiceRuntime {
 	registry: ServiceRegistry;
 	config: () => JudgmentConfig;
 	ledger: LedgerHooks;
+	/** Optional embedding transport, forwarded through Pi's public native fetch option. */
+	nativeFetch?: typeof globalThis.fetch;
 	/** Fresh secrets snapshot; recomputed lazily by the lifecycle hook. */
 	secrets?: () => readonly string[];
 }
@@ -1307,7 +1309,13 @@ export function createJudgmentService(runtime: ServiceRuntime): CreatedService {
 					runtime.registry,
 					model as AnyClassifierModel,
 					context,
-					{ signal: opts.signal, timeoutMs, observe: true, onAttempt },
+					{
+						signal: opts.signal,
+						timeoutMs,
+						observe: true,
+						onAttempt,
+						fetch: runtime.nativeFetch,
+					},
 				)) as ClassifierResult & {
 					observation?: {
 						version: number;
@@ -1331,7 +1339,7 @@ export function createJudgmentService(runtime: ServiceRuntime): CreatedService {
 						answers: {},
 						stopReason: "error",
 						errorMessage:
-							"selected classifier adapter lacks attempt-observation capability version 1",
+							"selected classifier adapter lacks observable HTTP attempts through Pi's public fetch option",
 					};
 				}
 				if (result.stopReason === "error") {

@@ -1,5 +1,7 @@
 # Local migration candidate acceptance
 
+Historical R2 snapshot: the approval and hashes below remain evidence for that candidate. The later released-host compatibility fix replaces its private Pi observation prerequisite with the public classifier `fetch` hook; see `PLAN/released-host-classifier-compatibility.md`. R2 approval is not approval of that follow-up diff.
+
 Implementation and independent **offline** acceptance are complete. The final reviewer approved R2 with explicit residual risk and closed F1/F2; this is not installed rollout or user/business acceptance. No new live inference, publication, commit/push or archive is included.
 
 ## Independent approval and final delivery

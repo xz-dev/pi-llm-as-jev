@@ -239,14 +239,20 @@ missing observations is only a lower bound. `usage.costUsd` is provider-reported
 charge; optional `catalogCostUsd` is a separate estimate. Cache hits/joins add no
 new owner charge. Native adapters need not report a catalog estimate.
 
-Native reviews require Pi classifier observation version one. Pi owns native
-transport/authentication and its bounded retries. LLM reviews use Pi's injected
-fetch and provider-event seams, `transport: "sse"`, and `maxRetries: 0`. A route
-that ignores those seams or cannot correlate its events fails accounting rather
-than switching models/backends or inventing a request count. Offline acceptance
-covers the actual patched native adapter and Anthropic HTTP/SSE path; it is not a
-claim that every provider route supports observable reviews. Legacy `judge()`
-does not require these observation capabilities.
+Native reviews use the released classifier API's public `fetch` option. This
+plugin records each actual fetch and inspects the response as Pi consumes it;
+validated independent answer members can be retained without changing Pi's
+strict final result. **No private `observe`/`onAttempt` API or Pi core patch is
+required.** Pi still owns request construction, authentication and bounded native
+retries. The classifier API is supplied by the xz-dev fork; this is not a claim
+that stock Pi exposes that API.
+
+LLM reviews use Pi's injected fetch and provider-event seams, `transport: "sse"`,
+and `maxRetries: 0`. A route that ignores the required public hooks or cannot
+correlate events fails accounting rather than switching models/backends or
+inventing a request count. Offline checks cover actual System One and Anthropic
+HTTP/SSE paths, not every provider route. Legacy `judge()` does not require
+review accounting capabilities.
 
 ## Threshold policy (native classifiers only)
 
@@ -416,8 +422,8 @@ selection, policy, raw cache, capacity/recovery and judgment/attempt storage;
 Pi owns provider transport/authentication. Old audit `model`, `apiUrl`, `apiKey`,
 `apiKeyEnvVar` and `contextLimits` load but are ignored, with field-name-only
 notices. No credential import or automatic configuration rewrite occurs.
-Configure selection/limits here and endpoints/credentials in Pi before a future
-rollout; a missing/incompatible service makes audit skip with a dependency notice,
+Configure selection/limits here and endpoints/credentials in Pi before enabling
+audits in an installed host; a missing/incompatible service makes audit skip with a dependency notice,
 without disabling ordinary TODO/main-agent work.
 
 Watchdog migration is separate and has not been performed by this change.

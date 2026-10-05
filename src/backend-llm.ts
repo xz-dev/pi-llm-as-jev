@@ -43,6 +43,10 @@ export interface LlmRegistry {
 			signal?: AbortSignal;
 			timeoutMs?: number;
 			toolChoice?: "auto" | "none";
+			maxRetries?: number;
+			transport?: "sse";
+			fetch?: typeof globalThis.fetch;
+			onProviderStreamEvent?: (data: unknown, model: AnyModel) => void;
 			reasoning?: Exclude<JudgmentThinkingLevel, "off">;
 		},
 	): { result(): Promise<AssistantMessage> };

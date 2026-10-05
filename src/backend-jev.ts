@@ -57,6 +57,15 @@ export interface JevClassifyOptions {
 	signal?: AbortSignal;
 	/** Deadline shared across discovery and classification, not reset per leaf. */
 	timeoutMs?: number;
+	/**
+	 * Review-only adapter observation passthrough (reviewVersion 1): opts
+	 * into Pi's versioned attempt-observation contract. Legacy `judge`
+	 * dispatches never set these. Structural optional fields keep this
+	 * compatible with the pinned peer type surface.
+	 */
+	observe?: true;
+	/** Synchronous adapter observation callback; failures stay isolated. */
+	onAttempt?: (event: never) => void;
 }
 
 /**
@@ -478,6 +487,10 @@ async function classifySelected(
 		classification = registry.classify(model, context, {
 			signal,
 			timeoutMs: Number.isFinite(remaining) ? remaining : undefined,
+			...(options?.observe !== undefined ? { observe: options.observe } : {}),
+			...(options?.onAttempt !== undefined
+				? { onAttempt: options.onAttempt as never }
+				: {}),
 		});
 	} catch (error) {
 		if (options?.signal?.aborted) {

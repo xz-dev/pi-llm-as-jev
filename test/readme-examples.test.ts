@@ -28,7 +28,7 @@ test("exact README snippets compile and run with explicit external bindings", as
 		const snippets = [...text.matchAll(/```ts\n([\s\S]*?)```/g)].map(
 			(match) => match[1],
 		);
-		assert.equal(snippets.length, 4, "every TypeScript fence must be covered");
+		assert.equal(snippets.length, 5, "every TypeScript fence must be covered");
 		await fs.copyFile(
 			path.join(root, "client/judgment-client.ts"),
 			path.join(dir, "judgment-client.ts"),
@@ -38,6 +38,7 @@ test("exact README snippets compile and run with explicit external bindings", as
 			"", // Quick start: execute with the service genuinely absent.
 			'import type { JsonObject, ClassifierQuestion, ClassifierAnswer, Usage } from "./judgment-client.ts";\n',
 			fixture,
+			"", // Review discovery: compile the additive API, run without a service.
 			fixture,
 		];
 		for (const [index, snippet] of snippets.entries()) {

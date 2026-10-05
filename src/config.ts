@@ -15,6 +15,13 @@
  */
 
 import * as fs from "node:fs/promises";
+import type { CapacityLimits } from "./capacity.js";
+
+/** Exact provider/model references; an override replaces the default profile. */
+export type ContextLimitOverrides = Record<
+	string,
+	Pick<CapacityLimits, "request" | "stateAndLongestQuestion">
+>;
 
 export type JudgmentMode = "auto" | "classifier" | "llm";
 export type JudgmentThinkingLevel =
@@ -48,6 +55,7 @@ export interface JudgmentConfig {
 	provider?: string;
 	thinkingLevel: JudgmentThinkingLevel;
 	timeoutMs: number;
+	contextLimits?: ContextLimitOverrides;
 }
 
 export interface ConfigDiagnostic {
@@ -78,6 +86,7 @@ const KNOWN_KEYS = [
 	"model",
 	"thinkingLevel",
 	"timeoutMs",
+	"contextLimits",
 ] as const;
 let saveSeq = 0;
 
@@ -137,6 +146,38 @@ function readModelField(
 	return { ok: true, provider: ref.provider, modelId: ref.modelId };
 }
 
+function readContextLimits(value: unknown): ContextLimitOverrides | undefined {
+	if (value === null || typeof value !== "object" || Array.isArray(value))
+		return undefined;
+	const entries = Object.entries(value);
+	const limits: [string, ContextLimitOverrides[string]][] = [];
+	for (const [ref, profile] of entries) {
+		const slash = ref.indexOf("/");
+		if (
+			slash <= 0 ||
+			slash === ref.length - 1 ||
+			profile === null ||
+			typeof profile !== "object" ||
+			Array.isArray(profile)
+		)
+			return undefined;
+		const fields = Object.entries(profile);
+		if (
+			!fields.length ||
+			fields.some(
+				([key, limit]) =>
+					!["request", "stateAndLongestQuestion"].includes(key) ||
+					typeof limit !== "number" ||
+					!Number.isSafeInteger(limit) ||
+					limit <= 0,
+			)
+		)
+			return undefined;
+		limits.push([ref, Object.fromEntries(fields)]);
+	}
+	return Object.fromEntries(limits);
+}
+
 /**
  * Validate a raw config object into effective settings plus diagnostics.
  * All-or-defaults: one invalid KNOWN field discards every known field;
@@ -151,6 +192,7 @@ export function validateConfig(raw: unknown): LoadedConfig {
 		model?: { provider: string; modelId: string };
 		thinkingLevel?: JudgmentThinkingLevel;
 		timeoutMs?: number;
+		contextLimits?: ContextLimitOverrides;
 	} = {};
 	let invalid = false;
 
@@ -223,6 +265,17 @@ export function validateConfig(raw: unknown): LoadedConfig {
 		}
 	}
 
+	if (obj.contextLimits !== undefined) {
+		fields.contextLimits = readContextLimits(obj.contextLimits);
+		if (!fields.contextLimits) {
+			invalid = true;
+			diagnostics.push({
+				message:
+					"llm-as-jev.json: contextLimits requires provider/model profiles with positive integer request and/or stateAndLongestQuestion limits; using default settings",
+			});
+		}
+	}
+
 	if (invalid) return { config: defaultConfig(), diagnostics, defaults: false };
 
 	if (fields.mode !== undefined) config.mode = fields.mode;
@@ -241,6 +294,8 @@ export function validateConfig(raw: unknown): LoadedConfig {
 	if (fields.thinkingLevel !== undefined)
 		config.thinkingLevel = fields.thinkingLevel;
 	if (fields.timeoutMs !== undefined) config.timeoutMs = fields.timeoutMs;
+	if (fields.contextLimits !== undefined)
+		config.contextLimits = fields.contextLimits;
 	return { config, diagnostics, defaults: false };
 }
 
@@ -315,6 +370,7 @@ export async function saveConfig(
 		model?: string | null;
 		thinkingLevel?: JudgmentThinkingLevel;
 		timeoutMs?: number;
+		contextLimits?: ContextLimitOverrides | null;
 	},
 	dir = agentDir(),
 ): Promise<LoadedConfig> {
@@ -389,6 +445,11 @@ export async function saveConfig(
 			: base.thinkingLevel;
 	candidate.timeoutMs =
 		update.timeoutMs !== undefined ? update.timeoutMs : base.timeoutMs;
+	const contextLimits =
+		update.contextLimits === undefined
+			? base.contextLimits
+			: update.contextLimits;
+	if (contextLimits != null) candidate.contextLimits = contextLimits;
 
 	// 4. Validate the final update. Invalid → throw BEFORE writing: disk and
 	//    memory stay unchanged and no success is reported.
@@ -404,6 +465,8 @@ export async function saveConfig(
 	if (merged.config.model !== undefined) {
 		next.model = merged.config.model;
 	}
+	if (merged.config.contextLimits !== undefined)
+		next.contextLimits = merged.config.contextLimits;
 	if (merged.config.classifierModel !== undefined) {
 		next.classifierModel = merged.config.classifierModel;
 	}

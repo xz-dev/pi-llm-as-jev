@@ -141,3 +141,61 @@ test("LLM envelope overhead is a positive constant", () => {
 	assert.ok(LLM_ENVELOPE_OVERHEAD_BYTES > 0);
 	assert.ok(PRIOR_TOKENS_PER_BYTE > 0.5);
 });
+
+test("transferred predictor samples preserve separate dimensions before and after learning", () => {
+	// Historical observed sizes only: not a new live call or tokenizer guarantee.
+	const direct = { request: 64000, stateAndLongestQuestion: 32000 };
+	const profile: CapacityProfile = { tokensPerByte: 0.5, rejections: [] };
+	assert.equal(predictOverflow(profile, s(58000, 62000, 2000), direct), false);
+	assert.equal(predictOverflow(profile, s(66000, 54000, 2000), direct), true);
+	assert.equal(predictOverflow(profile, s(40000, 100000, 2000), direct), true);
+	assert.equal(predictOverflow(profile, s(900000, 9000), undefined), false);
+	const samples: [number, number, number | "overflow"][] = [
+		[211114, 12440, "overflow"],
+		[113295, 7671, "overflow"],
+		[58918, 5140, "overflow"],
+		[32610, 4097, 20789],
+		[34990, 4150, 21629],
+		[63504, 5691, "overflow"],
+		[35373, 4407, 21111],
+		[39072, 4651, 20036],
+		[115672, 8343, "overflow"],
+		[67256, 5808, "overflow"],
+		[42994, 4721, 23042],
+		[42155, 4767, 21751],
+		[65980, 6162, "overflow"],
+		[41133, 4926, 21242],
+		[42429, 4916, 21345],
+	];
+	const learned = newCapacityProfile();
+	const expected = samples.map(([, , tokens]) => tokens === "overflow");
+	assert.deepEqual(
+		samples.map(([state, questions]) =>
+			predictOverflow(learned, s(state, questions, 1750), direct),
+		),
+		expected,
+	);
+	for (const [stateBytes, questionBytes, tokens] of samples)
+		observe(learned, {
+			stateBytes,
+			questionBytes,
+			longestQuestionBytes: 1750,
+			outcome: tokens === "overflow" ? "overflow" : "answered",
+			inputTokens: typeof tokens === "number" ? tokens : undefined,
+		});
+	assert.deepEqual(
+		samples.map(([state, questions]) =>
+			predictOverflow(learned, s(state, questions, 1750), direct),
+		),
+		expected,
+	);
+	const ratio = learned.tokensPerByte;
+	for (const inputTokens of [undefined, "unknown", 0, NaN, -1])
+		observe(learned, {
+			outcome: "answered",
+			inputTokens,
+			stateBytes: 1,
+			questionBytes: 1,
+		});
+	assert.equal(learned.tokensPerByte, ratio);
+});

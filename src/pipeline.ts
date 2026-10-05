@@ -47,12 +47,21 @@ export function isContextOverflow(result: {
 }
 
 /** UTF-8 byte sizes of state and question map. */
-export function sizeOf(state: JsonObject, questions: Record<string, unknown>) {
+export function sizeOf(
+	state: JsonObject,
+	questions: Record<string, unknown>,
+	model?: string,
+) {
 	const each = Object.entries(questions).map(([k, q]) =>
 		Buffer.byteLength(JSON.stringify({ [k]: q })),
 	);
 	return {
-		stateBytes: Buffer.byteLength(JSON.stringify(state)),
+		stateBytes:
+			Buffer.byteLength(
+				JSON.stringify(
+					model === undefined ? state : { model, state, questions: {} },
+				),
+			) - (model === undefined ? 0 : 2),
 		questionBytes: Buffer.byteLength(JSON.stringify(questions)),
 		longestQuestionBytes: Math.max(0, ...each),
 	};

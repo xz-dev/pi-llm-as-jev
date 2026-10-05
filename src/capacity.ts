@@ -87,8 +87,10 @@ export interface CapacityProfile {
 export const newCapacityProfile = (): CapacityProfile => ({ rejections: [] });
 
 export interface CapacityLimits {
-	/** Declared model context window in tokens. */
-	contextWindow: number;
+	/** Declared model context window in tokens (legacy/generic fallback). */
+	contextWindow?: number;
+	request?: number;
+	stateAndLongestQuestion?: number;
 }
 
 const longest = (s: EnvelopeSize) => s.stateBytes + s.longestQuestionBytes;
@@ -106,8 +108,12 @@ export function overflowConstraint(
 	limits?: CapacityLimits,
 ): CapacityConstraint | undefined {
 	const ratio = p.tokensPerByte ?? PRIOR_TOKENS_PER_BYTE;
-	if (limits && longest(s) * ratio > limits.contextWindow) return "state";
-	if (limits && total(s) * ratio > limits.contextWindow) return "request";
+	const stateLimit = limits?.stateAndLongestQuestion ?? limits?.contextWindow;
+	const requestLimit = limits?.request ?? limits?.contextWindow;
+	if (stateLimit !== undefined && longest(s) * ratio > stateLimit)
+		return "state";
+	if (requestLimit !== undefined && total(s) * ratio > requestLimit)
+		return "request";
 	if (p.rejections.some((r) => covers(s, r))) return "rejection";
 }
 

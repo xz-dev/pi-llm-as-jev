@@ -146,6 +146,108 @@ const result = await service.judge(
 If fixed state plus one irreducible fragment cannot fit, you get an explicit
 `contextOverflow` error — evidence is never silently trimmed.
 
+### Resumable reviews (additive capability)
+
+`judge()` remains final-only. Consumers that need durable partial progress must
+check the separate `reviewVersion` capability at **each eligible call**, not
+just at extension load:
+
+```ts
+import { getJudgmentService, type ReviewService } from "./judgment-client.ts";
+
+const candidate = getJudgmentService() as Partial<ReviewService> | undefined;
+if (candidate?.version === 1 && candidate.reviewVersion === 1 &&
+    typeof candidate.review === "function") {
+  const review = await candidate.review({
+    state: { scope: "release-42" },
+    questions: {
+      readiness: {
+        type: "choice",
+        instructions: "Is the supplied release evidence sufficient?",
+        criteria: { ready: "Sufficient", unresolved: "Missing or conflicting evidence" },
+      },
+    },
+    evidence: [{ id: "ci-report", text: "CI checks are reported passed; rollout awaits approval." }],
+  }, { minConfidence: 0.8, timeoutMs: 60_000 });
+  // Only accepted final answers are advice candidates. Source/authority checks
+  // remain the consumer's job. Progress/opinions never authorize an action.
+  if (review.stopReason === "stop" && review.unresolved.length === 0) {
+    const choice = review.answers.readiness;
+  }
+}
+// Missing capability: skip this feature, report the dependency, try discovery
+// on the next normal trigger. Do not send a probe or use a fallback HTTP client.
+```
+
+`ReviewResult` adds `progress.stages`, `unresolved`, and `diagnostics` to
+`JudgeResult`. Failed or aborted reviews still have **empty final answers**.
+Individually validated native members can be persisted for retry, but only a
+complete required raw-answer set advances a stage. Native policy-dropped raw
+answers are reusable without becoming accepted advice.
+
+For incremental business projection, additional options and projection outputs are:
+
+- `projectStage({ evidence, completed, previousAnswers, final })`: a synchronous
+  callback returning `{ state, questions, unresolved? }`. Set a stable
+  `projectionRevision`. Descriptors are isolated copies; the service always sends
+  its original selected evidence separately. A callback cannot replace source
+  bodies, forge fragment bounds, choose dispatches or advance progress.
+- `unresolved`: explicitly withhold required questions rather than silently omit
+  them. A withheld id cannot also be dispatched. An empty projected question map
+  with all required ids withheld sends nothing and advances no coverage; it is
+  distinct from an invalid empty initial request. Valid independent final answers
+  can remain available in an incomplete locally withheld scope. Missing provider
+  answers instead fail the review with empty finals.
+- `onProgress(stage)`: notification after acknowledged durable persistence only.
+  `stage` includes an opaque `checkpoint`, source ids/genuine bounds, advisory
+  `opinions`, `final`, and `durable`. Notification errors are isolated. Failed
+  persistence may appear as `durable: false` in returned stages; never advance a
+  consumer receipt from those stages.
+- `checkpoint`: an opaque active-branch checkpoint id used as an advisory seed
+  for a new incremental review. The service validates lineage and durable answer
+  references. Keep still-required original facts in the next request; a seed is
+  **not** their factual replacement. `fresh` and `checkpoint` cannot be combined.
+
+For interrupted identical work, reconstruct the same inputs; valid completed
+stages/members are reused after branch restoration. To force reassessment, supply
+`fresh` and no seed: the same token resumes that review, a new token starts new
+work. Only a token digest is persisted. Do not change a token and call the result
+resumption of the old review. Mid-record progress preserves UTF-16 bounds without
+splitting surrogate pairs; visiting every fragment does not prove that a final
+factual view contains every required constraint.
+
+Identity includes selected backend/model/effective thinking/transport, exact
+fixed state and each individual question, ordered evidence/metadata/genuine
+bounds, prior advisory opinions and finality. Adding independent C need not repay
+unchanged A/B. Checkpoint membership is separate from raw-question identity.
+Changing only threshold policy rechecks raw judgments without new inference.
+
+### Attempt accounting and review transport
+
+`reuse.sent` counts questions, **not HTTP requests**. Read `diagnostics.attempts`
+and `attemptCount` for newly owned observed attempts (including native retries),
+`presplits` for predictions, and `rejectedReuses` for avoided known rejections.
+Attempt ids survive accounting without colliding across service reloads. A row
+with `phase: "start"` is unfinished at settlement, not a fabricated response.
+Late events cannot mutate a settled result or write onto a newer branch. Joined
+waiters own no new attempt, and cancelling a waiter does not abort its owner.
+
+Check `observationCoverage` first: `"unavailable"` is an accounting/capability
+failure, **not proof of zero attempts or cost**. Otherwise each usage field has
+`{ knownSum, missing }`; a missing value is not a reported zero, and a total with
+missing observations is only a lower bound. `usage.costUsd` is provider-reported
+charge; optional `catalogCostUsd` is a separate estimate. Cache hits/joins add no
+new owner charge. Native adapters need not report a catalog estimate.
+
+Native reviews require Pi classifier observation version one. Pi owns native
+transport/authentication and its bounded retries. LLM reviews use Pi's injected
+fetch and provider-event seams, `transport: "sse"`, and `maxRetries: 0`. A route
+that ignores those seams or cannot correlate its events fails accounting rather
+than switching models/backends or inventing a request count. Offline acceptance
+covers the actual patched native adapter and Anthropic HTTP/SSE path; it is not a
+claim that every provider route supports observable reviews. Legacy `judge()`
+does not require these observation capabilities.
+
 ## Threshold policy (native classifiers only)
 
 When `backend === "classifier"`, the service applies numeric gates to the
@@ -208,7 +310,10 @@ Global `<agentDir>/llm-as-jev.json` (`PI_CODING_AGENT_DIR` or
 	"classifierModel": "typesafe/jev-1.13", // optional explicit native pick
 	"model": "anthropic/claude-sonnet-4-5", // LLM slot (independent)
 	"thinkingLevel": "low",             // LLM-only thinking level
-	"timeoutMs": 120000
+	"timeoutMs": 120000,
+	"contextLimits": {
+		"typesafe/jev-1.13": { "request": 64000, "stateAndLongestQuestion": 32000 }
+	}
 }
 ```
 
@@ -217,8 +322,9 @@ Global `<agentDir>/llm-as-jev.json` (`PI_CODING_AGENT_DIR` or
   never mutates the other, and nothing inherits the main-session model or
   thinking level.
 - `mode: auto` uses the selected/default available native classifier and
-  otherwise falls back to the LLM. `classifier` and `llm` never switch to
-  the other backend.
+  otherwise falls back to the LLM **only during initial availability selection**.
+  There is no fallback after dispatch or a provider/accounting error.
+  `classifier` and `llm` never switch to the other backend.
 - **Jev is the default native candidate** (`typesafe`, `openrouter`,
   `cloudflare-workers-ai`, `vercel-ai-gateway`, `opencode` priority).
   Omitting `classifierModel` keeps that discovery. An explicit selection is
@@ -234,6 +340,26 @@ Global `<agentDir>/llm-as-jev.json` (`PI_CODING_AGENT_DIR` or
   are preserved on save and never invalidate the file. Saves are atomic
   (temp file + rename) and only swap in-memory state after a successful
   write.
+
+- `timeoutMs` is a whole-call budget, including discovery/authentication,
+  projection, provider waits and recovery, not a fresh budget per attempt.
+- `contextLimits` is optional. Keys are exact `provider/modelid` references;
+  values have positive safe-integer `request` and/or `stateAndLongestQuestion`
+  token limits. A profile replaces the defaults for that model and applies to
+  both `judge` and `review`; it is not combined with an unrelated smaller limit.
+  Invalid profiles reject all known settings without printing profile values.
+- Without overrides, review recognizes TypeSafe-direct Jev's 64k request-wide /
+  32k state-plus-longest profile and OpenRouter System One's 32k / 32k profile at
+  their known endpoints. Other routes use the selected model's context window.
+  Legacy `judge` retains its model-window default. Custom endpoints/auth belong
+  in Pi, not in a consumer's former endpoint fields.
+- Capacity uses the actual serialized envelope and transport-scoped learning.
+  Predictions are not exact token counts. Later usable lower-density successes
+  correct estimates, including after reload. Overestimated fixed facts get one
+  useful unanswered-batch admission; known exact rejections stay protected.
+  Only recognized context overflow permits recovery. Auth/quota/rate/validation/
+  generic payload errors do not justify subdivision. Required facts are never
+  silently cropped to fit.
 
 ## Commands
 
@@ -274,23 +400,29 @@ Validated raw judgments, exact rejection envelopes, stage coverage and
 per-request diagnostics persist as non-context custom entries
 (`llm-as-jev-ledger`) — never bodies, secrets or provider replies — and are
 replayed **from the active branch only** on session start/tree/fork/switch.
-Aborted work persists no new judgments; late results from an abandoned generation
-cannot enter a new branch's cache or ledger.
+Legacy `judge` buffers new judgments until non-aborted settlement. `review`
+keeps already-durable pre-abort stages and individually validated native partial
+members; those are historical work, not successful final answers. Answers are
+written before checkpoint references. Failed appends cannot establish durable
+progress. Late results from an abandoned generation cannot enter a new branch's
+cache or ledger.
 
-## Consumer migrations (separate changes)
+## Consumer migration
 
-Migrations land in the consumers' own repositories; this package defines
-the contract:
+`pi-jev-todo-audit`'s companion development change now uses `reviewVersion: 1`.
+Audit owns question construction, source projection, scheduling, business
+receipts, diagnostics and advisory/TODO safety. This service owns backend/model
+selection, policy, raw cache, capacity/recovery and judgment/attempt storage;
+Pi owns provider transport/authentication. Old audit `model`, `apiUrl`, `apiKey`,
+`apiKeyEnvVar` and `contextLimits` load but are ignored, with field-name-only
+notices. No credential import or automatic configuration rewrite occurs.
+Configure selection/limits here and endpoints/credentials in Pi before a future
+rollout; a missing/incompatible service makes audit skip with a dependency notice,
+without disabling ordinary TODO/main-agent work.
 
-- **pi-continue-watchdog**: drop `askJevChoice` / `resolveJevEndpoint` /
-  System One constants from `src/jev-wait-gate.ts`; compose questions and
-  pass confidence/named-choice rules; keep activity/permission guards and
-  reason formatting. Treat an absent service as feature-unavailable.
-- **pi-jev-todo-audit**: drop transport, `EvaluationCache`, `envelopeKey`,
-  `isContextOverflow` from `typesafe.ts`, all of `capacity.ts`, and the
-  `eval`/`rejected`/`diag` ledger kinds from `ledger.ts` (keep `receipt`);
-  supply fixed business state, ordered evidence and questions; keep board
-  reconstruction, business verdicts and board progress receipts.
+Watchdog migration is separate and has not been performed by this change.
+Neither these source changes nor offline tests activate an installed checkout,
+prove live quality/billing, or publish a release.
 
 ## Development
 

@@ -36,6 +36,8 @@ export const JUDGMENT_VERSION = 3;
 export type StageEvidence = FramedEvidence[];
 
 export interface JudgmentIdentity {
+	/** Review identity scope; absent for the legacy final-only API. */
+	scope?: string;
 	backend: "classifier" | "llm";
 	/** Frozen `provider/modelid` for dispatch, cache and ledger. */
 	model: string;
@@ -61,6 +63,7 @@ export interface JudgmentIdentity {
 export function judgmentKey(identity: JudgmentIdentity): string {
 	return digest({
 		v: JUDGMENT_VERSION,
+		...(identity.scope !== undefined ? { scope: identity.scope } : {}),
 		backend: identity.backend,
 		model: identity.model,
 		thinkingLevel: identity.thinkingLevel,

@@ -7,6 +7,7 @@
  * `stopReason`/`errorMessage`.
  */
 
+import { randomUUID } from "node:crypto";
 import type {
 	Api,
 	ClassifierApi,
@@ -24,6 +25,13 @@ import type {
 	JudgeRequest,
 	JudgeResult,
 	JudgmentService,
+	ReviewAttemptObservation,
+	ReviewDiagnostics,
+	ReviewOptions,
+	ReviewResult,
+	ReviewService,
+	ReviewStageProgress,
+	ReviewStageProjection,
 	ThresholdRule,
 	Usage,
 } from "../client/judgment-client.ts";
@@ -51,16 +59,24 @@ import {
 	trackPending,
 } from "./cache.js";
 import {
+	type CapacityConstraint,
 	type CapacityLimits,
 	type CapacityProfile,
 	channelKey,
+	digest,
 	LLM_ENVELOPE_OVERHEAD_BYTES,
 	newCapacityProfile,
 	observe as observeCapacity,
 	overflowConstraint,
 } from "./capacity.js";
 import type { JudgmentConfig, JudgmentThinkingLevel } from "./config.js";
-import { type LedgerRecord, restoreLedger, writeLedger } from "./ledger.js";
+import {
+	type LedgerRecord,
+	type ReviewStageRecord,
+	restoreLedger,
+	writeLedger,
+} from "./ledger.js";
+import { observeLlmRegistry } from "./llm-observations.js";
 import {
 	type FramedEvidence,
 	framedEvidenceBytes,
@@ -77,6 +93,11 @@ import {
 	redactJson,
 	redactString,
 } from "./redaction.js";
+import {
+	collectAttempts,
+	diagnostics,
+	emptyDiagnostics,
+} from "./review-observations.js";
 
 type AnyModel = Model<Api>;
 type AnyClassifierModel = ClassifierModel<ClassifierApi>;
@@ -235,7 +256,10 @@ function assertJsonValue(value: unknown, path: string, depth = 0): void {
 }
 const seenObjects = new WeakMap<object, true>();
 
-function validateRequest(req: unknown): JudgeRequest {
+function validateRequest(
+	req: unknown,
+	allowEmptyQuestions = false,
+): JudgeRequest {
 	if (req === null || typeof req !== "object" || Array.isArray(req))
 		throw new InvalidRequestError("request is not an object");
 	const request = req as Record<string, unknown>;
@@ -251,7 +275,7 @@ function validateRequest(req: unknown): JudgeRequest {
 	)
 		throw new InvalidRequestError("questions is not an object");
 	const questionIds = Object.keys(questions);
-	if (questionIds.length === 0)
+	if (questionIds.length === 0 && !allowEmptyQuestions)
 		throw new InvalidRequestError("questions is empty");
 	for (const id of questionIds) {
 		const problem = validateQuestion(id, questions[id]);
@@ -479,9 +503,39 @@ async function bounded<T>(
 // Service instance
 // ---------------------------------------------------------------------------
 
+/**
+ * Request-owned review state (reviewVersion 1). The attempt collector is
+ * owned by this captured generation: a late adapter event after the request
+ * settled, or after a branch switch, is dropped and never written onto a
+ * newer branch. Observer callbacks are isolated - they cannot throw into,
+ * hang or mutate the review's result.
+ */
+interface ReviewFlight {
+	options: ReviewOptions;
+	unresolved: Set<string>;
+	/** Observed transport attempts, in observation order. */
+	attempts: ReviewAttemptObservation[];
+	/** Operation id for attempt identities. */
+	operationId: string;
+	/** Closed at settlement: late adapter events cannot mutate returned diagnostics. */
+	settled: boolean;
+	/** False once any dispatch returned without the observation contract. */
+	observationSupported: boolean;
+	/** Durable completed-stage progress views for the result. */
+	progress: ReviewStageProgress[];
+	presplits: number;
+	rejectedReuses: number;
+	channel?: string;
+}
+
 interface InFlight {
 	generation: number;
 	timeoutMs?: number;
+	/**
+	 * Review-mode extensions (reviewVersion 1). Undefined for legacy judge:
+	 * no observation collection, no early durable stage commits.
+	 */
+	review?: ReviewFlight;
 	/** Cache instance captured at request start (F4): all writes go through
 	 * this reference and are additionally generation-checked, so a stale
 	 * completion can never touch a newer branch's live cache. */
@@ -501,7 +555,7 @@ interface InFlight {
 	}[];
 }
 
-export interface CreatedService extends JudgmentService {
+export interface CreatedService extends ReviewService {
 	/** Lifecycle/config hook for src/index.ts (documented internal API). */
 	refreshBranch(): void;
 	/** Swap runtime config (7.2 re-registration path) without version bump. */
@@ -511,6 +565,12 @@ export interface CreatedService extends JudgmentService {
 export function createJudgmentService(runtime: ServiceRuntime): CreatedService {
 	let generation = 0;
 	let cache: RawJudgmentCache = newCache(generation);
+	/** Durable review-stage checkpoints restored from the active branch. */
+	let reviewCheckpoints: ReviewStageRecord[] = [];
+	const durableAnswers = new Map<string, string>();
+	/** Instance nonce prevents attempt-id collisions across reloads or clock rollback. */
+	const reviewInstance = randomUUID();
+	let reviewSerial = 0;
 	const capacity = new Map<string, CapacityProfile>();
 	const active = new Set<AbortController>();
 	let secrets: readonly string[] = [];
@@ -556,11 +616,15 @@ export function createJudgmentService(runtime: ServiceRuntime): CreatedService {
 		generation += 1;
 		cache = newCache(generation);
 		capacity.clear();
+		reviewCheckpoints = [];
+		durableAnswers.clear();
 		const branch = runtime.ledger.branch();
 		if (branch) {
 			const restored = restoreLedger(branch);
-			for (const [key, answer] of restored.answers)
+			for (const [key, answer] of restored.answers) {
 				cache.answers.set(key, answer);
+				durableAnswers.set(key, digest(answer));
+			}
 			for (const [token, keys] of restored.fresh) cache.fresh.set(token, keys);
 			for (const envelope of restored.rejected) cache.rejected.add(envelope);
 			for (const [channel, attempts] of restored.capacity) {
@@ -575,6 +639,7 @@ export function createJudgmentService(runtime: ServiceRuntime): CreatedService {
 					});
 				capacity.set(channel, profile);
 			}
+			reviewCheckpoints = restored.reviewStages;
 		}
 	}
 
@@ -587,8 +652,9 @@ export function createJudgmentService(runtime: ServiceRuntime): CreatedService {
 	function channelProfile(
 		backend: "classifier" | "llm",
 		model: string,
+		transport?: string,
 	): CapacityProfile {
-		const key = channelKey(backend, model);
+		const key = channelKey(backend, transport ?? model);
 		let profile = capacity.get(key);
 		if (!profile) {
 			profile = newCapacityProfile();
@@ -663,7 +729,32 @@ export function createJudgmentService(runtime: ServiceRuntime): CreatedService {
 
 	function contextLimits(
 		model: AnyClassifierModel | AnyModel,
+		config: JudgmentConfig,
+		review = false,
 	): CapacityLimits | undefined {
+		const ref = `${model.provider}/${model.id}`;
+		if (config.contextLimits && Object.hasOwn(config.contextLimits, ref))
+			return { ...config.contextLimits[ref] };
+		if (review && /^jev(?:-|$)/.test(model.id.replace(/^typesafe\//, ""))) {
+			const base = model.baseUrl.replace(/\/+$/, "");
+			if (
+				model.api === "typesafe-system-one" &&
+				[
+					"https://api.typesafe.ai/v1",
+					"https://api.typesafe.ai/v1/systemone",
+				].includes(base)
+			)
+				return { request: 64000, stateAndLongestQuestion: 32000 };
+			if (
+				(model.api === "typesafe-system-one" ||
+					model.api === "openrouter-system-one") &&
+				[
+					"https://openrouter.ai/api/v1",
+					"https://openrouter.ai/api/v1/systemone",
+				].includes(base)
+			)
+				return { request: 32000, stateAndLongestQuestion: 32000 };
+		}
 		const window = model.contextWindow;
 		return typeof window === "number" && window > 0
 			? { contextWindow: window }
@@ -672,8 +763,66 @@ export function createJudgmentService(runtime: ServiceRuntime): CreatedService {
 
 	const service: CreatedService = {
 		version: 1,
+		reviewVersion: 1,
 		refreshBranch,
 		updateConfig,
+
+		async review(rawReq, rawOpts): Promise<ReviewResult> {
+			const controller = new AbortController();
+			active.add(controller);
+			try {
+				const signal = rawOpts?.signal
+					? AbortSignal.any([rawOpts.signal, controller.signal])
+					: controller.signal;
+				const review: ReviewFlight = {
+					options: rawOpts ?? {},
+					unresolved: new Set(),
+					attempts: [],
+					operationId: `review-${reviewInstance}-${++reviewSerial}`,
+					settled: false,
+					observationSupported: true,
+					progress: [],
+					presplits: 0,
+					rejectedReuses: 0,
+				};
+				const result = await judgeInner(
+					rawReq,
+					{ ...rawOpts, signal },
+					{
+						generation,
+						cacheRef: cache,
+						bufferedJudgments: [],
+						review,
+					},
+				);
+				review.settled = true;
+				return {
+					...result,
+					progress: { stages: [...review.progress] },
+					diagnostics: {
+						...diagnostics(review.attempts, review.observationSupported),
+						presplits: review.presplits,
+						rejectedReuses: review.rejectedReuses,
+						...(review.channel ? { channel: review.channel } : {}),
+					},
+					unresolved: [...review.unresolved],
+				};
+			} catch (error) {
+				return {
+					...resultShell("llm", ""),
+					stopReason: "error",
+					errorMessage: redactString(
+						error instanceof Error ? error.message : String(error),
+						secrets,
+					),
+					progress: { stages: [] },
+					diagnostics: emptyDiagnostics(),
+					unresolved: [],
+				};
+			} finally {
+				active.delete(controller);
+			}
+		},
 
 		async availability(): Promise<{ classifier?: string; llm?: string }> {
 			const config = runtime.config();
@@ -816,7 +965,7 @@ export function createJudgmentService(runtime: ServiceRuntime): CreatedService {
 				);
 				noteFresh(flight.cacheRef, entry.fresh, entry.key);
 			}
-			ledger({
+			const durable = writeLedger(runtime.ledger.append, {
 				kind: "judgment",
 				key: entry.key,
 				answer: entry.answer,
@@ -827,6 +976,13 @@ export function createJudgmentService(runtime: ServiceRuntime): CreatedService {
 					? { freshToken: freshTokenKey(entry.fresh) }
 					: {}),
 			});
+			if (durable && ownsLiveCache(flight)) {
+				durableAnswers.set(entry.key, digest(entry.answer));
+				durableAnswers.set(
+					pendingKey(flight.cacheRef, entry.fresh, entry.key),
+					digest(entry.answer),
+				);
+			}
 		}
 		flight.bufferedJudgments.length = 0;
 	}
@@ -862,7 +1018,7 @@ export function createJudgmentService(runtime: ServiceRuntime): CreatedService {
 		rawReq: unknown,
 		rawOpts: JudgeOptions | undefined,
 		flight: InFlight,
-	): Promise<JudgeResult> {
+	): Promise<JudgeResult | ReviewResult> {
 		// F5: effective timeout — caller override wins, else the configured one.
 		const config = runtime.config();
 		const requestedTimeout = rawOpts?.timeoutMs ?? config.timeoutMs;
@@ -1014,8 +1170,12 @@ export function createJudgmentService(runtime: ServiceRuntime): CreatedService {
 				backend === "llm"
 					? effectiveThinkingLevel(model as AnyModel, config.thinkingLevel)
 					: "none";
-			const limits = contextLimits(model);
-			const profile = channelProfile(backend, modelId);
+			const limits = contextLimits(model, config, !!flight.review);
+			const profile = channelProfile(
+				backend,
+				modelId,
+				flight.review ? digest({ model }) : undefined,
+			);
 			const overhead = backend === "llm" ? LLM_ENVELOPE_OVERHEAD_BYTES : 0;
 
 			// F1: the SELECTED backend's provider is always part of known keys —
@@ -1099,7 +1259,16 @@ export function createJudgmentService(runtime: ServiceRuntime): CreatedService {
 		opts: JudgeOptions,
 		deadline: number | null,
 		thinkingLevel: string,
-	): Promise<ClassifierResult> {
+		flight: InFlight,
+	): Promise<
+		ClassifierResult & {
+			observation?: {
+				version: number;
+				attempts: number;
+				partialAnswers?: Record<string, unknown>;
+			};
+		}
+	> {
 		const remaining =
 			deadline !== null ? deadline - Date.now() : Number.POSITIVE_INFINITY;
 		if (remaining <= 0 || opts.signal?.aborted)
@@ -1118,6 +1287,117 @@ export function createJudgmentService(runtime: ServiceRuntime): CreatedService {
 						: "request aborted before dispatch",
 			};
 		const timeoutMs = Number.isFinite(remaining) ? remaining : undefined;
+		if (backend === "classifier" && flight.review) {
+			const review = flight.review;
+			const startIndex = review.attempts.length;
+			let open = true;
+			const onAttempt = collectAttempts(
+				review.operationId,
+				review.attempts,
+				() => open && !review.settled,
+				(attempt) => {
+					if (ownsLiveCache(flight))
+						ledger({ kind: "review-attempt", version: 1, attempt });
+				},
+				(text) => redactString(text, secrets),
+				sizeOf(context.state, context.questions, model.id),
+			);
+			try {
+				const result = (await classifyWithModel(
+					runtime.registry,
+					model as AnyClassifierModel,
+					context,
+					{ signal: opts.signal, timeoutMs, observe: true, onAttempt },
+				)) as ClassifierResult & {
+					observation?: {
+						version: number;
+						attempts: number;
+						partialAnswers?: Record<string, unknown>;
+					};
+				};
+				const observedCount = review.attempts.length - startIndex;
+				if (requestInterruption(flight, deadline, opts.signal)) {
+					if (observedCount === 0 && result.observation?.version !== 1)
+						review.observationSupported = false;
+					return result;
+				}
+				if (
+					result.observation?.version !== 1 ||
+					result.observation.attempts !== observedCount
+				) {
+					review.observationSupported = false;
+					return {
+						...result,
+						answers: {},
+						stopReason: "error",
+						errorMessage:
+							"selected classifier adapter lacks attempt-observation capability version 1",
+					};
+				}
+				if (result.stopReason === "error") {
+					const terminal = review.attempts.slice(startIndex).at(-1);
+					// Observed categories, never provider bodies, drive recovery and public diagnostics.
+					const category = terminal?.errorCategory ?? "response";
+					return {
+						...result,
+						errorMessage: `${category === "overflow" ? "context overflow" : `native review ${category} failure`}${terminal?.status ? ` (HTTP ${terminal.status})` : ""}`,
+					};
+				}
+				return result;
+			} finally {
+				open = false;
+			}
+		}
+		if (backend === "llm" && flight.review) {
+			const review = flight.review;
+			const start = review.attempts.length;
+			const observed = observeLlmRegistry(runtime.registry, {
+				operation: review.operationId,
+				attempts: review.attempts,
+				isOpen: () => !review.settled,
+				publish: (attempt) => {
+					if (ownsLiveCache(flight))
+						ledger({ kind: "review-attempt", version: 1, attempt });
+				},
+				sanitize: (text) => redactString(text, secrets),
+			});
+			let result: ClassifierResult;
+			try {
+				result = await llmClassify(
+					observed.registry,
+					model as AnyModel,
+					context,
+					{
+						thinkingLevel: thinkingLevel as JudgmentThinkingLevel,
+						signal: opts.signal,
+						timeoutMs,
+					},
+				);
+			} finally {
+				review.observationSupported =
+					observed.close() && review.observationSupported;
+			}
+			if (requestInterruption(flight, deadline, opts.signal)) return result;
+			if (!review.observationSupported)
+				return {
+					...result,
+					answers: {},
+					stopReason: "error",
+					errorMessage:
+						"selected LLM adapter lacks required HTTP/SSE attempt-observation capability",
+				};
+			if (result.stopReason === "error") {
+				const terminal = review.attempts.slice(start).at(-1);
+				return {
+					...result,
+					errorMessage:
+						terminal?.errorCategory === "overflow"
+							? "context overflow"
+							: `LLM review ${terminal?.errorCategory ?? "response"} failure`,
+				};
+			}
+			return result;
+		}
 		return backend === "classifier"
 			? classifyWithModel(
 					runtime.registry,
@@ -1173,20 +1453,188 @@ export function createJudgmentService(runtime: ServiceRuntime): CreatedService {
 		};
 		const usages: Usage[] = [];
 		const evidence = frameEvidence(request.evidence ?? []);
+		// Review keys never borrow legacy records lacking observation/transport provenance.
+		const reviewOptions = flight.review?.options;
+		const lineage = digest({
+			review: 1,
+			transport: model,
+			thinkingLevel,
+			projection: reviewOptions?.projectionRevision,
+		});
+		if (reviewOptions?.projectStage && !reviewOptions.projectionRevision)
+			throw new InvalidRequestError("projectStage requires projectionRevision");
+		// Each judgment key already includes its own complete question definition.
+		// Sibling membership belongs to the checkpoint, not raw-answer identity:
+		// adding C must not repay unchanged A/B in the same factual stage.
+		const scope = flight.review
+			? digest({
+					lineage,
+					state: request.state,
+					checkpoint: reviewOptions?.checkpoint,
+				})
+			: undefined;
+		const scopeIdentity = scope ? { scope } : {};
+		const capacityChannel = channelKey(
+			backend,
+			flight.review ? digest({ model }) : modelId,
+		);
+		if (flight.review) flight.review.channel = capacityChannel;
+		const completed: FramedEvidence[] = [];
 		/** Advisory prior-stage opinions (RAW, unfiltered, never final). */
 		let previousAnswers: Record<string, ClassifierAnswer> = {};
+		if (reviewOptions?.checkpoint !== undefined) {
+			if (opts.fresh !== undefined)
+				throw new InvalidRequestError(
+					"a fresh review cannot use an incremental seed",
+				);
+			const seed = reviewCheckpoints.find(
+				(row) =>
+					row.identity === reviewOptions.checkpoint && row.lineage === lineage,
+			);
+			if (
+				!seed ||
+				!seed.answerKeys.every((key, i) => {
+					const answer = flight.cacheRef.answers.get(key);
+					return (
+						answer !== undefined &&
+						digest(answer) === seed.answerDigests[i] &&
+						durableAnswers.get(key) === seed.answerDigests[i]
+					);
+				})
+			)
+				throw new InvalidRequestError(
+					"checkpoint is absent, incompatible or lacks durable answer references on this branch",
+				);
+			previousAnswers = Object.fromEntries(
+				seed.questionIds.map((id, i) => [
+					id,
+					structuredClone(flight.cacheRef.answers.get(seed.answerKeys[i])!),
+				]),
+			);
+		}
 		/** Raw completed-stage view, separate from each caller's policy. */
 		let stageRawAnswers: Record<string, ClassifierAnswer> = {};
+		// Evidence recovery owns the full question set. Ancestor question batches
+		// must not repeat that traversal or merge answers from its old factual stage.
+		let evidenceRevision = 0;
 
 		const sizeFor = (
 			batch: FramedEvidence[],
 			questions: Record<string, ClassifierQuestion>,
+			fixed = request.state,
+			prior = previousAnswers,
+			final = true,
 		) => {
+			if (flight.review)
+				return sizeOf(
+					stageState(fixed, batch, prior, final),
+					questions,
+					model.id,
+				);
 			const size = sizeOf(request.state, questions);
 			return {
 				...size,
 				stateBytes: size.stateBytes + framedEvidenceBytes(batch) + overhead,
 			};
+		};
+
+		/** Persist only a complete required-question view, with answers durable first. */
+		const checkpoint = (
+			batch: FramedEvidence[],
+			projection: ReviewStageProjection,
+			questions: Record<string, ClassifierQuestion>,
+			prior: Record<string, ClassifierAnswer>,
+			final: boolean,
+			answers: Record<string, ClassifierAnswer>,
+		) => {
+			const review = flight.review;
+			if (!review || requestInterruption(flight, deadline, opts.signal)) return;
+			if (projection.unresolved?.length) return;
+			const ids = Object.keys(projection.questions);
+			if (
+				Object.keys(questions).length !== ids.length ||
+				!ids.every(
+					(id) =>
+						Object.hasOwn(answers, id) &&
+						validateAnswer(questions[id], answers[id]),
+				)
+			)
+				return;
+			const keys = ids.map((id) =>
+				judgmentKey({
+					...scopeIdentity,
+					backend,
+					model: modelId,
+					thinkingLevel,
+					state: projection.state,
+					evidence: batch,
+					previousAnswers: prior,
+					questionId: id,
+					question: questions[id],
+					isFinalStage: final,
+				}),
+			);
+			flushJudgments(flight);
+			if (requestInterruption(flight, deadline, opts.signal)) return;
+			const identity = digest({
+				scope,
+				keys,
+				fresh: opts.fresh === undefined ? null : freshTokenKey(opts.fresh),
+			});
+			const record = {
+				lineage,
+				questionIds: ids,
+				answerDigests: ids.map((id) => digest(answers[id])),
+				sources: batch.map((f) => ({
+					id: f.bounds?.of ?? f.record.id,
+					...(f.bounds ? { bounds: { ...f.bounds } } : {}),
+				})),
+				identity,
+				evidenceIds: batch.map((f) => f.record.id),
+				answerKeys: keys.map((key) =>
+					pendingKey(flight.cacheRef, opts.fresh, key),
+				),
+				model: modelId,
+				final,
+			};
+			const allDurable = record.answerKeys.every(
+				(key, i) => durableAnswers.get(key) === digest(answers[ids[i]]),
+			);
+			const existing = reviewCheckpoints.some(
+				(row) => row.identity === identity && digest(row) === digest(record),
+			);
+			const durable =
+				allDurable &&
+				(existing ||
+					writeLedger(runtime.ledger.append, {
+						kind: "review-stage",
+						version: 1,
+						...record,
+					}));
+			if (!ownsLiveCache(flight)) return;
+			if (durable && !existing) reviewCheckpoints.push(record);
+			const progress: ReviewStageProgress = {
+				final,
+				checkpoint: identity,
+				evidenceIds: record.evidenceIds,
+				durable,
+				sources: batch.map((f) => ({
+					id: f.bounds?.of ?? f.record.id,
+					...(f.bounds ? { bounds: { ...f.bounds } } : {}),
+				})),
+				opinions: structuredClone(answers),
+			};
+			review.progress.push(progress);
+			completed.push(...batch);
+			if (durable && review.options.onProgress) {
+				try {
+					void Promise.resolve(
+						review.options.onProgress(structuredClone(progress)),
+					).catch(() => {});
+				} catch {
+					/* Notification cannot control recovery. */
+				}
+			}
 		};
 
 		/**
@@ -1199,13 +1647,83 @@ export function createJudgmentService(runtime: ServiceRuntime): CreatedService {
 			batch: FramedEvidence[],
 			questions: Record<string, ClassifierQuestion>,
 			isFinalStage: boolean,
+			projection?: ReviewStageProjection,
 		): Promise<boolean> => {
 			const stopped = requestInterruption(flight, deadline, opts.signal);
 			if (stopped) {
 				Object.assign(total, stopped);
 				return false;
 			}
+			if (!projection) {
+				projection = { state: request.state, questions };
+				if (reviewOptions?.projectStage) {
+					const projected = reviewOptions.projectStage(
+						structuredClone({
+							evidence: batch,
+							completed,
+							previousAnswers,
+							final: isFinalStage,
+						}),
+					);
+					if (
+						projected &&
+						typeof (projected as unknown as Promise<unknown>).then ===
+							"function"
+					) {
+						void Promise.resolve(projected).catch(() => {});
+						throw new InvalidRequestError(
+							"projectStage must return synchronous JSON",
+						);
+					}
+					const valid = validateRequest(projected, true);
+					if (
+						projected.unresolved !== undefined &&
+						(!Array.isArray(projected.unresolved) ||
+							!projected.unresolved.every((id) => typeof id === "string"))
+					)
+						throw new InvalidRequestError("invalid projected unresolved ids");
+					const withheld = new Set(projected.unresolved ?? []);
+					if (
+						Object.keys(request.questions).some(
+							(id) => !Object.hasOwn(valid.questions, id) && !withheld.has(id),
+						)
+					)
+						throw new InvalidRequestError(
+							"projectStage omitted required questions without declaring them unresolved",
+						);
+					if ([...withheld].some((id) => Object.hasOwn(valid.questions, id)))
+						throw new InvalidRequestError(
+							"projected unresolved questions must not also be dispatchable",
+						);
+					projection = redactJson(
+						{
+							state: valid.state,
+							questions: valid.questions,
+							...(projected.unresolved
+								? { unresolved: projected.unresolved }
+								: {}),
+						},
+						secrets,
+					) as unknown as ReviewStageProjection;
+					questions = projection.questions;
+					crossValidateThresholds(questions, opts.thresholds);
+				}
+			}
+			const afterProjection = requestInterruption(
+				flight,
+				deadline,
+				opts.signal,
+			);
+			if (afterProjection) {
+				Object.assign(total, afterProjection);
+				return false;
+			}
+			for (const id of projection.unresolved ?? [])
+				flight.review?.unresolved.add(id);
+			const fixed = projection.state;
 			const qIds = Object.keys(questions);
+			const stagePrior = previousAnswers;
+			for (const id of qIds) flight.review?.unresolved.add(id);
 			if (qIds.length === 0) return true;
 
 			// 1. Cache/join phase per question identity. Identity includes the
@@ -1216,10 +1734,11 @@ export function createJudgmentService(runtime: ServiceRuntime): CreatedService {
 			const misses: [string, string][] = [];
 			for (const id of qIds) {
 				const key = judgmentKey({
+					...scopeIdentity,
 					backend,
 					model: modelId,
 					thinkingLevel,
-					state: request.state,
+					state: fixed,
 					evidence: batch,
 					previousAnswers,
 					questionId: id,
@@ -1247,6 +1766,7 @@ export function createJudgmentService(runtime: ServiceRuntime): CreatedService {
 					flight.cacheRef.answers.delete(answerKey);
 				}
 				if (cached) {
+					flight.review?.unresolved.delete(id);
 					total.reuse.hits += 1;
 					Object.defineProperty(answers, id, {
 						value: cached,
@@ -1274,12 +1794,19 @@ export function createJudgmentService(runtime: ServiceRuntime): CreatedService {
 				const missQuestions = Object.fromEntries(
 					misses.map(([id]) => [id, questions[id]]),
 				);
-				const size = sizeFor(batch, missQuestions);
+				const size = sizeFor(
+					batch,
+					missQuestions,
+					fixed,
+					stagePrior,
+					isFinalStage,
+				);
 				const envelope = judgmentKey({
+					...scopeIdentity,
 					backend,
 					model: modelId,
 					thinkingLevel,
-					state: request.state,
+					state: fixed,
 					evidence: batch,
 					previousAnswers,
 					questionId: "*",
@@ -1287,28 +1814,61 @@ export function createJudgmentService(runtime: ServiceRuntime): CreatedService {
 					isFinalStage,
 				});
 				const constraint = overflowConstraint(profile, size, limits);
+				const evidenceCanSplit = splitPiece(batch) !== undefined;
+				const fixedSize = sizeFor(
+					// An irreducible source is part of the admission floor too;
+					// shrinking questions cannot correct a false state-size hint.
+					evidenceCanSplit ? [] : batch,
+					missQuestions,
+					fixed,
+					stagePrior,
+					isFinalStage,
+				);
+				const floor =
+					flight.review && overflowConstraint(profile, fixedSize, limits);
+				// A soft fixed-state prediction cannot be repaired by traversing records/questions.
+				// Admit the useful unanswered batch once; exact rejections still take precedence.
+				const admitFixed =
+					floor === "state" ||
+					floor === "rejection" ||
+					(flight.review &&
+						overflowConstraint(
+							profile,
+							{ ...fixedSize, questionBytes: fixedSize.longestQuestionBytes },
+							limits,
+						) === "request");
 				const rejected =
 					flight.cacheRef.rejected.has(envelope) ||
 					misses.some(([id]) =>
 						flight.cacheRef.rejected.has(
 							judgmentKey({
+								...scopeIdentity,
 								backend,
 								model: modelId,
 								thinkingLevel,
-								state: request.state,
+								state: fixed,
 								evidence: batch,
 								previousAnswers,
-								questionId: id,
-								question: questions[id],
+								// Rejections store envelopes, not individual answer keys.
+								questionId: "*",
+								question: { all: { [id]: questions[id] } } as never,
 								isFinalStage,
 							}),
 						),
 					);
-				const irreducible = misses.length === 1 && !splitPiece(batch);
+				const irreducible = misses.length === 1 && !evidenceCanSplit;
 
+				if (rejected && flight.review) flight.review.rejectedReuses += 1;
 				if (rejected && !irreducible) {
 					// Never resend a rejected envelope unchanged: subdivide first.
-					return await subdivide(batch, questions, isFinalStage);
+					return await subdivide(
+						batch,
+						questions,
+						isFinalStage,
+						projection,
+						constraint,
+						missQuestions,
+					);
 				}
 				if (rejected && irreducible) {
 					total.stopReason = "error";
@@ -1317,21 +1877,28 @@ export function createJudgmentService(runtime: ServiceRuntime): CreatedService {
 						"context overflow: this exact envelope was already rejected and cannot be reduced further";
 					return false;
 				}
-				if (constraint && !(irreducible && misses.length === 1)) {
+				if (
+					constraint &&
+					!admitFixed &&
+					!(irreducible && misses.length === 1)
+				) {
 					// Predicted overflow: split before sending (soft estimate).
-					return await subdivide(batch, questions, isFinalStage);
+					if (flight.review) flight.review.presplits += 1;
+					return await subdivide(
+						batch,
+						questions,
+						isFinalStage,
+						projection,
+						constraint,
+						missQuestions,
+					);
 				}
 
 				// Dispatch (one request for the whole miss batch). The in-flight
 				// promises are registered BEFORE the await so a concurrent identical
 				// call joins instead of duplicating the request.
 				const context: ClassifierContext = {
-					state: stageState(
-						request.state,
-						batch,
-						previousAnswers,
-						isFinalStage,
-					),
+					state: stageState(fixed, batch, previousAnswers, isFinalStage),
 					questions: missQuestions,
 				};
 				let recovering = false;
@@ -1342,10 +1909,43 @@ export function createJudgmentService(runtime: ServiceRuntime): CreatedService {
 					opts,
 					deadline,
 					thinkingLevel,
+					flight,
 				)
 					.then((result) => {
 						total.reuse.sent += misses.length;
 						if (result.usage) usages.push(result.usage);
+						if (
+							flight.review &&
+							result.observation?.version === 1 &&
+							!requestInterruption(flight, deadline, opts.signal) &&
+							result.stopReason !== "aborted"
+						) {
+							// Valid partial members survive failure; they do not advance coverage.
+							for (const [id, key] of misses) {
+								const partial = result.observation.partialAnswers;
+								const raw =
+									partial && Object.hasOwn(partial, id)
+										? partial[id]
+										: result.stopReason === "stop" &&
+												Object.hasOwn(result.answers, id)
+											? result.answers[id]
+											: undefined;
+								const answer = validateAnswer(questions[id], raw);
+								if (answer) {
+									flight.review.unresolved.delete(id);
+									persistJudgment(
+										flight,
+										key,
+										answer,
+										backend,
+										modelId,
+										thinkingLevel,
+										opts.fresh,
+									);
+								}
+							}
+							flushJudgments(flight);
+						}
 						if (result.stopReason !== "stop") return { ...result, answers: {} };
 						const validated: Record<string, ClassifierAnswer> = {};
 						for (const [id] of misses) {
@@ -1371,7 +1971,8 @@ export function createJudgmentService(runtime: ServiceRuntime): CreatedService {
 						}
 						const stopped = requestInterruption(flight, deadline, opts.signal);
 						if (stopped) return { ...result, ...stopped, answers: {} };
-						for (const [id, key] of misses)
+						for (const [id, key] of misses) {
+							flight.review?.unresolved.delete(id);
 							persistJudgment(
 								flight,
 								key,
@@ -1381,6 +1982,7 @@ export function createJudgmentService(runtime: ServiceRuntime): CreatedService {
 								thinkingLevel,
 								opts.fresh,
 							);
+						}
 						return { ...result, answers: validated };
 					})
 					.then(async (result) => {
@@ -1397,7 +1999,7 @@ export function createJudgmentService(runtime: ServiceRuntime): CreatedService {
 								pendingKey(flight.cacheRef, opts.fresh, key),
 							),
 						);
-						recordCapacity(flight, profile, channelKey(backend, modelId), {
+						recordCapacity(flight, profile, capacityChannel, {
 							outcome: "overflow",
 							stateBytes: size.stateBytes,
 							questionBytes: size.questionBytes,
@@ -1405,7 +2007,14 @@ export function createJudgmentService(runtime: ServiceRuntime): CreatedService {
 						});
 						flight.cacheRef.rejected.add(envelope);
 						ledger({ kind: "rejected", envelope });
-						const recovered = await subdivide(batch, questions, isFinalStage);
+						const recovered = await subdivide(
+							batch,
+							questions,
+							isFinalStage,
+							projection,
+							constraint,
+							missQuestions,
+						);
 						const afterRecovery = requestInterruption(
 							flight,
 							deadline,
@@ -1485,9 +2094,11 @@ export function createJudgmentService(runtime: ServiceRuntime): CreatedService {
 					return false;
 				}
 				// Answered: observe usage for calibration (F4: guarded).
-				recordCapacity(flight, profile, channelKey(backend, modelId), {
+				recordCapacity(flight, profile, capacityChannel, {
 					outcome: "answered",
-					inputTokens: result.usage?.input,
+					inputTokens: flight.review
+						? flight.review.attempts.at(-1)?.inputTokens
+						: result.usage?.input,
 					stateBytes: size.stateBytes,
 					questionBytes: size.questionBytes,
 					longestQuestionBytes: size.longestQuestionBytes,
@@ -1528,6 +2139,7 @@ export function createJudgmentService(runtime: ServiceRuntime): CreatedService {
 				if (joined.answer !== undefined) {
 					const validated = validateAnswer(questions[id], joined.answer);
 					if (validated) {
+						flight.review?.unresolved.delete(id);
 						persistJudgment(
 							flight,
 							key,
@@ -1551,8 +2163,26 @@ export function createJudgmentService(runtime: ServiceRuntime): CreatedService {
 			// policy is applied exactly once — below, on the completed FINAL
 			// stage's RAW answers.
 			stageRawAnswers = answers;
+			checkpoint(
+				batch,
+				projection,
+				questions,
+				stagePrior,
+				isFinalStage,
+				answers,
+			);
+			// Explicitly withheld scopes are not missing native response members:
+			// no checkpoint advances, but independent final choices remain usable.
+			if (projection.unresolved?.length && !isFinalStage) {
+				total.stopReason = "error";
+				total.errorMessage =
+					"intermediate stage has locally unresolved required questions";
+				return false;
+			}
 			if (!isFinalStage) {
-				previousAnswers = { ...previousAnswers, ...answers };
+				previousAnswers = flight.review
+					? answers
+					: { ...previousAnswers, ...answers };
 				return true;
 			}
 			// Final stage: build the caller's accepted view from THESE answers.
@@ -1588,26 +2218,88 @@ export function createJudgmentService(runtime: ServiceRuntime): CreatedService {
 			return true;
 		};
 
-		/** Reduce the constrained dimension: questions, then evidence. */
+		/** Keep question-bound work on one factual stage; otherwise reduce evidence. */
 		async function subdivide(
 			batch: FramedEvidence[],
 			questions: Record<string, ClassifierQuestion>,
 			isFinalStage: boolean,
+			projection: ReviewStageProjection,
+			constraint: CapacityConstraint | undefined,
+			unanswered: Record<string, ClassifierQuestion>,
 		): Promise<boolean> {
 			const qIds = Object.keys(questions);
 			const halvesQ = splitQuestions(qIds);
-			if (halvesQ) {
+			const halvesE = splitPiece(batch);
+			let evidenceFirst = false;
+			if (flight.review && halvesE && halvesQ) {
+				if (constraint === "state") evidenceFirst = true;
+				else if (constraint === "request") {
+					const size = sizeFor(
+						batch,
+						unanswered,
+						projection.state,
+						previousAnswers,
+						isFinalStage,
+					);
+					// If even one longest question cannot fit beside this state,
+					// question batching alone cannot remove the request pressure.
+					const single = overflowConstraint(
+						profile,
+						{ ...size, questionBytes: size.longestQuestionBytes },
+						limits,
+					);
+					evidenceFirst = single === "request" || single === "state";
+				} else {
+					// An unclassified rejection does not identify a token dimension.
+					// Compare actual envelope reductions; do not infer it from record count.
+					const bytes = (
+						frames: FramedEvidence[],
+						qs: Record<string, ClassifierQuestion>,
+					) => {
+						const size = sizeFor(
+							frames,
+							qs,
+							projection.state,
+							previousAnswers,
+							isFinalStage,
+						);
+						return size.stateBytes + size.questionBytes;
+					};
+					const questionSize = Math.max(
+						...halvesQ.map((ids) =>
+							bytes(
+								batch,
+								Object.fromEntries(
+									ids
+										.filter((id) => Object.hasOwn(unanswered, id))
+										.map((id) => [id, unanswered[id]]),
+								),
+							),
+						),
+					);
+					const evidenceSize = Math.max(
+						...halvesE.map((frames) => bytes(frames, unanswered)),
+					);
+					evidenceFirst = evidenceSize < questionSize;
+				}
+			}
+			if (halvesQ && !evidenceFirst) {
 				// Merge ONLY question subtrees over this same state/evidence.
 				// Each evidence subtree still replaces its own final view.
 				const answers: Record<string, ClassifierAnswer> = {};
 				const raw: Record<string, ClassifierAnswer> = {};
 				const dropped = new Set<string>();
 				const prior = previousAnswers;
+				const revision = evidenceRevision;
 				let advisory = prior;
 				for (const half of halvesQ) {
 					previousAnswers = prior;
 					const sub = Object.fromEntries(half.map((id) => [id, questions[id]]));
-					if (!(await stage(batch, sub, isFinalStage))) return false;
+					if (!(await stage(batch, sub, isFinalStage, projection)))
+						return false;
+					// A question subtree may discover state pressure. Its evidence
+					// recovery has already evaluated the full stage's questions.
+					if (evidenceRevision !== revision) return true;
 					Object.defineProperties(
 						raw,
 						Object.getOwnPropertyDescriptors(stageRawAnswers),
@@ -1622,6 +2314,7 @@ export function createJudgmentService(runtime: ServiceRuntime): CreatedService {
 					}
 				}
 				stageRawAnswers = raw;
+				checkpoint(batch, projection, questions, prior, isFinalStage, raw);
 				previousAnswers = isFinalStage ? prior : advisory;
 				if (isFinalStage) {
 					total.answers = answers;
@@ -1629,11 +2322,13 @@ export function createJudgmentService(runtime: ServiceRuntime): CreatedService {
 				}
 				return true;
 			}
-			const halvesE = splitPiece(batch);
 			if (halvesE) {
-				// Evidence subdivision: ordered halves, non-final stages.
-				if (!(await stage(halvesE[0], questions, false))) return false;
-				return await stage(halvesE[1], questions, isFinalStage);
+				// Promote an insufficient question split into ONE complete evidence
+				// traversal, not a traversal per sibling question batch.
+				if (flight.review) evidenceRevision++;
+				const wholeQuestions = flight.review ? projection.questions : questions;
+				if (!(await stage(halvesE[0], wholeQuestions, false))) return false;
+				return await stage(halvesE[1], wholeQuestions, isFinalStage);
 			}
 			// Irreducible: fixed state plus one minimum unit cannot fit.
 			total.stopReason = "error";

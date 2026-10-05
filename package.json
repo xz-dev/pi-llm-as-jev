@@ -9,7 +9,7 @@
   "pi": { "extensions": ["./src/index.ts"] },
   "files": ["src", "client", "README.md"],
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "tsc -p tsconfig.json && node scripts/sync-client.mjs",
     "typecheck": "tsc -p tsconfig.check.json",
     "lint": "biome check src test",
     "format": "biome format --write src test",

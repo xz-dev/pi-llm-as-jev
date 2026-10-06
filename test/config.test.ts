@@ -6,6 +6,7 @@ import {
 	agentDir,
 	configFilePath,
 	loadConfig,
+	loadConfigSync,
 	saveConfig,
 	validateConfig,
 } from "../src/config.ts";
@@ -21,6 +22,58 @@ const DEFAULTS = {
 	thinkingLevel: "off",
 	timeoutMs: 120_000,
 };
+
+test("sync operation reads match async validation, ignore timestamps and recover", async () => {
+	const dir = path.join(tmpRoot, "operation-reader");
+	await fs.mkdir(dir);
+	const file = configFilePath(dir);
+	const read = async () => {
+		const loaded = loadConfigSync(dir);
+		const asynchronous = await loadConfig(dir);
+		assert.deepEqual(loaded.config, asynchronous.config);
+		assert.equal(loaded.defaults, asynchronous.defaults);
+		assert.equal(loaded.diagnostics.length, asynchronous.diagnostics.length);
+		if (loaded.diagnostics.length)
+			assert.match(loaded.diagnostics[0].message, /using default settings/);
+		return loaded;
+	};
+	assert.deepEqual((await read()).config, DEFAULTS);
+	await fs.writeFile(
+		file,
+		JSON.stringify({ mode: "llm", model: "p/x", extra: 1 }),
+	);
+	const stamp = await fs.stat(file);
+	const first = (await read()).config;
+	await fs.writeFile(
+		file,
+		JSON.stringify({ mode: "llm", model: "p/y", extra: 2 }),
+	);
+	await fs.utimes(file, stamp.atime, stamp.mtime);
+	assert.equal((await read()).config.model, "p/y");
+	assert.equal(first.model, "p/x", "earlier snapshots are not mutated");
+	await fs.writeFile(file, JSON.stringify({ model: "p/y", timeoutMs: -1 }));
+	assert.deepEqual((await read()).config, DEFAULTS);
+	await fs.writeFile(file, "{");
+	assert.equal((await read()).diagnostics.length, 1);
+	await fs.rm(file);
+	await fs.mkdir(file);
+	assert.deepEqual((await read()).config, DEFAULTS);
+	assert.equal((await read()).diagnostics.length, 1);
+	await fs.rmdir(file);
+	assert.equal((await read()).diagnostics.length, 0);
+	await fs.writeFile(
+		file,
+		JSON.stringify({
+			model: "p/restored",
+			classifierModel: "absent/explicit",
+			extra: 3,
+		}),
+	);
+	assert.equal((await read()).config.classifierModel, "absent/explicit");
+	await saveConfig({ thinkingLevel: "high" }, dir);
+	assert.equal(JSON.parse(await fs.readFile(file, "utf8")).extra, 3);
+	assert.equal((await read()).config.model, "p/restored");
+});
 
 test("unreadable path yields defaults plus diagnostic, never throws", async () => {
 	// /dev/null is a file, so `/dev/null/llm-as-jev.json` fails with ENOTDIR.

@@ -38,7 +38,7 @@ export interface ProviderRegistry {
 
 export interface EmulatedClassifierOptions {
 	registry: ProviderRegistry;
-	config: JudgmentConfig;
+	config: JudgmentConfig | (() => JudgmentConfig);
 }
 
 /**
@@ -87,10 +87,10 @@ async function underlyingAvailable(
 	config: JudgmentConfig,
 ): Promise<AnyModel | undefined> {
 	if (!config.provider || !config.modelId) return undefined;
-	const auth = await registry.checkAuth(config.provider);
-	if (!auth) return undefined;
 	const chat = registry.getModel(config.provider, config.modelId);
-	return chat ?? undefined;
+	if (!chat) return undefined;
+	const auth = await registry.checkAuth(config.provider);
+	return auth ? chat : undefined;
 }
 
 /**
@@ -101,8 +101,10 @@ async function underlyingAvailable(
  */
 export function createEmulatedClassifierProvider({
 	registry,
-	config,
+	config: source,
 }: EmulatedClassifierOptions): Provider {
+	const snapshot = () =>
+		structuredClone(typeof source === "function" ? source() : source);
 	return {
 		id: EMULATED_PROVIDER_ID,
 		name: "LLM-as-Jev classifier emulation",
@@ -110,10 +112,12 @@ export function createEmulatedClassifierProvider({
 			apiKey: {
 				name: "Delegated chat credentials",
 				check: async () => {
+					const config = snapshot();
 					const chat = await underlyingAvailable(registry, config);
 					return chat ? { type: "api_key", source: "delegated" } : undefined;
 				},
 				resolve: async () => {
+					const config = snapshot();
 					const chat = await underlyingAvailable(registry, config);
 					return chat
 						? {
@@ -128,6 +132,7 @@ export function createEmulatedClassifierProvider({
 		stream: unsupportedChat,
 		streamSimple: unsupportedChat,
 		getAllModels: () => {
+			const config = snapshot();
 			// ponytail: synchronous model list cannot await the auth check; the
 			// registry's getAvailableOfType filter handles live availability.
 			const model = emulatedClassifierModel(config);
@@ -140,6 +145,7 @@ export function createEmulatedClassifierProvider({
 			context: ClassifierContext,
 			options?: { signal?: AbortSignal; timeoutMs?: number },
 		): Promise<ClassifierResult> => {
+			const config = snapshot();
 			const chat =
 				config.provider && config.modelId
 					? registry.getModel(config.provider, config.modelId)
@@ -148,7 +154,7 @@ export function createEmulatedClassifierProvider({
 				return {
 					api: model.api,
 					provider: EMULATED_PROVIDER_ID,
-					model: model.id,
+					model: config.model ?? "",
 					answers: {},
 					stopReason: "error",
 					errorMessage: `Configured chat model "${config.model}" is not available`,
@@ -158,7 +164,7 @@ export function createEmulatedClassifierProvider({
 			return llmClassify(registry as unknown as LlmRegistry, chat, context, {
 				thinkingLevel: config.thinkingLevel,
 				signal: options?.signal,
-				timeoutMs: options?.timeoutMs,
+				timeoutMs: options?.timeoutMs ?? config.timeoutMs,
 			});
 		},
 	};

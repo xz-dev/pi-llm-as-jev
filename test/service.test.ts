@@ -3222,6 +3222,88 @@ test("F7: reported eight-question overflow recovers all answers", async () => {
 
 // --- F12: real Unicode assertions (replaces || true tautology) -----------
 
+test("discovery after an external save keeps the admitted configuration", async () => {
+	const registry = new FakeRegistry();
+	registry.available = ["x", "y"].map((id) => ({ ...jevModel(), id }));
+	registry.authKeys.set("typesafe", "fixture-key");
+	registry.replayJev([
+		jevResult({ green: { type: "bool", probability: 0.9 } }),
+	]);
+	let current = baseConfig({
+		mode: "classifier",
+		classifierModel: "typesafe/x",
+		classifierProvider: "typesafe",
+		classifierModelId: "x",
+	});
+	let reads = 0;
+	let entered!: () => void;
+	const admission = new Promise<void>((resolve) => {
+		entered = resolve;
+	});
+	let release!: () => void;
+	const barrier = new Promise<void>((resolve) => {
+		release = resolve;
+	});
+	const auth = registry.getAuth.bind(registry);
+	registry.getAuth = async (id) => {
+		entered();
+		await barrier;
+		return auth(id);
+	};
+	const service = createJudgmentService({
+		registry,
+		config: () => {
+			reads += 1;
+			return current;
+		},
+		ledger: { append: undefined, branch: () => [] },
+	});
+	const pending = service.judge({ state: {}, questions: { green: BOOL_Q } });
+	await admission;
+	current = {
+		...current,
+		classifierModel: "typesafe/y",
+		classifierModelId: "y",
+	};
+	release();
+	const result = await pending;
+	assert.equal(result.model, "typesafe/x");
+	assert.equal(reads, 1, "one admission read, no helper rereads");
+	assert.equal(result.stopReason, "stop");
+});
+
+test("unexpected failure retains the selected native identity after a save", async () => {
+	const registry = new FakeRegistry();
+	registry.available = [{ ...jevModel(), id: "x" }];
+	let current = baseConfig({
+		mode: "classifier",
+		classifierModel: "typesafe/x",
+		classifierProvider: "typesafe",
+		classifierModelId: "x",
+	});
+	let probes = 0;
+	registry.getProviders = () => {
+		if (++probes === 2) {
+			current = { ...current, model: "fake/y", modelId: "y" };
+			throw new Error("fixture metadata failure");
+		}
+		return [];
+	};
+	const service = createJudgmentService({
+		registry,
+		config: () => current,
+		ledger: { append: undefined, branch: () => [] },
+	});
+	const result = await service.judge({
+		state: {},
+		questions: { green: BOOL_Q },
+	});
+	assert.equal(result.stopReason, "error");
+	assert.equal(result.backend, "classifier");
+	assert.equal(result.model, "typesafe/x");
+	assert.match(result.errorMessage ?? "", /fixture metadata failure/);
+});
+
 test("F12: fragment texts are well-formed Unicode with exact coverage", async () => {
 	const { FRAGMENT_MIN_CHARS, frameEvidence, splitPiece } = await import(
 		"../src/pipeline.ts"

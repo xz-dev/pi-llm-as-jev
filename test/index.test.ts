@@ -21,7 +21,10 @@ const EMULATED = "llm-as-jev";
 
 /** Fake ExtensionAPI capturing registrations, events and UI calls. */
 class FakePi {
-	registeredProviders: { provider: string }[] = [];
+	registeredProviders: {
+		id: string;
+		getAllModels?: () => readonly { id: string }[];
+	}[] = [];
 	unregistered: string[] = [];
 	commands = new Map<
 		string,
@@ -40,7 +43,7 @@ class FakePi {
 	customCalls = 0;
 
 	registerProvider(provider: { id: string }): void {
-		this.registeredProviders.push({ provider: provider.id });
+		this.registeredProviders.push(provider);
 	}
 	unregisterProvider(name: string): void {
 		this.unregistered.push(name);
@@ -840,7 +843,7 @@ test("cancel at the level picker leaves nothing saved, including the pending mod
 	});
 });
 
-test("chat confirm persists model+level, re-registers and leaves classifierModel alone", async () => {
+test("chat confirm persists model+level, refreshes provider metadata and leaves classifierModel alone", async () => {
 	await withAgentDir(async () => {
 		await fs.writeFile(
 			path.join(agentDir!, "llm-as-jev.json"),
@@ -869,9 +872,12 @@ test("chat confirm persists model+level, re-registers and leaves classifierModel
 		assert.equal(raw.model, "fake/beta");
 		assert.equal(raw.thinkingLevel, "high");
 		assert.equal(raw.classifierModel, "native/kev-2.1");
-		// 7.2: unregister + register on chat-model change.
-		assert.deepEqual(pi.unregistered, ["llm-as-jev", "llm-as-jev"]);
-		assert.equal(pi.registeredProviders.length, 2);
+		assert.deepEqual(pi.unregistered, []);
+		assert.equal(pi.registeredProviders.length, 1);
+		assert.equal(
+			pi.registeredProviders[0].getAllModels?.()[0]?.id,
+			"fake/beta",
+		);
 	});
 });
 
@@ -904,7 +910,7 @@ test("/llm-as-jev classifier selects a non-Jev native model without touching cha
 		assert.equal(raw.thinkingLevel, "off");
 		// No provider re-registration: emulated identity depends only on chat.
 		assert.equal(pi.registeredProviders.length, 1);
-		assert.deepEqual(pi.unregistered, ["llm-as-jev"]);
+		assert.deepEqual(pi.unregistered, []);
 	});
 });
 
@@ -1096,6 +1102,306 @@ test("no custom UI is requested outside TUI mode", async () => {
 				/needs the interactive TUI/,
 			);
 		}
+	});
+});
+
+test("retained production handle reads each admission once and preserves overlapping snapshots", async () => {
+	await withAgentDir(async () => {
+		const file = path.join(agentDir!, "llm-as-jev.json");
+		const save = (id: string) =>
+			fs.writeFile(
+				file,
+				JSON.stringify({ mode: "classifier", classifierModel: `native/${id}` }),
+			);
+		await save("x");
+		nativeModels = [nativeModel("native", "x"), nativeModel("native", "y")];
+		nativeAnswers = { green: { type: "bool", probability: 0.9 } };
+		const { pi, fire } = await freshExtension();
+		let entered!: () => void;
+		const admission = new Promise<void>((resolve) => {
+			entered = resolve;
+		});
+		let release!: () => void;
+		const barrier = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		const original = fakeHost.classify;
+		fakeHost.classify = async (model, context) => {
+			if (model.id === "x") {
+				entered();
+				await barrier;
+			}
+			return original(model, context);
+		};
+		const request = {
+			state: {},
+			questions: { green: mixedRequest().questions.green },
+		};
+		try {
+			await fire("session_start");
+			const handle = getJudgmentService()!;
+			const old = handle.judge(request);
+			await admission;
+			await save("y");
+			const fresh = handle.judge(request);
+			release();
+			const next = await fresh;
+			assert.equal(next.model, "native/y");
+			assert.equal(next.stopReason, "stop");
+			assert.equal((await old).model, "native/x");
+			assert.equal(getJudgmentService(), handle);
+			assert.deepEqual(await handle.availability(), { classifier: "native/y" });
+			const calls = nativeCalls.length;
+			assert.equal((await handle.judge(request)).reuse.hits, 1);
+			assert.equal(
+				nativeCalls.length,
+				calls,
+				"refresh preserves identity-qualified cache",
+			);
+			assert.ok(pi.entries.length > 0, "refresh preserves ledger writes");
+		} finally {
+			release();
+			fakeHost.classify = original;
+			await fire("session_shutdown");
+		}
+	});
+});
+
+test("status, guidance and native picker read external saves on their first operation", async () => {
+	await withAgentDir(async () => {
+		const file = path.join(agentDir!, "llm-as-jev.json");
+		nativeModels = [nativeModel("native", "x"), nativeModel("native", "y")];
+		const { pi, fire } = await freshExtension();
+		await fire("session_start");
+		const command = pi.commands.get("llm-as-jev")!;
+		for (const args of ["", "status", "mode invalid", "classifier"]) {
+			await fs.writeFile(
+				file,
+				JSON.stringify({ mode: "classifier", classifierModel: "native/y" }),
+			);
+			const before = await fs.readFile(file, "utf8");
+			pi.uiNotifications.length = 0;
+			if (args === "classifier") {
+				const ctx = pi.makeCtx() as { ui: { custom: unknown } };
+				ctx.ui.custom = async (
+					factory: (
+						tui: unknown,
+						theme: unknown,
+						keys: unknown,
+						done: (v: string | undefined) => void,
+					) => { handleInput(data: string): void },
+				) => {
+					let selected: string | undefined;
+					factory(undefined, undefined, undefined, (v) => {
+						selected = v;
+					}).handleInput("\r");
+					assert.equal(
+						selected,
+						"native/y",
+						"native preselection uses the latest file",
+					);
+					return undefined; // inspect selection, cancel without persistence
+				};
+				await command.handler(args, ctx as never);
+			} else {
+				await command.handler(args, pi.makeCtx());
+				assert.match(
+					pi.uiNotifications.map((n) => n.message).join("\n"),
+					args.startsWith("mode") ? /current: classifier/ : /native\/y/,
+				);
+			}
+			assert.equal(await fs.readFile(file, "utf8"), before);
+			await fs.writeFile(
+				file,
+				JSON.stringify({ mode: "llm", classifierModel: "native/x" }),
+			);
+		}
+		assert.equal(nativeCalls.length + llmCalls, 0);
+	});
+});
+
+test("status rows and availability share one snapshot across discovery", async () => {
+	await withAgentDir(async () => {
+		const file = path.join(agentDir!, "llm-as-jev.json");
+		await fs.writeFile(
+			file,
+			JSON.stringify({ mode: "classifier", classifierModel: "native/x" }),
+		);
+		nativeModels = [nativeModel("native", "x"), nativeModel("native", "y")];
+		const { pi, fire } = await freshExtension();
+		await fire("session_start");
+		let entered!: () => void;
+		const admission = new Promise<void>((resolve) => {
+			entered = resolve;
+		});
+		let release!: () => void;
+		const barrier = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		const original = fakeHost.getAvailableOfType;
+		fakeHost.getAvailableOfType = async (type) => {
+			entered();
+			await barrier;
+			return original(type);
+		};
+		try {
+			const status = pi.commands
+				.get("llm-as-jev")!
+				.handler("status", pi.makeCtx());
+			await admission;
+			await fs.writeFile(
+				file,
+				JSON.stringify({ mode: "classifier", classifierModel: "native/y" }),
+			);
+			release();
+			await status;
+			const text = pi.uiNotifications.map((n) => n.message).join("\n");
+			assert.match(text, /native\/x/);
+			assert.doesNotMatch(text, /native\/y/);
+		} finally {
+			release();
+			fakeHost.getAvailableOfType = original;
+		}
+	});
+});
+
+test("running extension defaults on invalid/unreadable/missing settings and recovers once warned", async () => {
+	await withAgentDir(async () => {
+		const file = path.join(agentDir!, "llm-as-jev.json");
+		nativeModels = [nativeModel("native", "x")];
+		await fs.writeFile(
+			file,
+			JSON.stringify({ mode: "classifier", classifierModel: "native/x" }),
+		);
+		const { pi, fire } = await freshExtension();
+		await fire("session_start");
+		const handle = getJudgmentService()!;
+		assert.equal((await handle.availability()).classifier, "native/x");
+		await fs.writeFile(file, '{"classifierModel":"native/x","mode":"bad"}');
+		assert.deepEqual(await handle.availability(), {});
+		assert.equal(
+			pi.uiNotifications.filter((n) => /using default settings/.test(n.message))
+				.length,
+			1,
+		);
+		await fs.rm(file);
+		await fs.mkdir(file);
+		assert.deepEqual(await handle.availability(), {});
+		await fs.rmdir(file);
+		assert.deepEqual(await handle.availability(), {});
+		await fs.writeFile(
+			file,
+			JSON.stringify({ mode: "classifier", classifierModel: "native/x" }),
+		);
+		assert.equal((await handle.availability()).classifier, "native/x");
+		assert.equal(
+			pi.uiNotifications.filter((n) => /using default settings/.test(n.message))
+				.length,
+			1,
+		);
+		assert.equal(getJudgmentService(), handle);
+		assert.equal(nativeCalls.length + llmCalls, 0);
+	});
+});
+
+for (const cancelAt of [0, 1, 2]) {
+	test(`open LLM dialog preserves a later save (cancel step ${cancelAt || "confirm"})`, async () => {
+		await withAgentDir(async () => {
+			const file = path.join(agentDir!, "llm-as-jev.json");
+			await fs.writeFile(
+				file,
+				JSON.stringify({ model: "fake/beta", thinkingLevel: "high" }),
+			);
+			chatModels = [
+				chatModel("fake", "alpha", true),
+				chatModel("fake", "beta", true),
+			];
+			const { pi, fire } = await freshExtension();
+			await fire("session_start");
+			// The next operation must preselect the externally saved model/level.
+			await fs.writeFile(
+				file,
+				JSON.stringify({ model: "fake/alpha", thinkingLevel: "low" }),
+			);
+			const later = {
+				mode: "classifier",
+				classifierModel: "native/y",
+				model: "fake/beta",
+				thinkingLevel: "high",
+				timeoutMs: 2500,
+				unknown: { keep: true },
+			};
+			let step = 0;
+			const ctx = pi.makeCtx() as { ui: { custom: unknown } };
+			ctx.ui.custom = async (
+				factory: (
+					tui: unknown,
+					theme: unknown,
+					keys: unknown,
+					done: (v: string | undefined) => void,
+				) => { handleInput(data: string): void },
+			) => {
+				step += 1;
+				if (step === 1) await fs.writeFile(file, JSON.stringify(later));
+				let selected: string | undefined;
+				factory(undefined, undefined, undefined, (v) => {
+					selected = v;
+				}).handleInput("\r");
+				assert.equal(
+					selected,
+					step === 1 ? "fake/alpha" : "low",
+					"open interaction retains its own preselection",
+				);
+				return cancelAt === step ? undefined : selected;
+			};
+			await pi.commands.get("llm-as-jev")!.handler("llm", ctx as never);
+			const actual = JSON.parse(await fs.readFile(file, "utf8"));
+			assert.deepEqual(
+				actual,
+				cancelAt
+					? later
+					: { ...later, model: "fake/alpha", thinkingLevel: "low" },
+			);
+			assert.equal(nativeCalls.length + llmCalls, 0);
+		});
+	});
+}
+
+test("failed dialog confirmation does not publish tentative settings", async () => {
+	await withAgentDir(async () => {
+		const file = path.join(agentDir!, "llm-as-jev.json");
+		await fs.writeFile(
+			file,
+			JSON.stringify({ model: "fake/alpha", thinkingLevel: "off" }),
+		);
+		chatModels = [chatModel("fake", "alpha"), chatModel("fake", "beta", true)];
+		const { pi, fire } = await freshExtension();
+		await fire("session_start");
+		const ctx = pi.makeCtx() as { ui: { custom: unknown } };
+		let step = 0;
+		ctx.ui.custom = async () => {
+			if (++step === 1) return "fake/beta";
+			await fs.rename(file, `${file}.saved`);
+			await fs.mkdir(file); // deterministic rename failure, including for root
+			return "high";
+		};
+		await pi.commands.get("llm-as-jev")!.handler("llm", ctx as never);
+		assert.ok(
+			pi.uiNotifications.some((notice) =>
+				/could not save settings/.test(notice.message),
+			),
+		);
+		assert.deepEqual(
+			pi.registeredProviders[0].getAllModels?.(),
+			[],
+			"unreadable disk uses defaults, not a tentative beta selection",
+		);
+		await fs.rmdir(file);
+		await fs.rename(`${file}.saved`, file);
+		assert.equal(
+			pi.registeredProviders[0].getAllModels?.()[0]?.id,
+			"fake/alpha",
+		);
 	});
 });
 

@@ -1,5 +1,5 @@
 /**
- * Extension entry (task 9.1). Loads config once per activation (diagnostics
+ * Extension entry. Reads configuration at each operation boundary (diagnostics
  * reported once per session), constructs the judgment service, publishes the
  * identity-checked `Symbol.for("pi-llm-as-jev:service")` handle, registers
  * the emulated classifier provider and the `/llm-as-jev` commands, and binds
@@ -20,11 +20,12 @@ import type {
 	ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import {
+	agentDir,
 	configFilePath,
 	type JudgmentConfig,
 	type JudgmentMode,
 	type JudgmentThinkingLevel,
-	loadConfig,
+	loadConfigSync,
 	saveConfig,
 } from "./config.js";
 import { pickFromList } from "./picker.js";
@@ -127,51 +128,51 @@ function adaptRegistry(host: HostModelRegistry): RegistrySlice {
 	};
 }
 
-const fallbackConfig = (): JudgmentConfig => ({
-	mode: "auto",
-	thinkingLevel: "off",
-	timeoutMs: 120_000,
-});
-
 export default function extension(pi: ExtensionAPI): void {
-	let config: JudgmentConfig = fallbackConfig();
+	// Bind the file location to this activation, not later process-env changes.
+	const dir = agentDir();
+	let context: ExtensionContext | undefined;
 	/** The ADAPTED registry: what the service and provider consume. */
 	let registry: RegistrySlice | undefined;
 	/** The raw host facade, for provider re-registration. */
 	let host: HostModelRegistry | undefined;
 	let service: CreatedService | undefined;
 	let disposed = false;
-	let pendingDiagnostics: string[] | null = null;
+	let configWarned = false;
 	let unknownChatWarned = false;
-	const configLoaded: Promise<void> = loadConfig().then(
-		(result) => {
-			config = result.config;
-			pendingDiagnostics = result.diagnostics.map((d) => d.message);
-		},
-		() => {
-			config = fallbackConfig();
-		},
-	);
 
-	const getConfig = (): JudgmentConfig => config;
+	function getConfig(): JudgmentConfig {
+		const loaded = loadConfigSync(dir);
+		if (context && !configWarned && loaded.diagnostics.length > 0) {
+			configWarned = true;
+			for (const diagnostic of loaded.diagnostics)
+				context.ui.notify(diagnostic.message, "warning");
+		}
+		const config = loaded.config;
+		if (
+			context &&
+			registry &&
+			!unknownChatWarned &&
+			config.provider &&
+			config.modelId &&
+			!registry.getModel(config.provider, config.modelId)
+		) {
+			unknownChatWarned = true;
+			context.ui.notify(
+				"llm-as-jev: configured chat model is not in Pi's catalog; LLM backend unavailable",
+				"warning",
+			);
+		}
+		return config;
+	}
 
-	// ---- Provider registration + runtime re-registration (7.2). ----
+	// One registration; native metadata/auth/dispatch callbacks read on demand.
 	function registerProvider(): void {
 		if (disposed || !registry) return;
-		// Unregister first so a chat-model change cannot leave a stale
-		// classifier dispatching under the old id. pi.unregisterProvider
-		// clears the old model list immediately; pi.registerProvider
-		// recomposes the provider and refreshes the registry snapshot in the
-		// same tick — no restart, no /reload, no stale dispatch.
-		try {
-			pi.unregisterProvider(EMULATED_ID);
-		} catch {
-			/* first registration: nothing to remove */
-		}
 		pi.registerProvider(
 			createEmulatedClassifierProvider({
 				registry: registry as never,
-				config,
+				config: getConfig,
 			}),
 		);
 	}
@@ -227,7 +228,8 @@ export default function extension(pi: ExtensionAPI): void {
 			return options.map((o) => ({ label: o, value: o }));
 		},
 		handler: async (args: string, ctx: ExtensionCommandContext) => {
-			await configLoaded;
+			context = ctx;
+			const config = getConfig();
 			const parts = args.trim().split(/\s+/).filter(Boolean);
 			if (parts[0] === "mode") {
 				const mode = parts[1];
@@ -249,7 +251,7 @@ export default function extension(pi: ExtensionAPI): void {
 					);
 					return;
 				}
-				await runChatPickers(ctx);
+				await runChatPickers(ctx, config);
 				return;
 			}
 			if (parts[0] === "classifier") {
@@ -260,12 +262,12 @@ export default function extension(pi: ExtensionAPI): void {
 					);
 					return;
 				}
-				await runClassifierPicker(ctx);
+				await runClassifierPicker(ctx, config);
 				return;
 			}
 			if (parts[0] === "status" || parts.length === 0) {
 				// Read-only overview: no picker, no write, no inference.
-				await showStatus(ctx);
+				await showStatus(ctx, config);
 				return;
 			}
 			ctx.ui.notify(
@@ -280,19 +282,21 @@ export default function extension(pi: ExtensionAPI): void {
 		ctx: ExtensionCommandContext,
 	): Promise<void> {
 		try {
-			config = (await saveConfig({ mode })).config;
+			await saveConfig({ mode }, dir);
 			ctx.ui.notify(`llm-as-jev: mode set to ${mode}`, "info");
 		} catch (error) {
 			ctx.ui.notify(
-				`llm-as-jev: could not save mode (${errText(error)}); disk unchanged, still ${config.mode}`,
+				`llm-as-jev: could not save mode (${errText(error)}); nothing saved`,
 				"error",
 			);
-			// Atomic swap only on successful write: a failed save leaves BOTH
-			// disk and memory on the previous mode.
+			// Failed confirmation does not publish a tentative selection.
 		}
 	}
 
-	async function showStatus(ctx: ExtensionContext): Promise<void> {
+	async function showStatus(
+		ctx: ExtensionContext,
+		config: JudgmentConfig,
+	): Promise<void> {
 		if (!service) {
 			ctx.ui.notify(
 				"llm-as-jev: runtime not ready; model registry not bound yet",
@@ -304,15 +308,18 @@ export default function extension(pi: ExtensionAPI): void {
 		// LLM catalog/auth checks) — no second native probe here.
 		const overview = formatStatus({
 			config,
-			availability: await service.availability(),
-			configPath: configFilePath(),
+			availability: await service.availabilityFor(config),
+			configPath: configFilePath(dir),
 		});
 		ctx.ui.notify(overview.text, "info");
 		if (overview.warning) ctx.ui.notify(overview.warning, "warning");
 	}
 
 	// ---- 8.2/8.3: chat model → thinking level pickers. ----
-	async function runChatPickers(ctx: ExtensionCommandContext): Promise<void> {
+	async function runChatPickers(
+		ctx: ExtensionCommandContext,
+		config: JudgmentConfig,
+	): Promise<void> {
 		if (!registry) {
 			ctx.ui.notify("llm-as-jev: model registry not bound yet", "warning");
 			return;
@@ -343,24 +350,27 @@ export default function extension(pi: ExtensionAPI): void {
 			return;
 		}
 		const levels = levelOptions(chat);
-		const level = await pickLevel(ctx, selectedModel, levels);
+		const level = await pickLevel(
+			ctx,
+			selectedModel,
+			levels,
+			config.thinkingLevel,
+		);
 		if (level === undefined) return; // cancel at either step: nothing saved
 
-		// Final confirmation done: persist BOTH chat values atomically,
-		// swap the in-memory config, re-register the emulated classifier and
-		// refresh the service — same process, no /reload.
+		// Confirmation patches only these fields against current disk contents.
 		try {
-			config = (
-				await saveConfig({
-					model: `${selectedModel.provider}/${selectedModel.id}`,
-					thinkingLevel: level,
-					// Chat selection never touches the native slot.
-				})
+			const saved = (
+				await saveConfig(
+					{
+						model: `${selectedModel.provider}/${selectedModel.id}`,
+						thinkingLevel: level,
+					},
+					dir,
+				)
 			).config;
-			registerProvider();
-			service?.updateConfig(config);
 			ctx.ui.notify(
-				`llm-as-jev: model ${config.model} @ ${config.thinkingLevel} saved (native selection unchanged)`,
+				`llm-as-jev: model ${saved.model} @ ${saved.thinkingLevel} saved (native selection unchanged)`,
 				"info",
 			);
 		} catch (error) {
@@ -374,6 +384,7 @@ export default function extension(pi: ExtensionAPI): void {
 	// ---- 8.4: native classifier picker (no thinking step). ----
 	async function runClassifierPicker(
 		ctx: ExtensionCommandContext,
+		config: JudgmentConfig,
 	): Promise<void> {
 		if (!registry) {
 			ctx.ui.notify("llm-as-jev: model registry not bound yet", "warning");
@@ -422,14 +433,16 @@ export default function extension(pi: ExtensionAPI): void {
 		// immediately (the service reads config per request). Chat model,
 		// thinking level, main session: untouched.
 		try {
-			config = (
-				await saveConfig({
-					classifierModel: `${selected.provider}/${selected.id}`,
-				})
+			const saved = (
+				await saveConfig(
+					{
+						classifierModel: `${selected.provider}/${selected.id}`,
+					},
+					dir,
+				)
 			).config;
-			service?.updateConfig(config);
 			ctx.ui.notify(
-				`llm-as-jev: classifier ${config.classifierModel} selected (chat settings unchanged)`,
+				`llm-as-jev: classifier ${saved.classifierModel} selected (chat settings unchanged)`,
 				"info",
 			);
 		} catch (error) {
@@ -467,8 +480,9 @@ export default function extension(pi: ExtensionAPI): void {
 		ctx: ExtensionCommandContext,
 		model: PickerModel,
 		levels: readonly JudgmentThinkingLevel[],
+		configured: JudgmentThinkingLevel,
 	): Promise<JudgmentThinkingLevel | undefined> {
-		const preselect = preselectLevel(levels, config.thinkingLevel);
+		const preselect = preselectLevel(levels, configured);
 		const value = await pickFromList(ctx.ui, {
 			title: `Thinking level for ${model.provider}/${model.id}`,
 			items: levels.map((level) => ({
@@ -476,7 +490,7 @@ export default function extension(pi: ExtensionAPI): void {
 				label: level,
 				description:
 					level === preselect
-						? level === config.thinkingLevel
+						? level === configured
 							? "configured"
 							: "model default"
 						: undefined,
@@ -489,21 +503,9 @@ export default function extension(pi: ExtensionAPI): void {
 
 	// ---- Lifecycle: registry bind, branch restore, identity-checked dispose. ----
 	async function onSessionNav(_event: unknown, ctx: ExtensionContext) {
-		await configLoaded;
+		context = ctx;
 		bindRegistry(ctx.modelRegistry);
-		if (
-			config.model &&
-			config.provider &&
-			config.modelId &&
-			!unknownChatWarned &&
-			!registry?.getModel(config.provider, config.modelId)
-		) {
-			ctx.ui.notify(
-				"llm-as-jev: configured chat model is not in Pi's catalog; LLM backend unavailable",
-				"warning",
-			);
-			unknownChatWarned = true;
-		}
+		getConfig();
 		sessionManager = ctx.sessionManager as never;
 		if (service) service.refreshBranch(); // branch-only ledger restore
 	}
@@ -512,16 +514,6 @@ export default function extension(pi: ExtensionAPI): void {
 	pi.on("session_tree", onSessionNav);
 	pi.on("session_before_fork", onSessionNav);
 	pi.on("session_before_switch", onSessionNav);
-
-	// Config diagnostics: reported exactly once per session (first context).
-	pi.on("session_start", async (_event, ctx) => {
-		await configLoaded;
-		if (pendingDiagnostics && pendingDiagnostics.length > 0) {
-			for (const message of pendingDiagnostics)
-				ctx.ui.notify(message, "warning");
-			pendingDiagnostics = null;
-		}
-	});
 
 	pi.on("session_shutdown", () => {
 		// Identity check: an old runtime must never delete its replacement's

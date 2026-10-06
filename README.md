@@ -341,11 +341,25 @@ Global `<agentDir>/llm-as-jev.json` (`PI_CODING_AGENT_DIR` or
   touching LLM settings.
 - An unknown chat model means *no LLM backend*, never a main-session
   fallback.
+- Every new `judge()`, `review()`, `availability()`, settings command and
+  provider metadata/auth/classification operation reads the current file.
+  Sessions already running this version and sharing the same agent directory
+  see completed saves on their next operation, without a configuration command,
+  restart or reload in the receiving session. Different agent directories stay
+  isolated; there is no idle watcher or polling timer.
+- An admitted judgment or review keeps one snapshot through discovery, stages,
+  retries and error reporting. A save does not cancel old work or reset its
+  branch ledger. New calls (including resumed reviews) use current settings;
+  reuse still requires the same actual backend/model/effective-thinking identity.
 - An unreadable or invalid file is reported once per session and **all**
-  known settings use defaults (no partial acceptance). Unknown extra keys
-  are preserved on save and never invalidate the file. Saves are atomic
-  (temp file + rename) and only swap in-memory state after a successful
-  write.
+  known settings use defaults, not a partially accepted or last-valid file.
+  A missing file uses defaults without a warning. Reads continue after a warning,
+  so repairing or restoring the file takes effect on the next operation.
+  Unknown extra keys survive valid patch saves. Saves are atomic (temp file +
+  rename); a failed save never publishes a tentative choice.
+- Updating the extension's **code** still requires the normal reload/restart.
+  Subsequent configuration-file edits do not. Simultaneous overlapping writers
+  retain last-write behavior: atomic replacement is not a conflict-free merge.
 
 - `timeoutMs` is a whole-call budget, including discovery/authentication,
   projection, provider waits and recovery, not a fresh budget per attempt.
@@ -405,12 +419,15 @@ Both pickers are searchable (`Input` + `SelectList` + fuzzy matching over
 `provider/id` **and display names**), alphabetically ordered by
 `provider/modelid` including filtered results, with the configured model
 preselected at its real index. The native list excludes this plugin's own
-LLM-emulation provider. Chat confirmation refreshes the registered emulated
-classifier immediately (no restart or `/reload`); native confirmation
-applies to the next judgment immediately. **Cancel at any step leaves both
-disk and memory unchanged.** Custom pickers are TUI-only; non-interactive
-sessions still get the overview and full service operation. The main-session
-model and thinking level are never touched.
+LLM-emulation provider. Opening either picker reads current settings; the open
+interaction keeps its original preselection even if another session saves.
+Confirmation patches only the selected fields against the file read for that
+save, preserving unrelated changes completed before that read and unknown keys.
+**Cancel at either step writes nothing and never rolls back another save.**
+Reopening reads the latest values. The read-only overview uses one snapshot for
+both its displayed settings and availability. Custom pickers are TUI-only;
+non-interactive sessions still get the overview and full service operation.
+The main-session model and thinking level are never touched.
 
 ## Registered classifier provider
 
@@ -419,7 +436,13 @@ exposing the configured LLM as `getAvailableOfType("classifier")` entry
 `llm-as-jev/<provider>/<modelid>` with the chat model's `contextWindow` and
 cost — visible to codemode scripts and other extensions. It is LLM
 emulation: its compatibility numbers never enter native numeric policy, and
-it is excluded from the native picker/discovery.
+it is excluded from the native picker/discovery. The next public listing reflects
+current target identity, context window and credential availability without a
+priming judgment or re-registration. Classifying through a previously retained
+descriptor uses the current configured target and reports its actual full model
+reference; removed/unavailable targets return an error rather than using the
+old target. A classification already in flight keeps its own snapshot through
+output repair.
 
 ## Session ledger
 

@@ -32,9 +32,11 @@ interface EmulatedProvider {
 }
 
 import type {
+	Api,
 	AssistantMessage,
 	ClassifierContext,
 	ClassifierResult,
+	Model,
 	ToolCall,
 } from "@earendil-works/pi-ai";
 
@@ -50,8 +52,9 @@ function config(overrides: Partial<JudgmentConfig> = {}): JudgmentConfig {
 	};
 }
 
-function chatModel() {
+function chatModel(): Model<Api> {
 	return {
+		name: "Fake model",
 		id: "fake-model",
 		provider: "fake",
 		api: "openai-completions",
@@ -62,7 +65,7 @@ function chatModel() {
 		contextWindow: 123456,
 		maxTokens: 4096,
 		type: undefined,
-	} as never;
+	};
 }
 
 interface RecordedCall {
@@ -267,6 +270,148 @@ test("classify with vanished chat model returns a structured error", async () =>
 	});
 	assert.equal(result.stopReason, "error");
 	assert.match(result.errorMessage ?? "", /not available/);
+});
+
+test("provider snapshots refresh metadata and retained-descriptor dispatch without re-registration", async () => {
+	const registry = new FakeRegistry();
+	let current = config();
+	let reads = 0;
+	registry.getModel = ((provider: string, id: string) =>
+		provider === "fake" && ["fake-model", "next"].includes(id)
+			? { ...chatModel(), id, contextWindow: id === "next" ? 24000 : 123456 }
+			: undefined) as typeof registry.getModel;
+	const provider: EmulatedProvider = createEmulatedClassifierProvider({
+		registry,
+		config: () => {
+			reads += 1;
+			return current;
+		},
+	});
+	const old = provider.getAllModels!()[0] as NonNullable<
+		ReturnType<typeof emulatedClassifierModel>
+	>;
+	current = config({ model: "fake/next", modelId: "next", timeoutMs: 1500 });
+	const model = provider.getAllModels!()[0] as typeof old;
+	assert.equal(model.id, "fake/next");
+	assert.equal(model.contextWindow, 24000);
+	const context: ClassifierContext = {
+		state: {},
+		questions: {
+			q: {
+				type: "choice",
+				instructions: "pick",
+				criteria: { ok: "yes", bad: "no" },
+			},
+		},
+	};
+	const before = reads;
+	const result = await provider.classify!(old, context);
+	assert.equal(reads, before + 1);
+	assert.equal(result.model, "fake/next");
+	assert.equal(result.stopReason, "stop");
+	const timeout = registry.recorded()[0].options?.timeoutMs as number;
+	assert.ok(
+		timeout > 0 && timeout <= 1500,
+		"configured timeout is used without caller override",
+	);
+	registry.authReady = false;
+	assert.equal(await provider.auth.apiKey!.check!({} as never), undefined);
+	current = config({
+		model: undefined,
+		provider: undefined,
+		modelId: undefined,
+	});
+	assert.deepEqual(provider.getAllModels!(), []);
+	const removed = await provider.classify!(old, context);
+	assert.equal(removed.stopReason, "error");
+	assert.equal(
+		registry.recorded().length,
+		1,
+		"removed target never dispatches old descriptor",
+	);
+	current = config();
+	assert.equal(
+		(provider.getAllModels!()[0] as typeof old).id,
+		"fake/fake-model",
+	);
+});
+
+test("in-flight provider repair keeps model, thinking and timeout across an edit", async () => {
+	const registry = new FakeRegistry();
+	let current = config({ thinkingLevel: "high", timeoutMs: 10000 });
+	registry.getModel = ((_provider: string, id: string) => ({
+		...chatModel(),
+		id,
+		reasoning: true,
+	})) as typeof registry.getModel;
+	const seen: { model: string; reasoning: unknown; timeout: unknown }[] = [];
+	let entered!: () => void;
+	const admission = new Promise<void>((resolve) => {
+		entered = resolve;
+	});
+	let release!: () => void;
+	const barrier = new Promise<void>((resolve) => {
+		release = resolve;
+	});
+	const stream = registry.streamSimple.bind(registry);
+	registry.streamSimple = (model, context, options) => {
+		seen.push({
+			model: (model as { id: string }).id,
+			reasoning: options?.reasoning,
+			timeout: options?.timeoutMs,
+		});
+		const message = stream(model, context, options);
+		if (seen.length !== 1) return message;
+		return {
+			result: async () => {
+				entered();
+				await barrier;
+				return { ...(await message.result()), content: [] };
+			},
+		};
+	};
+	const provider: EmulatedProvider = createEmulatedClassifierProvider({
+		registry,
+		config: () => current,
+	});
+	const old = provider.getAllModels!()[0] as NonNullable<
+		ReturnType<typeof emulatedClassifierModel>
+	>;
+	const pending = provider.classify!(old, {
+		state: {},
+		questions: {
+			q: {
+				type: "choice",
+				instructions: "pick",
+				criteria: { ok: "yes", bad: "no" },
+			},
+		},
+	});
+	await admission;
+	current = config({
+		model: "fake/next",
+		modelId: "next",
+		thinkingLevel: "low",
+		timeoutMs: 1,
+	});
+	release();
+	const result = await pending;
+	assert.equal(result.model, "fake/fake-model");
+	assert.equal(result.stopReason, "stop");
+	assert.equal(seen.length, 2, "malformed output repaired once");
+	assert.ok(
+		seen.every(
+			(call) => call.model === "fake-model" && call.reasoning === "high",
+		),
+	);
+	assert.ok(
+		seen.every(
+			(call) =>
+				typeof call.timeout === "number" &&
+				call.timeout > 1 &&
+				call.timeout <= 10000,
+		),
+	);
 });
 
 test("registerEmulatedClassifierProvider registers through the native form", () => {

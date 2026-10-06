@@ -14,6 +14,7 @@
  * explicit selection, not erased.
  */
 
+import { readFileSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import type { CapacityLimits } from "./capacity.js";
 
@@ -299,36 +300,8 @@ export function validateConfig(raw: unknown): LoadedConfig {
 	return { config, diagnostics, defaults: false };
 }
 
-/** Load `<agentDir>/llm-as-jev.json`; a missing file yields defaults. */
-export async function loadConfig(dir = agentDir()): Promise<LoadedConfig> {
-	const defaults = () => ({
-		config: defaultConfig(),
-		diagnostics: [] as ConfigDiagnostic[],
-		defaults: true,
-	});
-
-	let text: string;
-	try {
-		text = await fs.readFile(configFilePath(dir), "utf8");
-	} catch (error) {
-		const code = (error as NodeJS.ErrnoException).code;
-		if (code === "ENOENT") {
-			return defaults();
-		}
-		// Unreadable (permissions, ENOTDIR, EISDIR, ...): report once, use
-		// known-setting defaults. The integration owner surfaces diagnostics
-		// once per session; loading itself never throws.
-		return {
-			config: defaults().config,
-			diagnostics: [
-				{
-					message: `llm-as-jev.json: could not read settings file (${(error as Error).message}); using default settings`,
-				},
-			],
-			defaults: false,
-		};
-	}
-
+/** Shared decoding for asynchronous operations and synchronous metadata. */
+function parseConfigText(text: string): LoadedConfig {
 	let raw: unknown;
 	try {
 		raw = JSON.parse(text);
@@ -343,8 +316,40 @@ export async function loadConfig(dir = agentDir()): Promise<LoadedConfig> {
 			defaults: false,
 		};
 	}
-
 	return validateConfig(raw);
+}
+
+function unreadableConfig(error: unknown): LoadedConfig {
+	const missing = (error as NodeJS.ErrnoException).code === "ENOENT";
+	return {
+		config: defaultConfig(),
+		diagnostics: missing
+			? []
+			: [
+					{
+						message: `llm-as-jev.json: could not read settings file (${(error as Error).message}); using default settings`,
+					},
+				],
+		defaults: missing,
+	};
+}
+
+/** Load current contents, without caching file contents or timestamps. */
+export async function loadConfig(dir = agentDir()): Promise<LoadedConfig> {
+	try {
+		return parseConfigText(await fs.readFile(configFilePath(dir), "utf8"));
+	} catch (error) {
+		return unreadableConfig(error);
+	}
+}
+
+/** Synchronous native metadata callbacks use the same decoding/default policy. */
+export function loadConfigSync(dir = agentDir()): LoadedConfig {
+	try {
+		return parseConfigText(readFileSync(configFilePath(dir), "utf8"));
+	} catch (error) {
+		return unreadableConfig(error);
+	}
 }
 
 /**

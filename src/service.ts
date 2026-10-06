@@ -558,6 +558,10 @@ interface InFlight {
 }
 
 export interface CreatedService extends ReviewService {
+	/** Internal status view: reuse its already-admitted settings snapshot. */
+	availabilityFor(
+		config: JudgmentConfig,
+	): Promise<{ classifier?: string; llm?: string }>;
 	/** Lifecycle/config hook for src/index.ts (documented internal API). */
 	refreshBranch(): void;
 	/** Swap runtime config (7.2 re-registration path) without version bump. */
@@ -666,14 +670,14 @@ export function createJudgmentService(runtime: ServiceRuntime): CreatedService {
 	}
 
 	async function resolveBackend(
-		mode: JudgmentConfig["mode"],
+		config: JudgmentConfig,
 		signal: AbortSignal | undefined,
 	): Promise<
 		| { backend: "classifier"; model: AnyClassifierModel }
 		| { backend: "llm"; model: AnyModel }
 		| { error: string }
 	> {
-		const config = runtime.config();
+		const { mode } = config;
 		if (mode === "llm") {
 			const llm = llmChatModel(config);
 			return llm
@@ -826,8 +830,12 @@ export function createJudgmentService(runtime: ServiceRuntime): CreatedService {
 			}
 		},
 
-		async availability(): Promise<{ classifier?: string; llm?: string }> {
-			const config = runtime.config();
+		availability: () =>
+			service.availabilityFor(structuredClone(runtime.config())),
+
+		async availabilityFor(
+			config,
+		): Promise<{ classifier?: string; llm?: string }> {
 			const out: { classifier?: string; llm?: string } = {};
 			// Bounded budget so a hanging auth/discovery cannot hang the caller.
 			const budget =
@@ -1022,7 +1030,7 @@ export function createJudgmentService(runtime: ServiceRuntime): CreatedService {
 		flight: InFlight,
 	): Promise<JudgeResult | ReviewResult> {
 		// F5: effective timeout — caller override wins, else the configured one.
-		const config = runtime.config();
+		const config = structuredClone(runtime.config());
 		const requestedTimeout = rawOpts?.timeoutMs ?? config.timeoutMs;
 		const deadline =
 			typeof requestedTimeout === "number" &&
@@ -1033,10 +1041,17 @@ export function createJudgmentService(runtime: ServiceRuntime): CreatedService {
 		let signal = rawOpts?.signal;
 		const deadlineController = new AbortController();
 		let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
+		let selected: { backend: "classifier" | "llm"; model: string } | undefined;
 		const interrupted = (): JudgeResult | undefined => {
 			const stopped = requestInterruption(flight, deadline, signal);
 			return stopped
-				? { ...resultShell("llm", config.model ?? ""), ...stopped }
+				? {
+						...resultShell(
+							selected?.backend ?? "llm",
+							selected?.model ?? config.model ?? "",
+						),
+						...stopped,
+					}
 				: undefined;
 		};
 
@@ -1121,7 +1136,7 @@ export function createJudgmentService(runtime: ServiceRuntime): CreatedService {
 			let resolved: Awaited<ReturnType<typeof resolveBackend>>;
 			try {
 				const raced = await guardSelection(
-					resolveBackend(config.mode, signal),
+					resolveBackend(config, signal),
 					deadline,
 					signal,
 				);
@@ -1168,6 +1183,7 @@ export function createJudgmentService(runtime: ServiceRuntime): CreatedService {
 			// config mutation mid-flight cannot change a dispatch.
 			const { backend, model } = resolved;
 			const modelId = modelIdentity(backend, model);
+			selected = { backend, model: modelId };
 			const thinkingLevel =
 				backend === "llm"
 					? effectiveThinkingLevel(model as AnyModel, config.thinkingLevel)
@@ -1225,7 +1241,10 @@ export function createJudgmentService(runtime: ServiceRuntime): CreatedService {
 			const stopped = interrupted();
 			if (stopped) return stopped;
 			return {
-				...resultShell("llm", runtime.config().model ?? ""),
+				...resultShell(
+					selected?.backend ?? "llm",
+					selected?.model ?? config.model ?? "",
+				),
 				stopReason: "error",
 				errorMessage: redactString(message, secrets),
 			};

@@ -371,14 +371,35 @@ Global `<agentDir>/llm-as-jev.json` (`PI_CODING_AGENT_DIR` or
 
 | Command | Effect |
 |---|---|
-| `/llm-as-jev` | Status line, then chat model → thinking level pickers |
-| `/llm-as-jev status` | Status line only |
-| `/llm-as-jev mode <auto\|classifier\|llm>` | Persist mode (old `jev` rejected) |
+| `/llm-as-jev` | Read-only overview (same as `status`) |
+| `/llm-as-jev status` | Read-only overview |
+| `/llm-as-jev llm` | Chat model → thinking level pickers |
 | `/llm-as-jev classifier` | Native classifier picker (no thinking step) |
+| `/llm-as-jev mode <auto\|classifier\|llm>` | Persist mode (old `jev` rejected) |
 
-Status shows mode, the effective native candidate and its availability,
-the LLM model/level and the config path — and distinguishes an unavailable
-explicit classifier from unconfigured default discovery.
+The bare command and `status` never open a picker, write settings, send an
+inference request or touch the main-session model/thinking — in any mode,
+including non-TUI. The former `/llm-as-jev-classifier` alias is removed; the
+native entry is `/llm-as-jev classifier`. Command-line completion after
+`/llm-as-jev` offers `status`, `llm`, `classifier` and all three `mode`
+forms.
+
+The overview shows labeled `Mode`, `Classifier`, `LLM`, `Thinking` and
+`Config` rows. `Mode` is `Auto(classifier)` when the selected/default
+native candidate is usable, `Auto(llm)` when only the configured LLM is
+usable, `Auto(None)` when neither is, or the forced `Classifier` / `LLM`
+label. The suffix describes an **availability snapshot only** — not quota,
+billing or a promise of successful inference — and changes nothing about
+routing: `auto` still falls back only during initial availability
+selection, never after a dispatched request fails.
+
+An omitted `classifierModel` displays `Jev` (default discovery) plus the
+resolved `provider/modelid` when available, or `Jev (unavailable)` when
+not. An omitted LLM `model` displays `None` — which is different from a
+configured reference shown with `(unavailable)` when it is missing from
+Pi's catalog or lacks usable credentials. When the configured mode has no
+usable backend a warning names the relevant settings command; forced modes
+never switch to the other backend automatically.
 
 Both pickers are searchable (`Input` + `SelectList` + fuzzy matching over
 `provider/id` **and display names**), alphabetically ordered by
@@ -388,7 +409,7 @@ LLM-emulation provider. Chat confirmation refreshes the registered emulated
 classifier immediately (no restart or `/reload`); native confirmation
 applies to the next judgment immediately. **Cancel at any step leaves both
 disk and memory unchanged.** Custom pickers are TUI-only; non-interactive
-sessions still get status and full service operation. The main-session
+sessions still get the overview and full service operation. The main-session
 model and thinking level are never touched.
 
 ## Registered classifier provider

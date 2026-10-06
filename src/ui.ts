@@ -118,55 +118,104 @@ export function clampLevel(
 	return levels[0] ?? "off";
 }
 
-/** What the status line reports about the native classifier path. */
-export interface NativeStatus {
-	/** Effective explicit selection from config, when set. */
-	explicit?: string;
-	/** Discovered default Jev candidate (`provider/modelid`), when resolvable. */
-	defaultCandidate?: string;
-	/** Discovery/lookup error text (explicit-unavailable or none-available). */
-	error?: string;
+/** One `service.availability()` snapshot: usable references only. */
+export interface Availability {
+	classifier?: string;
+	llm?: string;
 }
 
 export interface StatusInput {
 	config: JudgmentConfig;
-	/** Native path status: explicit selection, default candidate or error. */
-	native: NativeStatus;
+	/** Service availability snapshot; undefined when the service isn't bound. */
+	availability?: Availability;
 	configPath: string;
 }
 
+export interface StatusOverview {
+	/** Labeled rows: Mode, Classifier, LLM, Thinking, Config. */
+	text: string;
+	/** Mode-aware warning for a missing usable backend, or undefined. */
+	warning?: string;
+}
+
+const DISPLAY_MODES: Record<string, string> = {
+	classifier: "Classifier",
+	llm: "LLM",
+};
+
 /**
- * One-line status (8.1): mode, effective native candidate and its
- * availability, LLM model/level, config path. Distinguishes an unavailable
- * EXPLICIT native selection from unconfigured default discovery.
+ * Multi-line read-only overview: mode (with the automatic-mode suffix over
+ * the availability snapshot), the two model slots, thinking level and
+ * config path. `Jev` names default discovery, `None` an unconfigured slot;
+ * configured references are retained and marked unavailable rather than
+ * appearing unset. The warning names a relevant settings command and, for
+ * forced modes, that the other backend is never selected automatically.
  */
 export function formatStatus({
 	config,
-	native,
+	availability,
 	configPath,
-}: StatusInput): string {
-	const llm = config.model ?? "not configured";
-	const level = config.thinkingLevel;
-	const classifier = native.explicit
-		? native.error
-			? `classifier=${native.explicit} (unavailable)`
-			: `classifier=${native.explicit}`
-		: native.defaultCandidate
-			? `classifier=default jev (${native.defaultCandidate})`
-			: native.error
-				? `classifier=default jev (${native.error})`
-				: "classifier=default jev (none available)";
-	const auto =
-		native.explicit && !native.error
-			? `auto→${native.explicit}, fallback llm (${llm})`
-			: native.explicit && native.error
-				? `auto→llm (${llm}; explicit classifier unavailable)`
-				: native.defaultCandidate
-					? `auto→${native.defaultCandidate}, fallback llm (${llm})`
-					: `auto→llm (${llm})`;
-	const backend =
-		config.mode === "auto"
-			? auto
-			: `${config.mode}→${config.mode === "classifier" ? (native.explicit ?? "default jev") : llm}`;
-	return `llm-as-jev: mode=${config.mode} [${backend}] | ${classifier} | llm=${llm} @ ${level} | ${configPath}`;
+}: StatusInput): StatusOverview {
+	const mode = config.mode;
+	const usableClassifier = availability?.classifier;
+	const usableLlm = availability?.llm;
+
+	let modeLabel: string;
+	if (mode === "auto") {
+		modeLabel = usableClassifier
+			? "Auto(classifier)"
+			: usableLlm
+				? "Auto(llm)"
+				: "Auto(None)";
+	} else {
+		modeLabel = DISPLAY_MODES[mode];
+	}
+
+	let classifierRow: string;
+	if (config.classifierModel !== undefined) {
+		classifierRow =
+			usableClassifier !== undefined
+				? config.classifierModel
+				: `${config.classifierModel} (unavailable)`;
+	} else {
+		classifierRow = usableClassifier
+			? `Jev (default: ${usableClassifier})`
+			: "Jev (unavailable)";
+	}
+
+	let llmRow: string;
+	if (config.model === undefined) {
+		llmRow = "None";
+	} else {
+		llmRow = usableLlm ? config.model : `${config.model} (unavailable)`;
+	}
+
+	const rows: [string, string][] = [
+		["Mode", modeLabel],
+		["Classifier", classifierRow],
+		["LLM", llmRow],
+		["Thinking", config.thinkingLevel],
+		["Config", configPath],
+	];
+	const width = Math.max(...rows.map(([label]) => label.length));
+	const text = [
+		"LLM-as-Jev",
+		"",
+		...rows.map(([label, value]) => `${label.padEnd(width)}  ${value}`),
+	].join("\n");
+
+	let warning: string | undefined;
+	if (availability !== undefined) {
+		if (mode === "auto" && !usableClassifier && !usableLlm) {
+			warning =
+				"llm-as-jev: no usable judge backend; configure an available classifier with /llm-as-jev classifier or an LLM with /llm-as-jev llm";
+		} else if (mode === "classifier" && !usableClassifier) {
+			warning =
+				"llm-as-jev: the configured classifier is unavailable; pick an available one with /llm-as-jev classifier (mode classifier never uses the LLM automatically)";
+		} else if (mode === "llm" && !usableLlm) {
+			warning =
+				"llm-as-jev: the configured LLM is unavailable; pick an available model with /llm-as-jev llm (mode llm never uses the classifier automatically)";
+		}
+	}
+	return { text, warning };
 }

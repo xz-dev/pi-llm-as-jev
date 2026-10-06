@@ -19,8 +19,8 @@ import type {
 	ExtensionCommandContext,
 	ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
-import { resolveNativeClassifier } from "./backend-jev.js";
 import {
+	configFilePath,
 	type JudgmentConfig,
 	type JudgmentMode,
 	type JudgmentThinkingLevel,
@@ -34,7 +34,6 @@ import {
 	filterModels,
 	formatStatus,
 	levelOptions,
-	type NativeStatus,
 	type PickerModel,
 	preselectIndex,
 	preselectLevel,
@@ -208,40 +207,22 @@ export default function extension(pi: ExtensionAPI): void {
 
 	let sessionManager: { getBranch(): unknown[] } | undefined;
 
-	/** Native-path status: explicit selection, default Jev candidate or error. */
-	async function nativeStatus(): Promise<NativeStatus> {
-		if (!registry) return {};
-		try {
-			const selected = await resolveNativeClassifier(
-				registry as never,
-				config,
-				{ signal: AbortSignal.timeout(config.timeoutMs) },
-			);
-			if ("model" in selected)
-				return config.classifierModel !== undefined
-					? { explicit: config.classifierModel }
-					: {
-							defaultCandidate: `${selected.model.provider}/${selected.model.id}`,
-						};
-			return config.classifierModel !== undefined
-				? { explicit: config.classifierModel, error: "not available" }
-				: {};
-		} catch {
-			return config.classifierModel !== undefined
-				? { explicit: config.classifierModel, error: "not available" }
-				: {};
-		}
-	}
-
-	// ---- /llm-as-jev command tree (8.1 status+mode, 8.2/8.3 chat pickers,
-	//      8.4 native classifier picker). ----
+	// ---- /llm-as-jev command tree: read-only overview (bare + `status`),
+	//      `llm` chat-model → thinking pickers, `classifier` native picker,
+	//      `mode` persistence. The removed llm-as-jev-classifier alias is
+	//      gone: `classifier` is the sole native settings entry.
 	pi.registerCommand("llm-as-jev", {
 		description:
-			"Judge backend: status, mode <auto|classifier|llm>, model + level pickers",
+			"Judge backend overview: status | llm picker | classifier picker | mode <auto|classifier|llm>",
 		getArgumentCompletions: (prefix: string) => {
-			const options = ["mode auto", "mode classifier", "mode llm"].filter((o) =>
-				o.startsWith(prefix),
-			);
+			const options = [
+				"status",
+				"llm",
+				"classifier",
+				"mode auto",
+				"mode classifier",
+				"mode llm",
+			].filter((o) => o.startsWith(prefix));
 			if (options.length === 0) return null;
 			return options.map((o) => ({ label: o, value: o }));
 		},
@@ -260,6 +241,17 @@ export default function extension(pi: ExtensionAPI): void {
 				);
 				return;
 			}
+			if (parts[0] === "llm") {
+				if (ctx.mode !== "tui" || !ctx.hasUI) {
+					ctx.ui.notify(
+						"llm-as-jev: model selection needs the interactive TUI",
+						"warning",
+					);
+					return;
+				}
+				await runChatPickers(ctx);
+				return;
+			}
 			if (parts[0] === "classifier") {
 				if (ctx.mode !== "tui" || !ctx.hasUI) {
 					ctx.ui.notify(
@@ -271,38 +263,15 @@ export default function extension(pi: ExtensionAPI): void {
 				await runClassifierPicker(ctx);
 				return;
 			}
-			if (parts[0] === "status") {
+			if (parts[0] === "status" || parts.length === 0) {
+				// Read-only overview: no picker, no write, no inference.
 				await showStatus(ctx);
 				return;
 			}
-			if (parts.length > 0) {
-				// Unknown subcommand: point at /llm-as-jev classifier too.
-				ctx.ui.notify(
-					`Unknown argument "${parts[0]}"; usage: /llm-as-jev [status] | mode <auto|classifier|llm> | classifier`,
-					"warning",
-				);
-				return;
-			}
-			await showStatus(ctx);
-			// Custom components need the TUI; RPC/json/print still get status.
-			if (ctx.mode !== "tui" || !ctx.hasUI) return;
-			await runChatPickers(ctx);
-		},
-	});
-
-	pi.registerCommand("llm-as-jev-classifier", {
-		description:
-			"Select the native judge classifier (independent of the LLM model)",
-		handler: async (_args: string, ctx: ExtensionCommandContext) => {
-			await configLoaded;
-			if (ctx.mode !== "tui" || !ctx.hasUI) {
-				ctx.ui.notify(
-					"llm-as-jev: classifier selection needs the interactive TUI",
-					"warning",
-				);
-				return;
-			}
-			await runClassifierPicker(ctx);
+			ctx.ui.notify(
+				`Unknown argument "${parts[0]}"; usage: /llm-as-jev [status] | llm | classifier | mode <auto|classifier|llm>`,
+				"warning",
+			);
 		},
 	});
 
@@ -324,24 +293,22 @@ export default function extension(pi: ExtensionAPI): void {
 	}
 
 	async function showStatus(ctx: ExtensionContext): Promise<void> {
-		ctx.ui.notify(
-			formatStatus({
-				config,
-				native: await nativeStatus(),
-				configPath: configPathForStatus(),
-			}),
-			"info",
-		);
-	}
-
-	function configPathForStatus(): string {
-		const env = process.env.PI_CODING_AGENT_DIR;
-		if (env && env.trim() !== "")
-			return `${env.replace(/\/+$/, "")}/llm-as-jev.json`;
-		const home = process.env.HOME ?? "";
-		return home === ""
-			? "llm-as-jev.json"
-			: `${home.replace(/\/+$/, "")}/.pi/agent/llm-as-jev.json`;
+		if (!service) {
+			ctx.ui.notify(
+				"llm-as-jev: runtime not ready; model registry not bound yet",
+				"warning",
+			);
+			return;
+		}
+		// One shared availability snapshot (service owns native discovery and
+		// LLM catalog/auth checks) — no second native probe here.
+		const overview = formatStatus({
+			config,
+			availability: await service.availability(),
+			configPath: configFilePath(),
+		});
+		ctx.ui.notify(overview.text, "info");
+		if (overview.warning) ctx.ui.notify(overview.warning, "warning");
 	}
 
 	// ---- 8.2/8.3: chat model → thinking level pickers. ----

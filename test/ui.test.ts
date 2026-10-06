@@ -26,90 +26,121 @@ const config = (overrides: Partial<JudgmentConfig> = {}): JudgmentConfig => ({
 });
 
 // ---------------------------------------------------------------------------
-// 8.1 Status formatter
+// Overview formatter: availability snapshot → Mode/Classifier/LLM rows +
+// mode-aware warning. No registry/auth/file access (pure).
 // ---------------------------------------------------------------------------
 
-test("status with default Jev available names the candidate and the LLM fallback", () => {
-	const line = formatStatus({
-		config: config({
-			mode: "auto",
-			model: "anthropic/claude-sonnet-4-5",
-			provider: "anthropic",
-			modelId: "claude-sonnet-4-5",
-			thinkingLevel: "low",
-		}),
-		native: { defaultCandidate: "typesafe/jev-1.13" },
+test("default usable Jev shows Auto(classifier), its reference and LLM None", () => {
+	const overview = formatStatus({
+		config: config({ mode: "auto", thinkingLevel: "low" }),
+		availability: { classifier: "typesafe/jev-1.13" },
 		configPath: "/home/u/.pi/agent/llm-as-jev.json",
 	});
-	assert.match(line, /mode=auto/);
-	assert.match(line, /classifier=default jev \(typesafe\/jev-1\.13\)/);
-	assert.match(line, /llm=anthropic\/claude-sonnet-4-5 @ low/);
-	assert.match(line, /\/home\/u\/\.pi\/agent\/llm-as-jev\.json/);
-	// Spec scenario: status identifies the actual Jev candidate and names the
-	// configured LLM as fallback.
-	assert.match(line, /auto→typesafe\/jev-1\.13, fallback llm/);
-});
-
-test("status distinguishes an unavailable EXPLICIT classifier from default discovery", () => {
-	// Spec scenario: explicit classifier unavailable, another native exists.
-	const line = formatStatus({
-		config: config({ mode: "auto", model: "openai/gpt-5" }),
-		native: { explicit: "typesafe/kev-2.1", error: "not available" },
-		configPath: "/p",
-	});
-	assert.match(line, /classifier=typesafe\/kev-2\.1 \(unavailable\)/);
-	// Never claims the other native model will be used.
-	assert.doesNotMatch(line, /auto→typesafe\/jev/);
+	assert.match(overview.text, /^Mode\s+Auto\(classifier\)$/m);
 	assert.match(
-		line,
-		/auto→llm \(openai\/gpt-5; explicit classifier unavailable\)/,
+		overview.text,
+		/^Classifier\s+Jev \(default: typesafe\/jev-1\.13\)$/m,
 	);
+	assert.match(overview.text, /^LLM\s+None$/m);
+	assert.match(overview.text, /^Thinking\s+low$/m);
+	assert.match(overview.text, /\/home\/u\/\.pi\/agent\/llm-as-jev\.json/);
+	// Default Jev usable: no missing-backend warning.
+	assert.equal(overview.warning, undefined);
 });
 
-test("status with an available explicit non-Jev classifier uses it", () => {
-	const line = formatStatus({
+test("unavailable Jev with a usable configured LLM shows Auto(llm)", () => {
+	const overview = formatStatus({
 		config: config({ mode: "auto", model: "openai/gpt-5" }),
-		native: { explicit: "openrouter/tev-mini" },
+		availability: { llm: "openai/gpt-5" },
 		configPath: "/p",
 	});
-	assert.match(line, /classifier=openrouter\/tev-mini/);
-	assert.doesNotMatch(line, /unavailable/);
-	assert.match(line, /auto→openrouter\/tev-mini, fallback llm/);
+	assert.match(overview.text, /^Mode\s+Auto\(llm\)$/m);
+	assert.match(overview.text, /^Classifier\s+Jev \(unavailable\)$/m);
+	assert.match(overview.text, /^LLM\s+openai\/gpt-5$/m);
+	assert.equal(overview.warning, undefined);
 });
 
-test("status unconfigured: no classifier and no LLM named as missing", () => {
-	const line = formatStatus({
-		config: config(),
-		native: {},
-		configPath: "/tmp/x/llm-as-jev.json",
-	});
-	assert.match(line, /llm=not configured/);
-	assert.match(line, /classifier=default jev \(none available\)/);
-	assert.match(line, /auto→llm \(not configured\)/);
-});
-
-test("status forced modes never mention the other backend as active", () => {
-	const classifier = formatStatus({
+test("available explicit non-Jev classifier is retained exactly", () => {
+	const overview = formatStatus({
 		config: config({
-			mode: "classifier",
+			mode: "auto",
 			classifierModel: "openrouter/tev-mini",
 			model: "openai/gpt-5",
 		}),
-		native: { explicit: "openrouter/tev-mini" },
+		availability: { classifier: "openrouter/tev-mini", llm: "openai/gpt-5" },
 		configPath: "/p",
 	});
+	assert.match(overview.text, /^Mode\s+Auto\(classifier\)$/m);
+	assert.match(overview.text, /^Classifier\s+openrouter\/tev-mini$/m);
+	assert.doesNotMatch(overview.text, /unavailable/);
+	assert.equal(overview.warning, undefined);
+});
+
+test("Auto(None): unconfigured LLM stays None while configured refs mark unavailable", () => {
+	const none = formatStatus({
+		config: config(),
+		availability: {},
+		configPath: "/tmp/x/llm-as-jev.json",
+	});
+	assert.match(none.text, /^Mode\s+Auto\(None\)$/m);
+	assert.match(none.text, /^Classifier\s+Jev \(unavailable\)$/m);
+	assert.match(none.text, /^LLM\s+None$/m);
+	// Warning names BOTH settings entries.
+	assert.match(none.warning ?? "", /\/llm-as-jev classifier/);
+	assert.match(none.warning ?? "", /\/llm-as-jev llm/);
+
+	// Configured-but-uncredentialed LLM keeps its reference, not `None`.
+	const uncredentialed = formatStatus({
+		config: config({ model: "openai/gpt-5" }),
+		availability: {},
+		configPath: "/p",
+	});
+	assert.match(uncredentialed.text, /^Mode\s+Auto\(None\)$/m);
+	assert.match(uncredentialed.text, /^LLM\s+openai\/gpt-5 \(unavailable\)$/m);
+	assert.match(uncredentialed.warning ?? "", /\/llm-as-jev llm/);
+});
+
+test("forced modes keep their labels and warn without claiming the other backend", () => {
+	const classifier = formatStatus({
+		config: config({
+			mode: "classifier",
+			classifierModel: "native/gone-1",
+			model: "openai/gpt-5",
+		}),
+		// Other slot usable; required one is not.
+		availability: { llm: "openai/gpt-5" },
+		configPath: "/p",
+	});
+	assert.match(classifier.text, /^Mode\s+Classifier$/m);
 	assert.match(
-		classifier,
-		/mode=classifier \[classifier→openrouter\/tev-mini\]/,
+		classifier.text,
+		/^Classifier\s+native\/gone-1 \(unavailable\)$/m,
 	);
-	assert.doesNotMatch(classifier, /auto→/);
+	assert.match(classifier.text, /^LLM\s+openai\/gpt-5$/m);
+	assert.doesNotMatch(classifier.text, /Auto\(/);
+	assert.match(classifier.warning ?? "", /\/llm-as-jev classifier/);
+	assert.match(classifier.warning ?? "", /never uses the LLM/);
+
 	const llm = formatStatus({
 		config: config({ mode: "llm", model: "openai/gpt-5" }),
-		native: { defaultCandidate: "typesafe/jev-1.13" },
+		availability: { classifier: "typesafe/jev-1.13" },
 		configPath: "/p",
 	});
-	assert.match(llm, /mode=llm \[llm→openai\/gpt-5\]/);
-	assert.doesNotMatch(llm, /auto→/);
+	assert.match(llm.text, /^Mode\s+LLM$/m);
+	assert.match(llm.text, /^LLM\s+openai\/gpt-5 \(unavailable\)$/m);
+	assert.doesNotMatch(llm.text, /Auto\(/);
+	assert.match(llm.warning ?? "", /\/llm-as-jev llm/);
+	assert.match(llm.warning ?? "", /never uses the classifier/);
+});
+
+test("available required slot in a forced mode emits no warning", () => {
+	const ok = formatStatus({
+		config: config({ mode: "llm", model: "openai/gpt-5" }),
+		availability: { llm: "openai/gpt-5" },
+		configPath: "/p",
+	});
+	assert.match(ok.text, /^Mode\s+LLM$/m);
+	assert.equal(ok.warning, undefined);
 });
 
 // ---------------------------------------------------------------------------

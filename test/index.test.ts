@@ -36,6 +36,8 @@ class FakePi {
 	private customHandler:
 		| ((done: (result: string | undefined) => void) => void)
 		| undefined;
+	/** Count of ctx.ui.custom invocations (picker focus grabs). */
+	customCalls = 0;
 
 	registerProvider(provider: { id: string }): void {
 		this.registeredProviders.push({ provider: provider.id });
@@ -85,6 +87,7 @@ class FakePi {
 						done: (result: string | undefined) => void,
 					) => unknown,
 				) => {
+					this.customCalls += 1;
 					if (!this.customHandler) throw new Error("no custom handler set");
 					return new Promise<string | undefined>((resolve) => {
 						this.customHandler?.(resolve);
@@ -142,6 +145,7 @@ let chatModels: ReturnType<typeof chatModel>[] = [];
 let nativeModels: ReturnType<typeof nativeModel>[] = [];
 /** Recorded native classify calls (model identity + context). */
 const nativeCalls: { model: string; questions: string[] }[] = [];
+let llmCalls = 0;
 /** Answer produced by the fake native provider, keyed by question id. */
 let nativeAnswers: Record<string, unknown> = {};
 
@@ -172,6 +176,7 @@ const fakeHost = {
 		};
 	},
 	streamSimple: () => {
+		llmCalls += 1;
 		throw new Error("llm path not exercised in this suite");
 	},
 };
@@ -181,6 +186,7 @@ function resetCatalog(): void {
 	chatModels = [];
 	nativeModels = [];
 	nativeCalls.length = 0;
+	llmCalls = 0;
 	nativeAnswers = {};
 }
 
@@ -437,34 +443,220 @@ test("invalid mode (including the old jev alias) shows usage, writes nothing", a
 	});
 });
 
-test("status names mode, effective native candidate, llm and config path", async () => {
+// ---------------------------------------------------------------------------
+// Read-only overview: bare command and `status` share one snapshot.
+// ---------------------------------------------------------------------------
+
+test("bare command and `status` show the overview without picker, write or inference", async () => {
 	await withAgentDir(async () => {
-		await fs.writeFile(
-			path.join(agentDir!, "llm-as-jev.json"),
-			JSON.stringify({ model: "fake/alpha", thinkingLevel: "off" }),
-		);
 		chatModels = [chatModel("fake", "alpha")];
-		nativeModels = [
-			nativeModel("openrouter", "jev"),
-			nativeModel("typesafe", "jev"),
-		];
+		nativeModels = [nativeModel("typesafe", "jev-1.13")];
 		const { pi, fire } = await freshExtension();
 		await fire("session_start");
 		const handler = pi.commands.get("llm-as-jev");
 		assert.ok(handler);
-		// Non-TUI: status only, no custom UI attempted.
-		await handler.handler("", pi.makeCtx({ mode: "rpc", hasUI: true }));
-		const status = pi.uiNotifications.find((n) =>
-			/llm-as-jev: mode=/.test(n.message),
+		for (const args of ["", "status", "  status  "]) {
+			pi.uiNotifications.length = 0;
+			pi.customCalls = 0;
+			await handler.handler(args, pi.makeCtx());
+			assert.equal(pi.customCalls, 0, `no picker for ${JSON.stringify(args)}`);
+			const overview = pi.uiNotifications.find((n) =>
+				n.message.startsWith("LLM-as-Jev\n"),
+			);
+			assert.ok(overview, "overview emitted");
+			assert.equal(overview.type, "info");
+			assert.match(overview.message, /^Mode\s+Auto\(classifier\)$/m);
+			assert.match(
+				overview.message,
+				/^Classifier\s+Jev \(default: typesafe\/jev-1\.13\)$/m,
+			);
+			assert.match(overview.message, /^LLM\s+None$/m);
+			assert.match(overview.message, /^Thinking\s+off$/m);
+			// No missing-backend warning while default Jev is usable.
+			assert.ok(
+				pi.uiNotifications.every((n) => n.type !== "warning"),
+				"no warning when default Jev is usable",
+			);
+		}
+		// Read-only: no settings file, no inference, no llm open side effects.
+		await assert.rejects(
+			fs.readFile(path.join(agentDir!, "llm-as-jev.json")),
+			/ENOENT/,
+			"status must not create a missing settings file",
 		);
-		assert.ok(status, "status line emitted");
-		assert.match(status.message, /mode=auto/);
-		assert.match(status.message, /classifier=default jev \(typesafe\/jev\)/);
-		assert.match(status.message, /llm=fake\/alpha @ off/);
+		assert.equal(nativeCalls.length, 0, "no native inference dispatched");
+		assert.equal(llmCalls, 0, "no LLM inference dispatched");
+	});
+});
+
+test("service unbound: overview reports runtime-not-ready, no writes", async () => {
+	await withAgentDir(async () => {
+		const { pi } = await freshExtension(); // no session_start: never bound
+		const handler = pi.commands.get("llm-as-jev");
+		assert.ok(handler);
+		await handler.handler("status", pi.makeCtx());
 		assert.match(
-			status.message,
-			new RegExp(agentDir!.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")),
+			pi.uiNotifications[pi.uiNotifications.length - 1]?.message ?? "",
+			/runtime not ready/,
 		);
+		await assert.rejects(
+			fs.readFile(path.join(agentDir!, "llm-as-jev.json")),
+			/ENOENT/,
+		);
+	});
+});
+
+test("overview shows Auto(llm) without picker, writes or inference", async () => {
+	await withAgentDir(async () => {
+		const configPath = path.join(agentDir!, "llm-as-jev.json");
+		const before = JSON.stringify({
+			model: "fake/alpha",
+			thinkingLevel: "off",
+		});
+		await fs.writeFile(configPath, before);
+		chatModels = [chatModel("fake", "alpha")];
+		nativeModels = []; // no Jev candidate
+		const { pi, fire } = await freshExtension();
+		await fire("session_start");
+		const handler = pi.commands.get("llm-as-jev");
+		assert.ok(handler);
+		for (const args of ["", "status"]) {
+			pi.uiNotifications.length = 0;
+			await handler.handler(args, pi.makeCtx({ mode: "rpc" }));
+			const overview = pi.uiNotifications.find((n) =>
+				n.message.startsWith("LLM-as-Jev\n"),
+			);
+			assert.ok(overview);
+			assert.match(overview.message, /^Mode\s+Auto\(llm\)$/m);
+			assert.match(overview.message, /^Classifier\s+Jev \(unavailable\)$/m);
+			assert.match(overview.message, /^LLM\s+fake\/alpha$/m);
+			assert.ok(pi.uiNotifications.every((n) => n.type !== "warning"));
+			assert.equal(pi.customCalls, 0);
+			assert.equal(nativeCalls.length, 0, "no native inference dispatched");
+			assert.equal(llmCalls, 0, "no LLM inference dispatched");
+			assert.equal(await fs.readFile(configPath, "utf8"), before);
+		}
+	});
+});
+
+test("Auto(None) warns to configure either backend without claiming quota checks", async () => {
+	await withAgentDir(async () => {
+		chatModels = [];
+		nativeModels = [];
+		const { pi, fire } = await freshExtension();
+		await fire("session_start");
+		const handler = pi.commands.get("llm-as-jev");
+		assert.ok(handler);
+		await handler.handler("", pi.makeCtx());
+		const overview = pi.uiNotifications.find((n) =>
+			n.message.startsWith("LLM-as-Jev\n"),
+		);
+		assert.ok(overview);
+		assert.match(overview.message, /^Mode\s+Auto\(None\)$/m);
+		assert.match(overview.message, /^Classifier\s+Jev \(unavailable\)$/m);
+		assert.match(overview.message, /^LLM\s+None$/m);
+		const warning = pi.uiNotifications.find((n) => n.type === "warning");
+		assert.ok(warning, "missing-backend warning emitted");
+		assert.match(warning.message, /\/llm-as-jev classifier/);
+		assert.match(warning.message, /\/llm-as-jev llm/);
+		assert.doesNotMatch(warning.message, /quota/i);
+		assert.equal(pi.customCalls, 0);
+	});
+});
+
+test("configured-but-uncredentialed LLM retains its reference as unavailable", async () => {
+	await withAgentDir(async () => {
+		await fs.writeFile(
+			path.join(agentDir!, "llm-as-jev.json"),
+			JSON.stringify({ model: "ghost/turbo" }),
+		);
+		chatModels = [chatModel("ghost", "turbo")]; // in catalog, no auth
+		nativeModels = [];
+		const { pi, fire } = await freshExtension();
+		await fire("session_start");
+		const handler = pi.commands.get("llm-as-jev");
+		assert.ok(handler);
+		await handler.handler("status", pi.makeCtx());
+		const overview = pi.uiNotifications.find((n) =>
+			n.message.startsWith("LLM-as-Jev\n"),
+		);
+		assert.ok(overview);
+		assert.match(overview.message, /^Mode\s+Auto\(None\)$/m);
+		assert.match(overview.message, /^LLM\s+ghost\/turbo \(unavailable\)$/m);
+		// Credentials never leak into the overview or warning text.
+		assert.ok(
+			pi.uiNotifications.every(
+				(n) => !/pseudo-native-key|emulated/.test(n.message),
+			),
+		);
+		assert.ok(pi.uiNotifications.some((n) => n.type === "warning"));
+	});
+});
+
+test("forced classifier mode warns and never claims the usable LLM is active", async () => {
+	await withAgentDir(async () => {
+		await fs.writeFile(
+			path.join(agentDir!, "llm-as-jev.json"),
+			JSON.stringify({
+				mode: "classifier",
+				classifierModel: "native/gone-1",
+				model: "fake/alpha",
+			}),
+		);
+		chatModels = [chatModel("fake", "alpha")];
+		nativeModels = [nativeModel("native", "jev-1.13")]; // other native exists
+		const { pi, fire } = await freshExtension();
+		await fire("session_start");
+		const handler = pi.commands.get("llm-as-jev");
+		assert.ok(handler);
+		await handler.handler("status", pi.makeCtx());
+		const overview = pi.uiNotifications.find((n) =>
+			n.message.startsWith("LLM-as-Jev\n"),
+		);
+		assert.ok(overview);
+		assert.match(overview.message, /^Mode\s+Classifier$/m);
+		assert.match(
+			overview.message,
+			/^Classifier\s+native\/gone-1 \(unavailable\)$/m,
+		);
+		assert.match(overview.message, /^LLM\s+fake\/alpha$/m);
+		assert.doesNotMatch(overview.message, /Auto\(/);
+		const warning = pi.uiNotifications.find((n) => n.type === "warning");
+		assert.ok(warning);
+		assert.match(warning.message, /\/llm-as-jev classifier/);
+		// Never claims the other native model or the LLM will be selected.
+		assert.doesNotMatch(
+			overview.message + (warning?.message ?? ""),
+			/jev-1\.13/,
+		);
+	});
+});
+
+test("forced llm mode warns about the required LLM despite a usable classifier", async () => {
+	await withAgentDir(async () => {
+		await fs.writeFile(
+			path.join(agentDir!, "llm-as-jev.json"),
+			JSON.stringify({ mode: "llm", model: "ghost/turbo" }),
+		);
+		chatModels = []; // configured LLM absent from the catalog
+		nativeModels = [nativeModel("typesafe", "jev-1.13")];
+		const { pi, fire } = await freshExtension();
+		await fire("session_start");
+		const handler = pi.commands.get("llm-as-jev");
+		assert.ok(handler);
+		await handler.handler("status", pi.makeCtx());
+		const overview = pi.uiNotifications.find((n) =>
+			n.message.startsWith("LLM-as-Jev\n"),
+		);
+		assert.ok(overview);
+		assert.match(overview.message, /^Mode\s+LLM$/m);
+		assert.match(overview.message, /^LLM\s+ghost\/turbo \(unavailable\)$/m);
+		const warning = [...pi.uiNotifications]
+			.reverse()
+			.find((n) => n.type === "warning");
+		assert.ok(warning);
+		assert.match(warning.message, /\/llm-as-jev llm/);
+		assert.match(warning.message, /never uses the classifier/);
 	});
 });
 
@@ -485,17 +677,110 @@ test("status reports an unavailable explicit classifier without claiming another
 		const handler = pi.commands.get("llm-as-jev");
 		assert.ok(handler);
 		await handler.handler("status", pi.makeCtx({ mode: "rpc" }));
-		const status = [...pi.uiNotifications]
-			.reverse()
-			.find((n) => /llm-as-jev: mode=/.test(n.message));
-		assert.ok(status);
-		assert.match(status.message, /classifier=native\/gone-1 \(unavailable\)/);
-		assert.doesNotMatch(status.message, /auto→native\/jev-1\.13/);
+		const overview = pi.uiNotifications.find((n) =>
+			n.message.startsWith("LLM-as-Jev\n"),
+		);
+		assert.ok(overview);
+		// Explicit unavailable selection kept; usable LLM drives Auto(llm).
+		assert.match(
+			overview.message,
+			/^Classifier\s+native\/gone-1 \(unavailable\)$/m,
+		);
+		assert.match(overview.message, /^Mode\s+Auto\(llm\)$/m);
+		// Never claims the other native model will be selected.
+		assert.doesNotMatch(overview.message, /jev-1\.13/);
 	});
 });
 
 // ---------------------------------------------------------------------------
-// 8.2/8.3: chat pickers — cancel, confirm, re-registration
+// Command discoverability: description, completions, alias removal, usage.
+// ---------------------------------------------------------------------------
+
+test("only /llm-as-jev is registered; the classifier alias is gone", async () => {
+	await withAgentDir(async () => {
+		const { pi } = await freshExtension();
+		assert.ok(pi.commands.get("llm-as-jev"));
+		assert.equal(
+			pi.commands.get("llm-as-jev-classifier"),
+			undefined,
+			"former alias must not be registered",
+		);
+		assert.equal(pi.commands.size, 1, "single command tree");
+	});
+});
+
+test("completions offer every subcommand on empty prefix and filter `ll`", async () => {
+	await withAgentDir(async () => {
+		const { pi } = await freshExtension();
+		const command = pi.commands.get("llm-as-jev") as unknown as {
+			getArgumentCompletions(prefix: string): { value: string }[] | null;
+		};
+		const completions = (prefix: string): { value: string }[] =>
+			command.getArgumentCompletions(prefix) ?? [];
+		assert.deepEqual(
+			completions("").map((o) => o.value),
+			[
+				"status",
+				"llm",
+				"classifier",
+				"mode auto",
+				"mode classifier",
+				"mode llm",
+			],
+		);
+		assert.deepEqual(
+			completions("ll").map((o) => o.value),
+			["llm"],
+		);
+		assert.deepEqual(
+			completions("mode ").map((o) => o.value),
+			["mode auto", "mode classifier", "mode llm"],
+		);
+		assert.deepEqual(completions("zzz"), []);
+	});
+});
+
+test("description and unknown-argument usage name all entries, not the alias", async () => {
+	await withAgentDir(async () => {
+		const { pi, fire } = await freshExtension();
+		const command = pi.commands.get("llm-as-jev") as unknown as {
+			description: string;
+		};
+		for (const word of [
+			"status",
+			"llm picker",
+			"classifier picker",
+			"mode <auto|classifier|llm>",
+		]) {
+			assert.ok(
+				command.description.includes(word),
+				`description mentions ${word}`,
+			);
+		}
+		chatModels = [chatModel("fake", "alpha")];
+		await fire("session_start");
+		const handler = pi.commands.get("llm-as-jev");
+		assert.ok(handler);
+		await handler.handler("bogus", pi.makeCtx({ mode: "rpc" }));
+		const usage = pi.uiNotifications[pi.uiNotifications.length - 1];
+		assert.match(usage?.message ?? "", /Unknown argument "bogus"/);
+		assert.match(usage?.message ?? "", /\[status\]\s+\|/);
+		assert.match(usage?.message ?? "", /\|\s+llm\s+\|/);
+		assert.match(usage?.message ?? "", /\|\s+classifier\s+\|/);
+		assert.match(usage?.message ?? "", /mode <auto\|classifier\|llm>/);
+		// The removed alias is never advertised.
+		assert.doesNotMatch(usage?.message ?? "", /llm-as-jev-classifier/);
+		assert.doesNotMatch(command.description, /llm-as-jev-classifier/);
+		await assert.rejects(
+			fs.readFile(path.join(agentDir!, "llm-as-jev.json")),
+			/ENOENT/,
+			"unknown argument changes no settings",
+		);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// 8.2/8.3: chat pickers via `/llm-as-jev llm` — cancel, confirm, re-registration
 // ---------------------------------------------------------------------------
 
 test("cancel at the chat model picker leaves disk and memory unchanged", async () => {
@@ -515,13 +800,14 @@ test("cancel at the chat model picker leaves disk and memory unchanged", async (
 		pi.nextCustom((done) => done(undefined)); // Esc on model picker
 		const handler = pi.commands.get("llm-as-jev");
 		assert.ok(handler);
-		await handler.handler("", pi.makeCtx());
+		await handler.handler("llm", pi.makeCtx());
 		const raw = JSON.parse(
 			await fs.readFile(path.join(agentDir!, "llm-as-jev.json"), "utf8"),
 		);
 		assert.equal(raw.model, "fake/alpha");
 		assert.equal(raw.thinkingLevel, "off");
 		assert.equal(pi.registeredProviders.length, 1);
+		assert.equal(pi.customCalls, 1);
 	});
 });
 
@@ -544,7 +830,7 @@ test("cancel at the level picker leaves nothing saved, including the pending mod
 		});
 		const handler = pi.commands.get("llm-as-jev");
 		assert.ok(handler);
-		await handler.handler("", pi.makeCtx());
+		await handler.handler("llm", pi.makeCtx());
 		const raw = JSON.parse(
 			await fs.readFile(path.join(agentDir!, "llm-as-jev.json"), "utf8"),
 		);
@@ -575,7 +861,7 @@ test("chat confirm persists model+level, re-registers and leaves classifierModel
 		pi.nextCustom((done) => done(answers[customIndex++]));
 		const handler = pi.commands.get("llm-as-jev");
 		assert.ok(handler);
-		await handler.handler("", pi.makeCtx());
+		await handler.handler("llm", pi.makeCtx());
 
 		const raw = JSON.parse(
 			await fs.readFile(path.join(agentDir!, "llm-as-jev.json"), "utf8"),
@@ -653,9 +939,9 @@ test("classifier selection changes the NEXT native judgment immediately", async 
 		assert.equal(result.model, "native/jev-1.13");
 		// Picker: select the non-Jev model.
 		pi.nextCustom((done) => done("native/kev-2.1"));
-		const handler = pi.commands.get("llm-as-jev-classifier");
+		const handler = pi.commands.get("llm-as-jev");
 		assert.ok(handler);
-		await handler.handler("", pi.makeCtx());
+		await handler.handler("classifier", pi.makeCtx());
 		// Next judgment uses the selection, same process, no reload.
 		result = await service.judge({
 			...mixedRequest(),
@@ -678,9 +964,9 @@ test("classifier picker cancel leaves disk and memory unchanged", async () => {
 		const { pi, fire } = await freshExtension();
 		await fire("session_start");
 		pi.nextCustom((done) => done(undefined));
-		const handler = pi.commands.get("llm-as-jev-classifier");
+		const handler = pi.commands.get("llm-as-jev");
 		assert.ok(handler);
-		await handler.handler("", pi.makeCtx());
+		await handler.handler("classifier", pi.makeCtx());
 		const raw = JSON.parse(
 			await fs.readFile(path.join(agentDir!, "llm-as-jev.json"), "utf8"),
 		);
@@ -710,9 +996,9 @@ test("classifier picker with an empty available list notifies and writes nothing
 				},
 			},
 		});
-		const handler = pi.commands.get("llm-as-jev-classifier");
+		const handler = pi.commands.get("llm-as-jev");
 		assert.ok(handler);
-		await handler.handler("", ctx);
+		await handler.handler("classifier", ctx);
 		assert.equal(customCalls, 0);
 		assert.match(
 			pi.uiNotifications[pi.uiNotifications.length - 1]?.message ?? "",
@@ -776,6 +1062,7 @@ test("unknown catalog chat model behaves unconfigured", async () => {
 test("no custom UI is requested outside TUI mode", async () => {
 	await withAgentDir(async () => {
 		chatModels = [chatModel("fake", "alpha")];
+		nativeModels = [nativeModel("typesafe", "jev-1.13")];
 		const { pi, fire } = await freshExtension();
 		await fire("session_start");
 		let customCalls = 0;
@@ -793,8 +1080,22 @@ test("no custom UI is requested outside TUI mode", async () => {
 		});
 		const handler = pi.commands.get("llm-as-jev");
 		assert.ok(handler);
+		// Bare command in print mode: read-only overview, never a picker.
 		await handler.handler("", ctx);
 		assert.equal(customCalls, 0, "guard: no custom UI in non-TUI mode");
+		assert.ok(
+			pi.uiNotifications.some((n) => n.message.startsWith("LLM-as-Jev\n")),
+			"non-TUI still gets the overview",
+		);
+		// Explicit picker entries are guarded too.
+		for (const sub of ["llm", "classifier"]) {
+			await handler.handler(sub, ctx);
+			assert.equal(customCalls, 0, `no custom UI for ${sub}`);
+			assert.match(
+				pi.uiNotifications[pi.uiNotifications.length - 1]?.message ?? "",
+				/needs the interactive TUI/,
+			);
+		}
 	});
 });
 

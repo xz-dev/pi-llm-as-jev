@@ -106,6 +106,11 @@ export function observeLlmRegistry(
 				current: undefined as ReviewAttemptObservation | undefined,
 			};
 			calls.push(call);
+			// Compose with the caller's request-scoped fetch (the inactivity
+			// tap) instead of discarding it: observation wraps whatever fetch
+			// llmClassify supplied so raw-body bytes still reach the clock.
+			const innerFetch = options?.fetch ?? fetch;
+			const callerStreamEvent = options?.onProviderStreamEvent;
 			const observeFetch: typeof globalThis.fetch = async (url, init) => {
 				if (!live() || options?.signal?.aborted)
 					throw new DOMException("review settled", "AbortError");
@@ -136,7 +141,7 @@ export function observeLlmRegistry(
 				call.count++;
 				publish(row);
 				try {
-					const response = await fetch(url, init);
+					const response = await innerFetch(url, init);
 					if (!live()) return response;
 					row.status = response.status;
 					if (!response.ok) {
@@ -175,6 +180,9 @@ export function observeLlmRegistry(
 				transport: "sse",
 				fetch: observeFetch,
 				onProviderStreamEvent: (raw) => {
+					// Let the caller's observer (the inactivity clock) see every
+					// event first; its liveness must not depend on our live() gate.
+					void callerStreamEvent?.(raw, model);
 					if (
 						!live() ||
 						call.ambiguous ||
@@ -247,6 +255,7 @@ export function observeLlmRegistry(
 	};
 	return {
 		registry: wrapped,
+		isSupported: () => supported && calls.every((call) => call.count > 0),
 		close() {
 			for (const call of calls) {
 				if (call.count === 0) supported = false;

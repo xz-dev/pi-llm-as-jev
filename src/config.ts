@@ -35,7 +35,14 @@ export type JudgmentThinkingLevel =
 	| "max";
 
 export const DEFAULT_MODE: JudgmentMode = "auto";
-export const DEFAULT_TIMEOUT_MS = 120_000;
+/** Native classifier default: one absolute logical-call deadline. A slower
+ * class model is a performance problem, not a reason for a longer wait. */
+export const DEFAULT_NATIVE_TIMEOUT_MS = 60_000;
+/** LLM default: Pi's own HTTP idle timeout (`httpIdleTimeoutMs`), read from the
+ * host settings when available; this constant is Pi's documented default. */
+export const DEFAULT_HOST_IDLE_TIMEOUT_MS = 300_000;
+/** @deprecated Single-value default retired; kept for compatibility reads. */
+export const DEFAULT_TIMEOUT_MS = DEFAULT_NATIVE_TIMEOUT_MS;
 
 export interface JudgmentConfig {
 	mode: JudgmentMode;
@@ -55,7 +62,9 @@ export interface JudgmentConfig {
 	/** Provider portion of `model`, before the first slash. */
 	provider?: string;
 	thinkingLevel: JudgmentThinkingLevel;
-	timeoutMs: number;
+	/** Explicit default for calls that omit `timeoutMs`. Unset means backend
+	 * defaults: native 60 s absolute, LLM Pi's `httpIdleTimeoutMs` inactivity. */
+	timeoutMs?: number;
 	contextLimits?: ContextLimitOverrides;
 }
 
@@ -109,7 +118,6 @@ function defaultConfig(): JudgmentConfig {
 	return {
 		mode: DEFAULT_MODE,
 		thinkingLevel: "off",
-		timeoutMs: DEFAULT_TIMEOUT_MS,
 	};
 }
 
@@ -466,7 +474,9 @@ export async function saveConfig(
 	// 5. Exactly the validated known fields plus preserved extras.
 	next.mode = merged.config.mode;
 	next.thinkingLevel = merged.config.thinkingLevel;
-	next.timeoutMs = merged.config.timeoutMs;
+	if (merged.config.timeoutMs !== undefined)
+		next.timeoutMs = merged.config.timeoutMs;
+	else delete next.timeoutMs;
 	if (merged.config.model !== undefined) {
 		next.model = merged.config.model;
 	}

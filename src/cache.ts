@@ -88,6 +88,14 @@ export interface PendingJudgment {
 	answer?: ClassifierAnswer;
 	errorMessage?: string;
 	contextOverflow?: boolean;
+	/**
+	 * Owner's wait policy for join compatibility (F6 timeout slice): an LLM
+	 * pending entry records its inactivity window so a caller with a
+	 * different window never silently inherits an incompatible owner's
+	 * clock. Absent means join-compatible for any caller (native shares one
+	 * absolute deadline; the joiner remains bounded by its own).
+	 */
+	waitTag?: string;
 }
 
 export interface RawJudgmentCache {
@@ -99,6 +107,9 @@ export interface RawJudgmentCache {
 	 * fresh evaluation while same-token retries still reuse it (F6).
 	 */
 	pending: Map<string, Promise<PendingJudgment>>;
+	/** Owner's wait policy per pending key (LLM inactivity window); absent
+	 *  means joinable by any caller. */
+	pendingWait: Map<string, string>;
 	/** Exact envelopes rejected for context size; never resent unchanged. */
 	rejected: Set<string>;
 	/** Evaluation keys answered per forced-review token. */
@@ -110,6 +121,7 @@ export interface RawJudgmentCache {
 export const newCache = (generation: number): RawJudgmentCache => ({
 	answers: new Map(),
 	pending: new Map(),
+	pendingWait: new Map(),
 	rejected: new Set(),
 	fresh: new Map(),
 	generation,
@@ -143,10 +155,15 @@ export function trackPending(
 	cache: RawJudgmentCache,
 	key: string,
 	promise: Promise<PendingJudgment>,
+	waitTag?: string,
 ): void {
 	cache.pending.set(key, promise);
+	if (waitTag !== undefined) cache.pendingWait.set(key, waitTag);
 	const cleanup = () => {
-		if (cache.pending.get(key) === promise) cache.pending.delete(key);
+		if (cache.pending.get(key) === promise) {
+			cache.pending.delete(key);
+			cache.pendingWait.delete(key);
+		}
 	};
 	void promise.then(cleanup, cleanup);
 }
@@ -165,6 +182,7 @@ export function settlePending(
 		// The pending entry (if still present) belongs to the failed batch;
 		// delete it so subdivided children dispatch instead of joining it.
 		cache.pending.delete(key);
+		cache.pendingWait.delete(key);
 	}
 }
 

@@ -83,6 +83,8 @@ function chatModel(reasoning = false) {
 	} as Parameters<typeof llmClassify>[1];
 }
 
+type ChatModel = Parameters<typeof llmClassify>[1];
+
 /** Scripted streamSimple fake: records every call, returns queued messages. */
 class FakeLlmRegistry implements LlmRegistry {
 	calls: {
@@ -101,6 +103,13 @@ class FakeLlmRegistry implements LlmRegistry {
 	throwResultSync = false;
 	/** When set, result() rejects asynchronously. */
 	rejectResult = false;
+	/** Scripted per-call behaviors: `useFetch` makes the adapter consume the
+	 *  request-scoped `options.fetch` body (real adapter behavior). */
+	scripts: {
+		delayMs?: number;
+		useFetch?: boolean;
+		events?: unknown[];
+	}[] = [];
 	/** Optional hook after a dispatch is recorded. */
 	onDispatch: (() => void) | undefined = undefined;
 
@@ -109,7 +118,7 @@ class FakeLlmRegistry implements LlmRegistry {
 	}
 
 	streamSimple(
-		_model: never,
+		_model: ChatModel,
 		context: Parameters<LlmRegistry["streamSimple"]>[1],
 		options?: Parameters<LlmRegistry["streamSimple"]>[2],
 	) {
@@ -119,6 +128,7 @@ class FakeLlmRegistry implements LlmRegistry {
 			userContent: String((context.messages[0] as { content: string }).content),
 		});
 		const next = this.queue.shift() ?? assistantMessage([]);
+		const script = this.scripts.shift() ?? {};
 		const signal = options?.signal;
 		this.onDispatch?.();
 		if (this.throwSync) {
@@ -166,7 +176,24 @@ class FakeLlmRegistry implements LlmRegistry {
 			};
 		}
 		return {
-			result: async () => next,
+			result: async () => {
+				if (script.delayMs)
+					await new Promise((r) => setTimeout(r, script.delayMs));
+				if (script.useFetch) {
+					// Scripted transport: read the body through the request-scoped
+					// fetch option, like real adapters — byte gaps reach the
+					// plugin's inactivity observer.
+					const response = await options!.fetch!("https://fake.invalid/x", {
+						signal,
+					});
+					const reader = response.body?.getReader();
+					if (reader) while (!(await reader.read()).done) {}
+				}
+				for (const event of script.events ?? [])
+					await options?.onProviderStreamEvent?.(event, _model);
+				if (options?.signal?.aborted) return assistantMessage([], "aborted");
+				return next;
+			},
 		};
 	}
 }
@@ -416,7 +443,7 @@ test("caller abort yields stopReason aborted before any call", async () => {
 	assert.equal(registry.calls.length, 0);
 });
 
-test("deadline expires before the per-question call: structured timeout error", async () => {
+test("already-expired inactivity value yields a structured timeout error", async () => {
 	const registry = new FakeLlmRegistry();
 	const result = await llmClassify(
 		registry,
@@ -425,7 +452,7 @@ test("deadline expires before the per-question call: structured timeout error", 
 			state: {},
 			questions: { q: CHOICE_QUESTION },
 		},
-		{ timeoutMs: -1 },
+		{ timeoutMs: 0 },
 	);
 	assert.equal(result.stopReason, "error");
 	assert.match(result.errorMessage ?? "", /timed out/);
@@ -555,6 +582,188 @@ test("canceled caller plus rejection resolves as aborted, not an unhandled rejec
 	assert.equal(result.stopReason, "aborted");
 	assert.deepEqual(result.answers, {});
 	assert.equal(registry.calls.length, 1);
+});
+
+// --- backend-specific timeout semantics (LLM = inactivity) ---
+
+/** SSE-ish byte stream that emits `count` chunks with `gapMs` between. */
+function streamingFetch(
+	chunks: number,
+	gapMs: number,
+): typeof globalThis.fetch {
+	return async () => {
+		const encoder = new TextEncoder();
+		let sent = 0;
+		const body = new ReadableStream<Uint8Array>({
+			async pull(controller) {
+				if (sent >= chunks) {
+					controller.close();
+					return;
+				}
+				await new Promise((r) => setTimeout(r, gapMs));
+				sent += 1;
+				controller.enqueue(encoder.encode(`data: chunk-${sent}\n\n`));
+			},
+		});
+		return new Response(body, { status: 200 });
+	};
+}
+
+/** Fetch that never resolves (provider accepted the request, no response). */
+function firstByteHangFetch(): typeof globalThis.fetch {
+	return () => new Promise<Response>(() => {});
+}
+
+test("LLM total duration beyond timeoutMs succeeds while gaps stay under it", async () => {
+	const registry = new FakeLlmRegistry();
+	registry.replay([
+		assistantMessage([toolCall({ choice: "ship" })]),
+		assistantMessage([toolCall({ value: true })]),
+	]);
+	// Each question's transport drips 4 chunks at 15ms gaps: ~60ms per
+	// question, ~120ms total — the OLD whole-call 40ms budget would fail.
+	registry.scripts = [{ useFetch: true }, { useFetch: true }];
+	const result = await withTimeout(
+		llmClassify(
+			registry,
+			chatModel(),
+			{ state: {}, questions: { v: CHOICE_QUESTION, g: BOOL_QUESTION } },
+			{ timeoutMs: 40, fetch: streamingFetch(4, 15) },
+		),
+		1000,
+		"llmClassify hung past streaming drain",
+	);
+	assert.equal(result.stopReason, "stop");
+	assert.equal(result.answers.v?.type, "choice");
+	assert.equal(result.answers.g?.type, "bool");
+	assert.equal(registry.calls.length, 2);
+	// The inactivity observer travelled through options.fetch on both calls.
+	assert.equal(registry.calls.length, 2);
+});
+
+test("LLM inactivity resets per question and per raw chunk", async () => {
+	const registry = new FakeLlmRegistry();
+	registry.replay([
+		assistantMessage([toolCall({ choice: "ship" })]),
+		assistantMessage([toolCall({ value: true })]),
+	]);
+	// Question 1 drips ~65ms through the scripted fetch tap; question 2 is a
+	// quick normal call. Each provider request gets a fresh clock, so a
+	// total beyond timeoutMs is legal while each gap stays below it.
+	registry.scripts = [{ useFetch: true }, { delayMs: 5 }];
+	const started = Date.now();
+	const result = await llmClassify(
+		registry,
+		chatModel(),
+		{ state: {}, questions: { v: CHOICE_QUESTION, g: BOOL_QUESTION } },
+		{ timeoutMs: 30, fetch: streamingFetch(5, 13) },
+	);
+	assert.equal(result.stopReason, "stop");
+	assert.ok(Date.now() - started > 30, "total exceeded the idle window");
+	assert.equal(registry.calls.length, 2);
+});
+
+test("LLM silent body stall fails boundedly at the inactivity window", async () => {
+	const registry = new FakeLlmRegistry();
+	// The adapter reads the response body through options.fetch; its stream
+	// stays silent until the plugin's inactivity signal aborts it.
+	const silentFetch: typeof globalThis.fetch = async () =>
+		new Response(
+			new ReadableStream<Uint8Array>({
+				pull() {
+					return new Promise(() => {});
+				},
+			}),
+			{ status: 200 },
+		);
+	registry.scripts = [{ useFetch: true }];
+	const result = await withTimeout(
+		llmClassify(
+			registry,
+			chatModel(),
+			{ state: {}, questions: { q: CHOICE_QUESTION } },
+			{ timeoutMs: 30, fetch: silentFetch },
+		),
+		500,
+		"silent stream did not settle boundedly",
+	);
+	assert.equal(result.stopReason, "error");
+	assert.match(result.errorMessage ?? "", /timed out after 30ms/);
+	assert.equal(registry.calls.length, 1);
+});
+
+test("LLM no-first-response fails boundedly even when registry ignores signal", async () => {
+	const registry = new FakeLlmRegistry();
+	// fetch promise never resolves AND result() waits on the fetch: the
+	// plugin's own inactivity signal aborts the stalled fetch.
+	registry.scripts = [{ useFetch: true }];
+	registry.hang = true;
+	const result = await withTimeout(
+		llmClassify(
+			registry,
+			chatModel(),
+			{ state: {}, questions: { q: CHOICE_QUESTION } },
+			{ timeoutMs: 30, fetch: firstByteHangFetch() },
+		),
+		500,
+		"first-byte stall did not settle boundedly",
+	);
+	assert.equal(result.stopReason, "error");
+	assert.match(result.errorMessage ?? "", /timed out after 30ms/);
+});
+
+test("provider stream events count as activity (reasoning/tool adapters)", async () => {
+	const registry = new FakeLlmRegistry();
+	registry.replay([assistantMessage([toolCall({ choice: "ship" })])]);
+	// Adapter emits provider stream events (reasoning deltas etc.) every
+	// 10ms for 45ms, then answers. No fetch body needed for this adapter.
+	registry.scripts = [{ events: [null, null, null, null], delayMs: 55 }];
+	// Emit one event per ~11ms inside result(): spread via the script's
+	// event list consumed in a loop with a small wait.
+	const original = registry.streamSimple.bind(registry);
+	registry.streamSimple = (model: never, context, options) => {
+		const call = original(model, context, options);
+		let fired = 0;
+		const beat = setInterval(() => {
+			fired += 1;
+			void options?.onProviderStreamEvent?.(
+				{ type: "reasoning-delta", n: fired },
+				model,
+			);
+			if (fired >= 5) clearInterval(beat);
+		}, 10);
+		return {
+			result: async () => {
+				const message = await call.result();
+				clearInterval(beat);
+				return message;
+			},
+		};
+	};
+	const result = await withTimeout(
+		llmClassify(
+			registry,
+			chatModel(),
+			{ state: {}, questions: { q: CHOICE_QUESTION } },
+			{ timeoutMs: 35 },
+		),
+		500,
+		"event-driven activity did not keep the call alive",
+	);
+	assert.equal(result.stopReason, "stop");
+	assert.equal(result.answers.q?.type, "choice");
+});
+
+test("no timeoutMs keeps prior behavior (no plugin inactivity timer)", async () => {
+	const registry = new FakeLlmRegistry();
+	registry.replay([assistantMessage([toolCall({ choice: "ship" })])]);
+	registry.scripts = [{ delayMs: 5 }];
+	const result = await llmClassify(registry, chatModel(), {
+		state: {},
+		questions: { q: CHOICE_QUESTION },
+	});
+	assert.equal(result.stopReason, "stop");
+	assert.equal(registry.calls[0]?.options?.timeoutMs, undefined);
 });
 
 // --- own-key preservation for legal JSON labels and question ids ---

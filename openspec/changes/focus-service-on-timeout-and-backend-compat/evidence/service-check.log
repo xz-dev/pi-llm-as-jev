@@ -1,0 +1,773 @@
+
+> pi-llm-as-jev@0.1.0 check
+> npm run lint && npm run typecheck && npm run test && npm run build
+
+
+> pi-llm-as-jev@0.1.0 lint
+> biome check src test
+
+The number of diagnostics exceeds the limit allowed. Use --max-diagnostics to increase it.
+Diagnostics not shown: 80.
+Checked 43 files in 88ms. No fixes applied.
+Found 98 warnings.
+Found 2 infos.
+
+> pi-llm-as-jev@0.1.0 typecheck
+> tsc -p tsconfig.check.json
+
+
+> pi-llm-as-jev@0.1.0 test
+> tsx --test
+
+✔ jev identity filter keeps jev variants, rejects other classifiers (2.069049ms)
+✔ selection order follows provider priority then id (1.294884ms)
+✔ findJevModel returns undefined when nothing jev is available (0.57978ms)
+✔ classifyWithJev delegates to the selected model and registry result (1.240371ms)
+✔ none-available error is structured, not thrown (0.786288ms)
+✔ pre-aborted caller yields aborted without discovery or classify (0.464243ms)
+✔ abort during classification surfaces the registry's aborted result (6.336061ms)
+✔ timeout returns a structured timeout error without waiting forever (40.110896ms)
+✔ classify rejection is a structured error, never thrown (0.647337ms)
+✔ hung discovery settles as a timeout error even when the registry ignores the signal (16.510729ms)
+✔ caller abort during hung discovery yields aborted, not error (20.445066ms)
+✔ expired deadline after discovery returns timeout error without dispatching classify (10.429767ms)
+✔ no-dispatch guarantee holds even for a slow classify result arriving late (29.716886ms)
+✔ classifyWithModel dispatches the pinned model without rediscovery (0.803551ms)
+✔ classifyWithModel honors caller abort before dispatch (0.249479ms)
+✔ classifyWithModel never dispatches after the deadline (30.414898ms)
+✔ classifyWithNative explicit non-Jev selection pins that exact model (0.891105ms)
+✔ classifyWithNative missing explicit model does not substitute another native model (0.390965ms)
+✔ classifyWithNative own emulation reference is rejected, never dispatched (0.296768ms)
+✔ classifyWithNative default still prefers Jev by provider priority (0.308379ms)
+✔ classifyWithJev keeps working as the standalone Jev entry point (0.212229ms)
+✔ answer tool schemas are discrete and carry no confidence inputs (3.53203ms)
+✔ choice answer validates, unknown label rejected (0.640935ms)
+✔ bool and score selections validate; malformed arguments rejected (0.379363ms)
+✔ compatibility fields encode discrete selection locally (0.582164ms)
+✔ thinking levels: supported off sends no reasoning, unsupported clamps up (0.587244ms)
+✔ successful choice/bool/score run: discrete answers, summed usage, provenance (2.541458ms)
+✔ prose-only first response gets exactly one retry, then error (0.463691ms)
+✔ malformed then valid: retry succeeds with two calls total (0.301207ms)
+✔ provider stopReason error is reported, not retried (0.289084ms)
+✔ caller abort yields stopReason aborted before any call (0.238018ms)
+✔ already-expired inactivity value yields a structured timeout error (0.202751ms)
+✔ hung streamSimple settles as a timeout error even when it ignores the signal (16.603724ms)
+✔ deadline-driven abort message is a timeout error, not aborted (20.909769ms)
+✔ timeout failure does not trigger the malformed-output retry (16.392146ms)
+✔ system prompt treats state as untrusted data (0.434387ms)
+✔ system prompt forbids confidence self-report without banning score levels (0.24485ms)
+✔ synchronous streamSimple throw resolves as structured error with one dispatch (0.710997ms)
+✔ synchronous result() throw resolves as structured error with one dispatch (0.514116ms)
+✔ asynchronous result() rejection resolves as structured error with one dispatch (2.225804ms)
+✔ canceled caller plus rejection resolves as aborted, not an unhandled rejection (2.055986ms)
+✔ LLM total duration beyond timeoutMs succeeds while gaps stay under it (155.752645ms)
+✔ LLM inactivity resets per question and per raw chunk (72.463056ms)
+✔ LLM silent body stall fails boundedly at the inactivity window (30.261871ms)
+✔ LLM no-first-response fails boundedly even when registry ignores signal (31.062596ms)
+✔ provider stream events count as activity (reasoning/tool adapters) (56.034201ms)
+✔ no timeoutMs keeps prior behavior (no plugin inactivity timer) (5.812627ms)
+✔ __proto__ choice label survives compatibility probabilities (0.431481ms)
+✔ arbitrary JSON question id survives as an answer key (0.336553ms)
+✔ identity is stable for identical inputs (2.423426ms)
+✔ backend, model, thinking, state, evidence, question all affect identity (0.868232ms)
+✔ ordered evidence distinguishes identity: order matters, fragment bounds matter (0.568588ms)
+✔ previousAnswers are part of identity (stage histories cannot collide) (0.574159ms)
+✔ fresh token membership gates eligibility (1.12232ms)
+✔ final-stage flag distinguishes identity (F6) (0.475344ms)
+✔ pending join resolves and cleans up (14.49004ms)
+✔ cache generation separates branch scopes (0.653498ms)
+✔ channel constant: TypeSafe direct Jev discloses channel limits and the prior (4.942792ms)
+✔ override wins over channel constant (0.940388ms)
+✔ model metadata is the fallback; absent metadata is reported, not inferred (1.413647ms)
+✔ LLM selection discloses envelope overhead; config change reflected on next call (0.957911ms)
+✔ judge result freezes prediction capacity; the next query exposes learned calibration (9.147908ms)
+✔ selection query neither runs inference nor appends entries; pre-abort does not discover (0.972077ms)
+✔ digest is stable and input-sensitive (2.6652ms)
+✔ channelKey distinguishes backend and model (0.636016ms)
+✔ prior ratio alone predicts overflow against declared context window (0.883872ms)
+✔ request constraint fires when state+all questions exceed but longest alone fits (0.502214ms)
+✔ learned tokensPerByte replaces the prior (0.437532ms)
+✔ observed overflow records a rejection; dominated rejections prune (0.596261ms)
+✔ duplicate rejection is not recorded twice (0.235803ms)
+✔ LLM envelope overhead is a positive constant (0.495912ms)
+✔ transferred predictor samples preserve separate dimensions before and after learning (2.785787ms)
+✔ sync operation reads match async validation, ignore timestamps and recover (33.29356ms)
+✔ unreadable path yields defaults plus diagnostic, never throws (1.435058ms)
+✔ directory-as-config-file yields defaults plus diagnostic, never throws (3.12227ms)
+✔ any invalid known field defaults ALL known fields (0.789194ms)
+✔ an invalid model reference also defaults the whole file (0.532531ms)
+✔ an invalid explicit classifier reference defaults the whole file (0.40445ms)
+✔ mixed valid/invalid file on disk defaults all known fields (2.902296ms)
+✔ old jev mode value is invalid, not silently aliased (0.566175ms)
+✔ saveConfig over an unreadable existing file recovers and replaces it (6.000931ms)
+✔ saveConfig onto a directory-named config file fails without leaving a temp file (4.244289ms)
+✔ saveConfig temporary names are unique across rapid sequential saves (2.064131ms)
+✔ missing file yields defaults, no diagnostics (0.698272ms)
+✔ valid file parses all fields including an independent classifierModel (1.003577ms)
+✔ malformed JSON yields defaults plus diagnostic (1.958351ms)
+✔ unknown enum values produce diagnostics and all-defaults (0.28728ms)
+✔ model without provider/id is rejected and defaults the whole file (0.145894ms)
+✔ model split at first slash keeps slashes in modelid (0.080191ms)
+✔ classifierModel split at first slash keeps slashes in model id (0.07421ms)
+✔ invalid timeoutMs falls back to all-defaults (0.289624ms)
+✔ home fallback when env unset (0.53195ms)
+✔ agentDir honors PI_CODING_AGENT_DIR (0.337945ms)
+✔ saveConfig round-trips, preserves unknown keys and independent slots (5.781729ms)
+✔ saveConfig classifier-only update leaves the LLM slot untouched (2.943815ms)
+✔ saveConfig LLM-only update leaves the classifier slot untouched (4.928375ms)
+✔ removing classifierModel restores default discovery without touching chat fields (2.773624ms)
+✔ saveConfig writes 0600 and no stale temp files (2.770759ms)
+✔ saveConfig over a malformed file starts clean but keeps unknown keys absent (4.13279ms)
+✔ a syntactically valid explicit classifier is preserved as an unavailable selection (0.292459ms)
+✔ legacy invalid mode plus native save keeps the confirmed selection (3.619905ms)
+✔ malformed setting plus chat/mode save normalizes base and persists choice (1.810704ms)
+✔ null removal clears a slot over a file with other invalid known fields (2.140363ms)
+✔ invalid update fails without writing, leaving disk unchanged (2.558129ms)
+✔ unknown own __proto__/constructor/toString extras survive without prototype mutation (2.859386ms)
+✔ disk and returned config agree for independent slots (3.2) (1.176733ms)
+✔ contract module has no @earendil-works imports (6.429787ms)
+✔ contract is a pure re-export of the canonical client types (4.106359ms)
+✔ contract shapes typecheck against pi-ai classifier values (0.702651ms)
+✔ test/fixtures/refresh-native.mjs (864.231413ms)
+✔ handle published after registry bind and cleared on shutdown (identity-checked) (758.00267ms)
+✔ consumer load-before-service sees undefined until activation (10.41499ms)
+✔ judge() dispatches through the adapted registry to the host classify (27.289222ms)
+✔ availability() reports classifier and llm slots through the adapted registry (25.857009ms)
+✔ invalid config diagnostics are reported exactly once per session (18.326463ms)
+✔ /llm-as-jev mode classifier persists to the config file (9.226295ms)
+✔ invalid mode (including the old jev alias) shows usage, writes nothing (8.696228ms)
+✔ bare command and `status` show the overview without picker, write or inference (17.775056ms)
+✔ service unbound: overview reports runtime-not-ready, no writes (5.736945ms)
+✔ overview shows Auto(llm) without picker, writes or inference (6.364024ms)
+✔ Auto(None) warns to configure either backend without claiming quota checks (7.293732ms)
+✔ configured-but-uncredentialed LLM retains its reference as unavailable (5.893459ms)
+✔ forced classifier mode warns and never claims the usable LLM is active (5.311605ms)
+✔ forced llm mode warns about the required LLM despite a usable classifier (14.190017ms)
+✔ status reports an unavailable explicit classifier without claiming another (4.371197ms)
+✔ only /llm-as-jev is registered; the classifier alias is gone (3.689797ms)
+✔ completions offer every subcommand on empty prefix and filter `ll` (4.384712ms)
+✔ description and unknown-argument usage name all entries, not the alias (4.666413ms)
+✔ cancel at the chat model picker leaves disk and memory unchanged (6.20222ms)
+✔ cancel at the level picker leaves nothing saved, including the pending model (13.304071ms)
+✔ chat confirm persists model+level, refreshes provider metadata and leaves classifierModel alone (5.419258ms)
+✔ /llm-as-jev classifier selects a non-Jev native model without touching chat (5.694415ms)
+✔ classifier selection changes the NEXT native judgment immediately (9.123361ms)
+✔ classifier picker cancel leaves disk and memory unchanged (7.252374ms)
+✔ classifier picker with an empty available list notifies and writes nothing (7.690718ms)
+✔ classifier mode with unavailable explicit selection errors without substitution (19.282771ms)
+✔ unknown catalog chat model behaves unconfigured (4.942792ms)
+✔ no custom UI is requested outside TUI mode (5.15987ms)
+✔ retained production handle reads each admission once and preserves overlapping snapshots (6.156243ms)
+✔ status, guidance and native picker read external saves on their first operation (7.438594ms)
+✔ status rows and availability share one snapshot across discovery (14.395553ms)
+✔ running extension defaults on invalid/unreadable/missing settings and recovers once warned (6.596461ms)
+✔ open LLM dialog preserves a later save (cancel step confirm) (7.43107ms)
+✔ open LLM dialog preserves a later save (cancel step 1) (8.47869ms)
+✔ open LLM dialog preserves a later save (cancel step 2) (7.951939ms)
+✔ failed dialog confirmation does not publish tentative settings (9.302688ms)
+✔ ledger append routes through two-argument appendEntry and branch restore runs (26.594837ms)
+✔ returns undefined when no service is published (2.677073ms)
+✔ returns the published object (0.481886ms)
+✔ set/restore leaves the registry clean (1.411824ms)
+✔ writeLedger uses the two-argument append and reports failures (3.656955ms)
+✔ isOwnBookkeeping matches only our custom type (0.642057ms)
+✔ restoreLedger replays judgments, rejections and capacity in branch order (0.771159ms)
+✔ restoreLedger ignores malformed and foreign entries (0.385915ms)
+✔ restoreLedger later judgment for the same key wins (branch order) (0.511572ms)
+✔ ledger records never contain state/evidence bodies or secrets by construction (0.32458ms)
+✔ legacy jev-tagged judgment entries are stale and never restored (0.462119ms)
+﹣ native: live sessions refresh the actual candidate without priming or reload (1.225414ms) # SKIP
+✔ explicit non-Jev classifier reference is honored exactly (1.869895ms)
+✔ explicit reference with slash inside the model id resolves via first-slash split (0.454905ms)
+✔ explicit reference with a wrong (non-classifier) type is unavailable (0.427704ms)
+✔ missing explicit classifier never substitutes another native model (0.234601ms)
+✔ own emulation provider is rejected even when explicitly referenced (0.146455ms)
+✔ no explicit reference keeps Jev provider-priority discovery (0.326133ms)
+✔ no explicit reference does not pick an arbitrary non-Jev classifier (0.264457ms)
+✔ classifyWithModel dispatches the already-selected model without rediscovery (1.182513ms)
+✔ renders items in caller order (alphabetical provider/id) (7.530948ms)
+✔ preselects the real index without reordering (0.748447ms)
+✔ typing filters through the fuzzy helper while keeping order (4.336633ms)
+✔ cancel (escape) resolves undefined and nothing else (0.544684ms)
+✔ enter selects the highlighted item (0.440388ms)
+✔ arrow keys move within filtered results (0.868242ms)
+✔ no filter callback disables filtering (level picker shape) (0.572767ms)
+✔ empty match set renders a no-match state and enter is a no-op (1.263546ms)
+✔ fuzzyFilter from pi-tui reorders, our filter preserves input order (1.816084ms)
+✔ isContextOverflow recognizes explicit context-length errors (6.935248ms)
+✔ isContextOverflow rejects non-overflow errors (0.685349ms)
+✔ sizeOf measures state and question bytes, longest question separately (0.676561ms)
+✔ splitQuestions halves id lists, undefined for singletons (1.056296ms)
+✔ splitPiece splits record lists by count (0.379573ms)
+✔ splitPiece fragments one long record with Unicode-safe bounds (0.741784ms)
+✔ splitPiece refuses records too small to halve (1.306296ms)
+✔ frameEvidence + toModelEvidence keep bounds outside caller metadata (0.407546ms)
+✔ boolCertainty is max(p, 1-p) (1.433435ms)
+✔ default confidence threshold applies to choice and score (0.399441ms)
+✔ bool answers use certainty max(p,1-p) against the default (0.313059ms)
+✔ named-choice probability rule beats overall confidence (0.262934ms)
+✔ per-question rule replaces (not stacks with) the default (0.443123ms)
+✔ no rule at all accepts everything on jev (0.411203ms)
+✔ LLM backend ignores every numeric rule; nothing drops (0.274286ms)
+✔ measuredValue handles missing probability and non-choice questions (0.178375ms)
+✔ unconfigured: no classifier model is exposed (3.082535ms)
+✔ configured: one classifier model with chat-derived contextWindow and cost (0.483429ms)
+✔ configured but chat model unknown to registry: no models advertised (0.195989ms)
+✔ availability delegates to the underlying chat provider auth (0.419318ms)
+✔ classify delegates to the LLM backend with provenance and no leaked chat models (2.28199ms)
+✔ classify with vanished chat model returns a structured error (0.32449ms)
+✔ provider snapshots refresh metadata and retained-descriptor dispatch without re-registration (0.660191ms)
+✔ in-flight provider repair keeps model, thinking and timeout across an edit (1.535186ms)
+✔ registerEmulatedClassifierProvider registers through the native form (0.328858ms)
+✔ exact README snippets compile and run with explicit external bindings (1334.036538ms)
+✔ redactString replaces every occurrence of each secret (1.498236ms)
+✔ redactJson walks nested objects, arrays, keys and values (0.614115ms)
+✔ redactJson preserves legal own keys like __proto__ (0.280487ms)
+✔ redactJson does not mutate the input (0.1969ms)
+✔ redactJson preserves shared references that are not cycles (1.100368ms)
+✔ resolveKnownSecrets collects api keys through the registry only (0.701739ms)
+✔ resolveKnownSecrets with no provider list resolves nothing (0.288102ms)
+✔ R1: joined caller must not accept error provider partial answers (23.83614ms)
+✔ R1: joined caller must not accept aborted provider partial answers (12.71339ms)
+✔ R1: concurrent overflow recovery retains raw answers for each caller's policy (14.118392ms)
+✔ R2: spent auth deadline forbids dispatch and successful result (30.30411ms)
+✔ R2: configured auth deadline also forbids dispatch (31.148146ms)
+✔ R2: discovery receives aborted deadline signal (20.43129ms)
+✔ R2: expiry between recovery leaves forbids further dispatch and late persistence (35.815892ms)
+✔ R2: a timed-out waiter cannot abort the independent owner's signal (21.371347ms)
+✔ R3: capacity observations recorded for active branch replay (1.940568ms)
+✔ R3: empty new branch does not retain learned overflow profile (3.186731ms)
+✔ R3: compact active-branch capacity alone restores in a fresh service (2.737747ms)
+✔ R4: named-choice rule on bool rejected before dispatch (0.391136ms)
+✔ R4: named-choice rule requires an own existing choice question (0.471196ms)
+✔ R4: existing empty own choice key remains legal through gates, cache and restore (1.340661ms)
+✔ B1: elapsed synchronous discovery aborts its supplied deadline signal (45.529292ms)
+✔ B1: late rejected discovery cannot terminate the caller process (360.41065ms)
+✔ B2: actual pre-repair failed-join ledger rows require a fresh judgment (1.2711ms)
+✔ review: discovery is separately visible and judge keeps version 1 behavior (2.046016ms)
+✔ review: failed stage returns empty final answers, keeps durable committed stages, reload sends only unresolved (38.587091ms)
+✔ review: diagnostics report actual attempts with per-field known sums and missing counts (3.305474ms)
+✔ review: Cloudflare direct-failed HTTP 200 retains metering (17) without answers or coverage (5.231786ms)
+✔ review: Cloudflare direct-failed HTTP 200 retains metering (undefined) without answers or coverage (4.30867ms)
+✔ review: Cloudflare nested-failed HTTP 200 retains metering (17) without answers or coverage (2.573809ms)
+✔ review: Cloudflare nested-failed HTTP 200 retains metering (undefined) without answers or coverage (2.933104ms)
+✔ review: Cloudflare failed-state HTTP 200 retains metering (17) without answers or coverage (2.876307ms)
+✔ review: Cloudflare failed-state HTTP 200 retains metering (undefined) without answers or coverage (2.63851ms)
+✔ review: Cloudflare running-state HTTP 200 retains metering (17) without answers or coverage (2.252524ms)
+✔ review: Cloudflare running-state HTTP 200 retains metering (undefined) without answers or coverage (4.320082ms)
+✔ review: Cloudflare direct-failed HTTP 400 retains metering (17) without answers or coverage (2.386637ms)
+✔ review: Cloudflare direct-failed HTTP 400 retains metering (undefined) without answers or coverage (4.857632ms)
+✔ review: Cloudflare nested-failed HTTP 400 retains metering (17) without answers or coverage (1.969823ms)
+✔ review: Cloudflare nested-failed HTTP 400 retains metering (undefined) without answers or coverage (1.706068ms)
+✔ review: Cloudflare failed-state HTTP 400 retains metering (17) without answers or coverage (2.794924ms)
+✔ review: Cloudflare failed-state HTTP 400 retains metering (undefined) without answers or coverage (3.078077ms)
+✔ review: Cloudflare running-state HTTP 400 retains metering (17) without answers or coverage (2.425029ms)
+✔ review: Cloudflare running-state HTTP 400 retains metering (undefined) without answers or coverage (1.735633ms)
+✔ review: adapter ignoring public fetch fails explicitly with no fake counts (1.067657ms)
+✔ review: stage append failure is not acknowledged as durable progress (2.056286ms)
+✔ review: legacy judge keeps final-only answers and records no stage progress (2.844497ms)
+✔ review limits are validated model-scoped settings and survive unrelated saves (43.76172ms)
+✔ invalid limits default all known settings without echoing their values (0.761501ms)
+✔ milestone: no jev, LLM answers choice/bool/score discretely with backend llm (15.168035ms)
+✔ milestone: structured missing-backend errors, never a throw (2.119635ms)
+✔ milestone: repeated identical call hits the raw cache with zero new dispatches (2.566014ms)
+✔ milestone: stricter Jev caller policy on a cached raw judgment drops without re-sending (3.319911ms)
+✔ auto prefers jev when a jev classifier is available (1.313359ms)
+✔ auto without jev falls back to the configured LLM model (1.194315ms)
+✔ forced llm mode never uses a jev classifier even when available (0.939256ms)
+✔ availability reports classifier and llm identities (0.454365ms)
+✔ judge resolves (never throws) for invalid inputs (1.754198ms)
+✔ pre-aborted signal resolves aborted with no dispatch (0.462039ms)
+✔ backend provider failure resolves as structured error (1.985363ms)
+✔ backend switch misses cache and sends a new request (2.047389ms)
+✔ thinking level change misses the cache (1.569962ms)
+✔ in-flight join: concurrent identical calls send one dispatch (13.295905ms)
+✔ fresh token forces a new judgment; retries within the token reuse it (1.933755ms)
+✔ question batch overflow splits into smaller batches and merges by id (1.481305ms)
+✔ irreducible single-question overflow fails explicitly, envelope not resent (0.878251ms)
+✔ oversized single evidence record is processed through ordered Unicode-safe fragments (1.354086ms)
+✔ late-stage failure returns no final answers though earlier stages cached (1.599958ms)
+✔ no-evidence fixed state cannot fit → explicit overflow, nothing cropped (0.782371ms)
+✔ canceled waiter resolves aborted and persists no new judgments (11.32478ms)
+✔ branch switch mid-flight: late result never persists into the new branch (11.081472ms)
+✔ two judge() calls across a simulated resume send exactly one backend request (2.066876ms)
+✔ resume on jev cached data reapplies thresholds per caller (1.116349ms)
+✔ branch without the persisted answer misses (branch isolation) (0.895123ms)
+✔ resolved provider keys are redacted from outgoing state and evidence (1.688214ms)
+✔ returned error messages never contain credentials (0.754839ms)
+✔ diag accounting record per request, judgments only on success (1.180469ms)
+✔ joined answer is threshold-checked for the joining caller (10.905712ms)
+✔ timeoutMs deadline resolves error without retrying the request (62.003693ms)
+✔ explicit classifierModel dispatches that exact non-Jev model, not default Jev (1.070753ms)
+✔ missing explicit classifierModel never substitutes another native model (1.058179ms)
+✔ selected native model survives a registry change mid-request (pinned dispatch) (1.231785ms)
+✔ thinking mutation mid-flight does not change the dispatched level (1.374003ms)
+✔ native dispatch failure never falls back to the LLM (0.687773ms)
+✔ discovery sync throw resolves structured error, never rejects (0.366619ms)
+✔ discovery async rejection resolves structured error, never rejects (0.256432ms)
+✔ hanging discovery is bounded by the caller deadline (80.867596ms)
+✔ caller abort during hanging discovery resolves aborted (11.247685ms)
+✔ recursive fragment splits preserve original bounds and ALL caller metadata (1.068649ms)
+✔ service-level fragmentation preserves caller metadata through stages (2.224673ms)
+✔ selected native model switch causes a cache miss and new identity (1.257193ms)
+✔ old jev-tagged ledger entries are stale and ignored on restore (1.373282ms)
+✔ arbitrary own JSON ids/labels survive cache, policy and ledger (1.034886ms)
+✔ caller metadata with the same-named internal key is never touched and bounds are not inferred from it (1.495402ms)
+✔ forged bounds in caller metadata cannot hijack fragment ids (0.370797ms)
+✔ complete final stage only; special own JSON keys through cache and stages (0.806957ms)
+✔ F2: malformed native fields rejected, not cached/persisted/dropped (0.678606ms)
+✔ F2: missing answer for special id yields error, never inherited constructor (0.693493ms)
+✔ F2: wrong type/label/score rejected; legal own keys survive (4.799192ms)
+✔ slow native auth and rotated keys are redacted before dispatch (42.136364ms)
+✔ native fractional scores retain the adapter's reported value (1.702321ms)
+✔ F2: sanitized contract-shaped answers strip provider extras (0.700026ms)
+✔ F2: restored raw answers revalidated against current question (0.964183ms)
+✔ F5: hung auth cannot hold an already-aborted short-deadline call (0.300134ms)
+✔ F5: configured timeoutMs applies when caller omits override (25.574739ms)
+✔ F5: joined caller settles under its own deadline and abort (11.746884ms)
+✔ F5: cyclic evidence metadata resolves structured error, never rejects (0.443123ms)
+✔ F5: fractional timeout resolves structured error, never rejects (0.312558ms)
+✔ F5: non-integer / nonfinite / zero timeouts are invalid, not crashy (0.188184ms)
+✔ F5: aborted outcomes carry a safe diagnostic message (6.291919ms)
+✔ F1: selected native provider key resolved and redacted even when not in getProviders (0.995732ms)
+✔ F1: selected chat provider key redacted on llm path (0.999689ms)
+✔ F10: uncredentialed configured chat is not available (0.307468ms)
+✔ F10: credentialed configured chat IS available (0.166302ms)
+✔ F10: unknown configured chat is not available, no hang on auth (0.175601ms)
+✔ F10: availability bounds a hanging auth check (31.307967ms)
+✔ F6: recorded 32-bit collision pair produces distinct identities (1.35652ms)
+✔ F6: partial-stage judgment is never reused as full coverage (2.21802ms)
+✔ F6: reordered JSON state canonicalizes to the same identity (1.351731ms)
+✔ F6: fresh new-review never joins older ordinary pending work (12.020237ms)
+✔ F6: distinct fresh tokens never reuse each other's work (3.738198ms)
+✔ F6: restored fresh membership only reuses its own token's work (1.544344ms)
+✔ F3: accept→drop stage sequence yields final-stage view only (1.109456ms)
+✔ F3: drop→accept stage sequence yields final-stage view only (0.995211ms)
+✔ F3: later-stage error returns no final answers (0.96301ms)
+✔ F4: released stale branch completion cannot contaminate the new branch cache (6.338306ms)
+✔ F4: abort after a completed early stage persists no judgments (21.857731ms)
+✔ F4: canceled waiter does not cancel an unrelated caller's work (10.127519ms)
+✔ F7: reported two-question overflow sends both smaller batches (1.357602ms)
+✔ F7: reported eight-question overflow recovers all answers (2.240102ms)
+✔ discovery after an external save keeps the admitted configuration (0.863764ms)
+✔ unexpected failure retains the selected native identity after a save (0.555665ms)
+✔ F12: fragment texts are well-formed Unicode with exact coverage (0.570243ms)
+✔ LLM call outlives the old whole-call deadline when transport stays active (78.278709ms)
+✔ LLM caller abort resolves aborted during an in-flight stream (15.724812ms)
+✔ LLM inactivity window still bounds a stalled stream through the service (41.486633ms)
+✔ LLM callers with different inactivity windows dispatch instead of joining (40.774804ms)
+✔ LLM callers with the same inactivity window still join (41.298108ms)
+✔ test/spike-provider.ts (266.80078ms)
+✔ native: internal batches share one logical-call deadline, never reset per batch (103.705179ms)
+✔ native: the same batches succeed when the one deadline is large enough (63.483165ms)
+✔ defaults: native 60s absolute, LLM follows Pi httpIdleTimeoutMs, explicit wins (0.270569ms)
+✔ omitted timeoutMs: native call is bounded by the 60s default, reported in the error (60.499866ms)
+✔ default usable Jev shows Auto(classifier), its reference and LLM None (0.972769ms)
+✔ unavailable Jev with a usable configured LLM shows Auto(llm) (0.209795ms)
+✔ available explicit non-Jev classifier is retained exactly (0.176832ms)
+✔ Auto(None): unconfigured LLM stays None while configured refs mark unavailable (0.178896ms)
+✔ forced modes keep their labels and warn without claiming the other backend (0.210195ms)
+✔ available required slot in a forced mode emits no warning (0.07986ms)
+✔ models sort alphabetically by provider/id with localeCompare (1.022763ms)
+✔ spec: preselect configured model at its alphabetical position (0.105869ms)
+✔ spec: nothing configured highlights the first alphabetical entry (0.069751ms)
+✔ spec: true fuzzy search keeps only matches, still alphabetical (0.480904ms)
+✔ spec: reasoning model offers exactly its supported levels (0.123352ms)
+✔ spec: non-reasoning model offers only off (0.045476ms)
+✔ xhigh/max stay opt-in through the model's thinkingLevelMap (0.054803ms)
+✔ preselect configured level when supported, else model default clamped (0.074891ms)
+✔ model default is medium, clamped with Pi's up-first direction (0.030477ms)
+ℹ tests 358
+ℹ suites 0
+ℹ pass 357
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 1
+ℹ todo 0
+ℹ duration_ms 61324.80731
+
+> pi-llm-as-jev@0.1.0 build
+> tsc -p tsconfig.json && node scripts/sync-client.mjs
+
+test/native-refresh.test.ts:73:4 lint/style/useTemplate  FIXABLE  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  i Template literals are preferred over string concatenation.
+  
+    71 │ 		appendFileSync(
+    72 │ 			join(dir, "requests.jsonl"),
+  > 73 │ 			JSON.stringify(requests.at(-1)) + "\n",
+       │ 			^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    74 │ 		);
+    75 │ 		response.setHeader("content-type", "application/json");
+  
+  i Unsafe fix: Use a template literal.
+  
+     71  71 │       appendFileSync(
+     72  72 │         join(dir, "requests.jsonl"),
+     73     │ - → → → JSON.stringify(requests.at(-1))·+·"\n",
+         73 │ + → → → `${JSON.stringify(requests.at(-1))}\n`,
+     74  74 │       );
+     75  75 │       response.setHeader("content-type", "application/json");
+  
+
+test/backend-llm.test.ts:186:29 lint/style/noNonNullAssertion  FIXABLE  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  ! Forbidden non-null assertion.
+  
+    184 │ 					// fetch option, like real adapters — byte gaps reach the
+    185 │ 					// plugin's inactivity observer.
+  > 186 │ 					const response = await options!.fetch!("https://fake.invalid/x", {
+        │ 					                       ^^^^^^^^^^^^^^^
+    187 │ 						signal,
+    188 │ 					});
+  
+  i Unsafe fix: Replace with optional chain operator ?. This operator includes runtime checks, so it is safer than the compile-only non-null assertion operator
+  
+    184 184 │             // fetch option, like real adapters — byte gaps reach the
+    185 185 │             // plugin's inactivity observer.
+    186     │ - → → → → → const·response·=·await·options!.fetch!("https://fake.invalid/x",·{
+        186 │ + → → → → → const·response·=·await·options!.fetch?.("https://fake.invalid/x",·{
+    187 187 │               signal,
+    188 188 │             });
+  
+
+test/backend-llm.test.ts:186:29 lint/style/noNonNullAssertion  FIXABLE  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  ! Forbidden non-null assertion.
+  
+    184 │ 					// fetch option, like real adapters — byte gaps reach the
+    185 │ 					// plugin's inactivity observer.
+  > 186 │ 					const response = await options!.fetch!("https://fake.invalid/x", {
+        │ 					                       ^^^^^^^^
+    187 │ 						signal,
+    188 │ 					});
+  
+  i Unsafe fix: Replace with optional chain operator ?. This operator includes runtime checks, so it is safer than the compile-only non-null assertion operator
+  
+    184 184 │             // fetch option, like real adapters — byte gaps reach the
+    185 185 │             // plugin's inactivity observer.
+    186     │ - → → → → → const·response·=·await·options!.fetch!("https://fake.invalid/x",·{
+        186 │ + → → → → → const·response·=·await·options?.fetch!("https://fake.invalid/x",·{
+    187 187 │               signal,
+    188 188 │             });
+  
+
+test/backend-llm.test.ts:790:15 lint/suspicious/noProto ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  ! Avoid use of the deprecated __proto__ accessor.
+  
+    788 │ 	);
+    789 │ 	assert.equal(Object.hasOwn(answer.probabilities, "__proto__"), true);
+  > 790 │ 	assert.equal(answer.probabilities.__proto__, 1);
+        │ 	             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    791 │ 	// Own key recorded without breaking the plain-object shape consumers
+    792 │ 	// deep-compare against.
+  
+  i Object.prototype.__proto__ is an outdated way to get or set an object's prototype,
+    having been deprecated in 2009 for being inefficient and unreliable.
+  
+  i Object.getPrototypeOf() and Object.setPrototypeOf() are modern alternatives that work on all objects and are more performant.
+  
+
+test/backend-llm.test.ts:812:17 lint/suspicious/noProto ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  ! Avoid use of the deprecated __proto__ accessor.
+  
+    810 │ 	assert.deepEqual(Object.keys(result.answers), ["__proto__"]);
+    811 │ 	assert.equal(Object.hasOwn(result.answers, "__proto__"), true);
+  > 812 │ 	const answer = result.answers.__proto__ as unknown;
+        │ 	               ^^^^^^^^^^^^^^^^^^^^^^^^
+    813 │ 	assert.deepEqual(answer, { type: "bool", probability: 1 });
+    814 │ 	assert.equal(
+  
+  i Object.prototype.__proto__ is an outdated way to get or set an object's prototype,
+    having been deprecated in 2009 for being inefficient and unreliable.
+  
+  i Object.getPrototypeOf() and Object.setPrototypeOf() are modern alternatives that work on all objects and are more performant.
+  
+
+test/native-refresh.test.ts:170:4 lint/style/noNonNullAssertion ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  ! Forbidden non-null assertion.
+  
+    168 │ 		writeFileSync(join(home, "environment.json"), JSON.stringify(env, null, 2));
+    169 │ 		const child = spawn(
+  > 170 │ 			binary!,
+        │ 			^^^^^^^
+    171 │ 			[
+    172 │ 				"--mode",
+  
+
+test/native-refresh.test.ts:201:21 lint/suspicious/noExplicitAny ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  ! Unexpected any. Specify a different type.
+  
+    199 │ 		const pending = new Map<
+    200 │ 			string,
+  > 201 │ 			{ resolve(value: any): void; reject(error: Error): void }
+        │ 			                 ^^^
+    202 │ 		>();
+    203 │ 		const events: any[] = [];
+  
+  i any disables many type checking rules. Its use should be avoided.
+  
+
+test/native-refresh.test.ts:203:17 lint/suspicious/noExplicitAny ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  ! Unexpected any. Specify a different type.
+  
+    201 │ 			{ resolve(value: any): void; reject(error: Error): void }
+    202 │ 		>();
+  > 203 │ 		const events: any[] = [];
+        │ 		              ^^^
+    204 │ 		let buffer = "",
+    205 │ 			serial = 0;
+  
+  i any disables many type checking rules. Its use should be avoided.
+  
+
+test/native-refresh.test.ts:217:16 lint/suspicious/noExplicitAny ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  ! Unexpected any. Specify a different type.
+  
+    215 │ 				const line = buffer.slice(0, end);
+    216 │ 				buffer = buffer.slice(end + 1);
+  > 217 │ 				let event: any;
+        │ 				           ^^^
+    218 │ 				try {
+    219 │ 					event = JSON.parse(line);
+  
+  i any disables many type checking rules. Its use should be avoided.
+  
+
+test/native-refresh.test.ts:224:6 lint/style/noNonNullAssertion  FIXABLE  ━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  ! Forbidden non-null assertion.
+  
+    222 │ 				}
+    223 │ 				if (event.type === "response" && pending.has(event.id))
+  > 224 │ 					pending.get(event.id)!.resolve(event);
+        │ 					^^^^^^^^^^^^^^^^^^^^^^
+    225 │ 				else events.push(event);
+    226 │ 			}
+  
+  i Unsafe fix: Replace with optional chain operator ?. This operator includes runtime checks, so it is safer than the compile-only non-null assertion operator
+  
+    222 222 │           }
+    223 223 │           if (event.type === "response" && pending.has(event.id))
+    224     │ - → → → → → pending.get(event.id)!.resolve(event);
+        224 │ + → → → → → pending.get(event.id)?.resolve(event);
+    225 225 │           else events.push(event);
+    226 226 │         }
+  
+
+test/provider.test.ts:291:14 lint/style/noNonNullAssertion  FIXABLE  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  ! Forbidden non-null assertion.
+  
+    289 │ 		},
+    290 │ 	});
+  > 291 │ 	const old = provider.getAllModels!()[0] as NonNullable<
+        │ 	            ^^^^^^^^^^^^^^^^^^^^^^
+    292 │ 		ReturnType<typeof emulatedClassifierModel>
+    293 │ 	>;
+  
+  i Unsafe fix: Replace with optional chain operator ?. This operator includes runtime checks, so it is safer than the compile-only non-null assertion operator
+  
+    289 289 │       },
+    290 290 │     });
+    291     │ - → const·old·=·provider.getAllModels!()[0]·as·NonNullable<
+        291 │ + → const·old·=·provider.getAllModels?.()[0]·as·NonNullable<
+    292 292 │       ReturnType<typeof emulatedClassifierModel>
+    293 293 │     >;
+  
+
+test/provider.test.ts:295:16 lint/style/noNonNullAssertion  FIXABLE  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  ! Forbidden non-null assertion.
+  
+    293 │ 	>;
+    294 │ 	current = config({ model: "fake/next", modelId: "next", timeoutMs: 1500 });
+  > 295 │ 	const model = provider.getAllModels!()[0] as typeof old;
+        │ 	              ^^^^^^^^^^^^^^^^^^^^^^
+    296 │ 	assert.equal(model.id, "fake/next");
+    297 │ 	assert.equal(model.contextWindow, 24000);
+  
+  i Unsafe fix: Replace with optional chain operator ?. This operator includes runtime checks, so it is safer than the compile-only non-null assertion operator
+  
+    293 293 │     >;
+    294 294 │     current = config({ model: "fake/next", modelId: "next", timeoutMs: 1500 });
+    295     │ - → const·model·=·provider.getAllModels!()[0]·as·typeof·old;
+        295 │ + → const·model·=·provider.getAllModels?.()[0]·as·typeof·old;
+    296 296 │     assert.equal(model.id, "fake/next");
+    297 297 │     assert.equal(model.contextWindow, 24000);
+  
+
+test/provider.test.ts:309:23 lint/style/noNonNullAssertion  FIXABLE  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  ! Forbidden non-null assertion.
+  
+    307 │ 	};
+    308 │ 	const before = reads;
+  > 309 │ 	const result = await provider.classify!(old, context);
+        │ 	                     ^^^^^^^^^^^^^^^^^^
+    310 │ 	assert.equal(reads, before + 1);
+    311 │ 	assert.equal(result.model, "fake/next");
+  
+  i Unsafe fix: Replace with optional chain operator ?. This operator includes runtime checks, so it is safer than the compile-only non-null assertion operator
+  
+    307 307 │     };
+    308 308 │     const before = reads;
+    309     │ - → const·result·=·await·provider.classify!(old,·context);
+        309 │ + → const·result·=·await·provider.classify?.(old,·context);
+    310 310 │     assert.equal(reads, before + 1);
+    311 311 │     assert.equal(result.model, "fake/next");
+  
+
+test/provider.test.ts:318:21 lint/style/noNonNullAssertion  FIXABLE  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  ! Forbidden non-null assertion.
+  
+    316 │ 	assert.equal(timeout, undefined);
+    317 │ 	registry.authReady = false;
+  > 318 │ 	assert.equal(await provider.auth.apiKey!.check!({} as never), undefined);
+        │ 	                   ^^^^^^^^^^^^^^^^^^^^^
+    319 │ 	current = config({
+    320 │ 		model: undefined,
+  
+  i Unsafe fix: Replace with optional chain operator ?. This operator includes runtime checks, so it is safer than the compile-only non-null assertion operator
+  
+    316 316 │     assert.equal(timeout, undefined);
+    317 317 │     registry.authReady = false;
+    318     │ - → assert.equal(await·provider.auth.apiKey!.check!({}·as·never),·undefined);
+        318 │ + → assert.equal(await·provider.auth.apiKey?.check!({}·as·never),·undefined);
+    319 319 │     current = config({
+    320 320 │       model: undefined,
+  
+
+test/provider.test.ts:318:21 lint/style/noNonNullAssertion  FIXABLE  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  ! Forbidden non-null assertion.
+  
+    316 │ 	assert.equal(timeout, undefined);
+    317 │ 	registry.authReady = false;
+  > 318 │ 	assert.equal(await provider.auth.apiKey!.check!({} as never), undefined);
+        │ 	                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    319 │ 	current = config({
+    320 │ 		model: undefined,
+  
+  i Unsafe fix: Replace with optional chain operator ?. This operator includes runtime checks, so it is safer than the compile-only non-null assertion operator
+  
+    316 316 │     assert.equal(timeout, undefined);
+    317 317 │     registry.authReady = false;
+    318     │ - → assert.equal(await·provider.auth.apiKey!.check!({}·as·never),·undefined);
+        318 │ + → assert.equal(await·provider.auth.apiKey!.check?.({}·as·never),·undefined);
+    319 319 │     current = config({
+    320 320 │       model: undefined,
+  
+
+test/provider.test.ts:324:19 lint/style/noNonNullAssertion  FIXABLE  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  ! Forbidden non-null assertion.
+  
+    322 │ 		modelId: undefined,
+    323 │ 	});
+  > 324 │ 	assert.deepEqual(provider.getAllModels!(), []);
+        │ 	                 ^^^^^^^^^^^^^^^^^^^^^^
+    325 │ 	const removed = await provider.classify!(old, context);
+    326 │ 	assert.equal(removed.stopReason, "error");
+  
+  i Unsafe fix: Replace with optional chain operator ?. This operator includes runtime checks, so it is safer than the compile-only non-null assertion operator
+  
+    322 322 │       modelId: undefined,
+    323 323 │     });
+    324     │ - → assert.deepEqual(provider.getAllModels!(),·[]);
+        324 │ + → assert.deepEqual(provider.getAllModels?.(),·[]);
+    325 325 │     const removed = await provider.classify!(old, context);
+    326 326 │     assert.equal(removed.stopReason, "error");
+  
+
+test/provider.test.ts:325:24 lint/style/noNonNullAssertion  FIXABLE  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  ! Forbidden non-null assertion.
+  
+    323 │ 	});
+    324 │ 	assert.deepEqual(provider.getAllModels!(), []);
+  > 325 │ 	const removed = await provider.classify!(old, context);
+        │ 	                      ^^^^^^^^^^^^^^^^^^
+    326 │ 	assert.equal(removed.stopReason, "error");
+    327 │ 	assert.equal(
+  
+  i Unsafe fix: Replace with optional chain operator ?. This operator includes runtime checks, so it is safer than the compile-only non-null assertion operator
+  
+    323 323 │     });
+    324 324 │     assert.deepEqual(provider.getAllModels!(), []);
+    325     │ - → const·removed·=·await·provider.classify!(old,·context);
+        325 │ + → const·removed·=·await·provider.classify?.(old,·context);
+    326 326 │     assert.equal(removed.stopReason, "error");
+    327 327 │     assert.equal(
+  
+
+test/provider.test.ts:334:4 lint/style/noNonNullAssertion  FIXABLE  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  ! Forbidden non-null assertion.
+  
+    332 │ 	current = config();
+    333 │ 	assert.equal(
+  > 334 │ 		(provider.getAllModels!()[0] as typeof old).id,
+        │ 		 ^^^^^^^^^^^^^^^^^^^^^^
+    335 │ 		"fake/fake-model",
+    336 │ 	);
+  
+  i Unsafe fix: Replace with optional chain operator ?. This operator includes runtime checks, so it is safer than the compile-only non-null assertion operator
+  
+    332 332 │     current = config();
+    333 333 │     assert.equal(
+    334     │ - → → (provider.getAllModels!()[0]·as·typeof·old).id,
+        334 │ + → → (provider.getAllModels?.()[0]·as·typeof·old).id,
+    335 335 │       "fake/fake-model",
+    336 336 │     );
+  
+
+test/provider.test.ts:377:14 lint/style/noNonNullAssertion  FIXABLE  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  ! Forbidden non-null assertion.
+  
+    375 │ 		config: () => current,
+    376 │ 	});
+  > 377 │ 	const old = provider.getAllModels!()[0] as NonNullable<
+        │ 	            ^^^^^^^^^^^^^^^^^^^^^^
+    378 │ 		ReturnType<typeof emulatedClassifierModel>
+    379 │ 	>;
+  
+  i Unsafe fix: Replace with optional chain operator ?. This operator includes runtime checks, so it is safer than the compile-only non-null assertion operator
+  
+    375 375 │       config: () => current,
+    376 376 │     });
+    377     │ - → const·old·=·provider.getAllModels!()[0]·as·NonNullable<
+        377 │ + → const·old·=·provider.getAllModels?.()[0]·as·NonNullable<
+    378 378 │       ReturnType<typeof emulatedClassifierModel>
+    379 379 │     >;
+  
+
+test/provider.test.ts:380:18 lint/style/noNonNullAssertion  FIXABLE  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  ! Forbidden non-null assertion.
+  
+    378 │ 		ReturnType<typeof emulatedClassifierModel>
+    379 │ 	>;
+  > 380 │ 	const pending = provider.classify!(old, {
+        │ 	                ^^^^^^^^^^^^^^^^^^
+    381 │ 		state: {},
+    382 │ 		questions: {
+  
+  i Unsafe fix: Replace with optional chain operator ?. This operator includes runtime checks, so it is safer than the compile-only non-null assertion operator
+  
+    378 378 │       ReturnType<typeof emulatedClassifierModel>
+    379 379 │     >;
+    380     │ - → const·pending·=·provider.classify!(old,·{
+        380 │ + → const·pending·=·provider.classify?.(old,·{
+    381 381 │       state: {},
+    382 382 │       questions: {
+  
+

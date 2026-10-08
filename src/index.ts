@@ -190,6 +190,21 @@ export default function extension(pi: ExtensionAPI): void {
 		service = createJudgmentService({
 			registry: registry as never,
 			config: getConfig,
+			// LLM default inactivity follows Pi's own HTTP idle setting (0 = disabled).
+			hostIdleTimeoutMs: () => {
+				try {
+					const value = (
+						pi as { getSettings?: () => { httpIdleTimeoutMs?: unknown } }
+					).getSettings?.()?.httpIdleTimeoutMs;
+					return typeof value === "number" &&
+						Number.isFinite(value) &&
+						value >= 0
+						? Math.floor(value)
+						: undefined;
+				} catch {
+					return undefined;
+				}
+			},
 			ledger: {
 				append: (type, data) => {
 					if (type === "llm-as-jev-ledger") pi.appendEntry(type, data);

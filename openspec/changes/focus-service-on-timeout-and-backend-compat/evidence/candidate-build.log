@@ -1,0 +1,4 @@
+
+> pi-llm-as-jev@0.1.0 build
+> tsc -p tsconfig.json && node scripts/sync-client.mjs
+

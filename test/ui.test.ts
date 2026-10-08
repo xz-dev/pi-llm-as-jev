@@ -21,7 +21,6 @@ import {
 const config = (overrides: Partial<JudgmentConfig> = {}): JudgmentConfig => ({
 	mode: "auto",
 	thinkingLevel: "off",
-	timeoutMs: 120_000,
 	...overrides,
 });
 

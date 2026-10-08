@@ -70,6 +70,19 @@ interface JudgmentService {
 	version: 1;
 	judge(req: JudgeRequest, opts?: JudgeOptions): Promise<JudgeResult>;
 	availability(): Promise<{ classifier?: string; llm?: string }>;
+	capacityVersion?: 1;                              // advertises the two members below
+	describeSelection?(opts?: { signal?: AbortSignal; path?: "judge" | "review" }):
+		Promise<CapacityDisclosure | { error: string }>;
+}
+
+interface CapacityDisclosure {
+	backend: "classifier" | "llm";
+	model: string;                                    // provider/modelid
+	limits: { request?: number; stateAndLongestQuestion?: number; contextWindow?: number }; // tokens
+	limitSource: "override" | "channel" | "model" | "none"; // declared, not proven
+	tokensPerByte: number;                            // learned from usage, else prior
+	prior: boolean;                                   // true until usage calibrates
+	envelopeOverheadBytes: number;                    // LLM request scaffolding; 0 native
 }
 
 interface JudgeRequest {
@@ -106,11 +119,47 @@ interface JudgeResult {
 	contextOverflow?: boolean;
 	reuse: { hits: number; joined: number; sent: number };
 	usage?: Usage;            // provider-reported only, never invented
+	capacity?: CapacityDisclosure; // initial prediction limits/calibration for this call
+	inputDimensions?: { stateBytes: number; questionBytes: number; longestQuestionBytes: number }[];
 }
 ```
 
 `judge()` **never throws** — every failure resolves through `stopReason` and
 `errorMessage` with an empty `answers` map.
+
+### Timeout: one number, interpreted per backend
+
+The caller passes one `timeoutMs`, or omits it. An omitted value uses the
+configured `timeoutMs` override when present, otherwise a backend default:
+**native classifier 60 000 ms** (a slower class model is a performance problem,
+not a reason to wait longer) and **LLM = Pi's own `httpIdleTimeoutMs`**
+(Pi default 300 000 ms; `0` disables, mapped to the timer maximum). The service
+decides what the number means:
+
+| Phase / backend | Interpretation |
+|---|---|
+| Setup (readiness, discovery, auth) | bounded by the explicit number or the native default; a hung registry promise settles as a timeout error |
+| Native classifier (Jev) | one absolute logical-call deadline across every internal batch/stage, using remaining wall time, never reset per stage |
+| LLM emulation | per-request transport-inactivity window: restarts for each provider request (each question batch and the single output repair); reset by any response bytes (text, reasoning, tool-argument deltas, keepalives) and provider events; **not** forwarded to the provider SDK as a whole-request timeout |
+
+Caller abort stays `aborted`; deadline/inactivity expiry is `error`; late
+backend results are never published after either. Consumers should not run
+an outer timer of their own. (`pi-jev-todo-audit` passes no value unless the
+user configures one, so these defaults apply.)
+
+### Capacity disclosure
+
+`describeSelection()` resolves the backend/model a call would use now and the
+**declared** input limits (tokens) with their source, plus the bytes→tokens
+ratio the overflow prediction uses. Read-only: no inference, no writes.
+`JudgeResult.capacity` freezes the initial prediction inputs before inference updates calibration. A later `describeSelection()` returns the newly learned ratio. `inputDimensions` records the UTF-8 sizes supplied to each logical backend dispatch, including rejected dispatches; it is not an SDK HTTP-retry count or a raw HTTP-body size. Provider usage stays in `usage` when reported. Absent limits mean missing metadata — the service never infers one.
+
+Built-in channel constants (`limitSource: "channel"`, review path only):
+OpenRouter System One `request = stateAndLongestQuestion = 32 000` (OpenRouter's
+Jev 1.13 page states a 32 000-token context window); TypeSafe direct
+`request = 64 000`, `stateAndLongestQuestion = 32 000` (carried from earlier
+configuration, **not verified** against TypeSafe documentation). Override per
+model with `contextLimits`.
 
 ### Ordered evidence
 
@@ -146,7 +195,15 @@ const result = await service.judge(
 If fixed state plus one irreducible fragment cannot fit, you get an explicit
 `contextOverflow` error — evidence is never silently trimmed.
 
-### Resumable reviews (additive capability)
+### Resumable reviews (additive capability) — deprecated protocol
+
+> **Deprecated.** The consumer-owned cache callbacks (`cache.lookup/store`,
+> `reviewCacheVersion`), business-stage callbacks (`planStages`,
+> `projectStage`, `onProgress`, `reviewStagesVersion`), `checkpoint` /
+> resume receipts and `projectionRevision` remain callable for existing
+> `reviewVersion: 1` clients and behave as before, but new consumers should
+> persist their own judgment state and pack input using `describeSelection()`.
+> These members will be removed once no caller passes them.
 
 `judge()` remains final-only. Consumers that need durable partial progress must
 check the separate `reviewVersion` capability at **each eligible call**, not
@@ -316,7 +373,7 @@ Global `<agentDir>/llm-as-jev.json` (`PI_CODING_AGENT_DIR` or
 	"classifierModel": "typesafe/jev-1.13", // optional explicit native pick
 	"model": "anthropic/claude-sonnet-4-5", // LLM slot (independent)
 	"thinkingLevel": "low",             // LLM-only thinking level
-	"timeoutMs": 120000,
+	"timeoutMs": 90000,                  // optional override for BOTH backends; omit for backend defaults
 	"contextLimits": {
 		"typesafe/jev-1.13": { "request": 64000, "stateAndLongestQuestion": 32000 }
 	}
@@ -361,8 +418,13 @@ Global `<agentDir>/llm-as-jev.json` (`PI_CODING_AGENT_DIR` or
   Subsequent configuration-file edits do not. Simultaneous overlapping writers
   retain last-write behavior: atomic replacement is not a conflict-free merge.
 
-- `timeoutMs` is a whole-call budget, including discovery/authentication,
-  projection, provider waits and recovery, not a fresh budget per attempt.
+- `timeoutMs` follows the selected backend. For the native classifier it is
+  one absolute whole-call budget covering discovery/authentication,
+  projection, provider waits and recovery — never reset across internal
+  stages. For the LLM backend it is a per-request transport-INACTIVITY
+  window (including the bounded first-byte wait) reset by every observed
+  byte/event; a continuously active stream may outlive it, while setup and
+  selection stay bounded by the same budget before dispatch.
 - `contextLimits` is optional. Keys are exact `provider/modelid` references;
   values have positive safe-integer `request` and/or `stateAndLongestQuestion`
   token limits. A profile replaces the defaults for that model and applies to
@@ -446,6 +508,8 @@ output repair.
 
 ## Session ledger
 
+The ledger is the service's **internal** reuse and metering record, not the
+consumer's progress or business memory; consumers persist their own state.
 Validated raw judgments, exact rejection envelopes, stage coverage and
 per-request diagnostics persist as non-context custom entries
 (`llm-as-jev-ledger`) — never bodies, secrets or provider replies — and are

@@ -1,0 +1,331 @@
+Skipped 22 suggested fixes.
+If you wish to apply the suggested (unsafe) fixes, use the command biome check --write --unsafe
+
+The number of diagnostics exceeds the limit allowed. Use --max-diagnostics to increase it.
+Diagnostics not shown: 17.
+Checked 4 files in 243ms. Fixed 2 files.
+Found 1 error.
+Found 36 warnings.
+src/service.ts:1735:22 lint/style/noNonNullAssertion ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  ! Forbidden non-null assertion.
+  
+    1733 │ 				seed.questionIds.map((id, i) => [
+    1734 │ 					id,
+  > 1735 │ 					structuredClone(flight.cacheRef.answers.get(seed.answerKeys[i])!),
+         │ 					                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    1736 │ 				]),
+    1737 │ 			);
+  
+
+src/service.ts:28:2 lint/correctness/noUnusedImports  FIXABLE  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  ! Several of these imports are unused.
+  
+    26 │ 	JudgeRequest,
+    27 │ 	JudgeResult,
+  > 28 │ 	JudgmentService,
+       │ 	^^^^^^^^^^^^^^^^
+  > 29 │ 	ReviewAttemptObservation,
+  > 30 │ 	ReviewDiagnostics,
+       │ 	^^^^^^^^^^^^^^^^^
+    31 │ 	ReviewOptions,
+    32 │ 	ReviewResult,
+  
+  i Unused imports might be the result of an incomplete refactoring.
+  
+  i Unsafe fix: Remove the unused imports.
+  
+      26   26 │     JudgeRequest,
+      27   27 │     JudgeResult,
+      28      │ - → JudgmentService,
+      29   28 │     ReviewAttemptObservation,
+      30      │ - → ReviewDiagnostics,
+      31   29 │     ReviewOptions,
+      32   30 │     ReviewResult,
+  
+
+src/service.ts:1719:5 lint/complexity/useOptionalChain  FIXABLE  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  ! Change to an optional chain.
+  
+    1717 │ 			);
+    1718 │ 			if (
+  > 1719 │ 				!seed ||
+         │ 				^^^^^^^^
+  > 1720 │ 				!seed.answerKeys.every((key, i) => {
+          ...
+  > 1726 │ 					);
+  > 1727 │ 				})
+         │ 				^^
+    1728 │ 			)
+    1729 │ 				throw new InvalidRequestError(
+  
+  i Unsafe fix: Change to an optional chain.
+  
+    1717 1717 │         );
+    1718 1718 │         if (
+    1719      │ - → → → → !seed·||
+    1720      │ - → → → → !seed.answerKeys.every((key,·i)·=>·{
+         1719 │ + → → → → !seed?.answerKeys.every((key,·i)·=>·{
+    1721 1720 │             const answer = flight.cacheRef.answers.get(key);
+    1722 1721 │             return (
+  
+
+src/service.ts:2427:9 lint/complexity/useOptionalChain  FIXABLE  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  ! Change to an optional chain.
+  
+    2425 │ 					return false;
+    2426 │ 				}
+  > 2427 │ 				if (!joined || joined.stopReason !== "stop") {
+         │ 				    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    2428 │ 					total.stopReason = joined?.stopReason ?? "error";
+    2429 │ 					total.errorMessage =
+  
+  i Unsafe fix: Change to an optional chain.
+  
+    2425 2425 │             return false;
+    2426 2426 │           }
+    2427      │ - → → → → if·(!joined·||·joined.stopReason·!==·"stop")·{
+         2427 │ + → → → → if·(joined?.stopReason·!==·"stop")·{
+    2428 2428 │             total.stopReason = joined?.stopReason ?? "error";
+    2429 2429 │             total.errorMessage =
+  
+
+test/service.test.ts:346:15 lint/style/noNonNullAssertion ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  ! Forbidden non-null assertion.
+  
+    344 │ 	assert.deepEqual(result.answers, {});
+    345 │ 	assert.ok(result.errorMessage);
+  > 346 │ 	assert.match(result.errorMessage!, /no LLM model is configured/);
+        │ 	             ^^^^^^^^^^^^^^^^^^^^
+    347 │ 
+    348 │ 	// Forced classifier mode with no native candidate: never switches to LLM.
+  
+
+test/service.test.ts:353:15 lint/style/noNonNullAssertion ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  ! Forbidden non-null assertion.
+  
+    351 │ 	const r2 = await h2.service.judge(mixedRequest());
+    352 │ 	assert.equal(r2.stopReason, "error");
+  > 353 │ 	assert.match(r2.errorMessage!, /No Jev classifier model is available/);
+        │ 	             ^^^^^^^^^^^^^^^^
+    354 │ 	assert.equal(h2.registry.llmCalls.length, 0);
+    355 │ 	assert.equal(h2.registry.jevCalls.length, 0);
+  
+
+test/service.test.ts:367:3 lint/style/noNonNullAssertion ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  ! Forbidden non-null assertion.
+  
+    365 │ 	assert.equal(r3.stopReason, "error");
+    366 │ 	assert.match(
+  > 367 │ 		r3.errorMessage!,
+        │ 		^^^^^^^^^^^^^^^^
+    368 │ 		/no selected\/default native classifier is available and no LLM model is configured/,
+    369 │ 	);
+  
+
+test/service.test.ts:594:15 lint/style/noNonNullAssertion ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  ! Forbidden non-null assertion.
+  
+    592 │ 	);
+    593 │ 	assert.equal(badRule.stopReason, "error");
+  > 594 │ 	assert.match(badRule.errorMessage!, /unknown choice "absent"/);
+        │ 	             ^^^^^^^^^^^^^^^^^^^^^
+    595 │ });
+    596 │ 
+  
+
+test/service.test.ts:635:15 lint/style/noNonNullAssertion ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  ! Forbidden non-null assertion.
+  
+    633 │ 	assert.equal(result.stopReason, "error");
+    634 │ 	assert.deepEqual(result.answers, {});
+  > 635 │ 	assert.match(result.errorMessage!, /answer/);
+        │ 	             ^^^^^^^^^^^^^^^^^^^^
+    636 │ });
+    637 │ 
+  
+
+test/service.test.ts:908:15 lint/style/noNonNullAssertion ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  ! Forbidden non-null assertion.
+  
+    906 │ 	assert.equal(result.stopReason, "error");
+    907 │ 	assert.deepEqual(result.answers, {});
+  > 908 │ 	assert.match(result.errorMessage!, /provider exploded|answer/);
+        │ 	             ^^^^^^^^^^^^^^^^^^^^
+    909 │ 	// But the validated first stage was cached: a retry reuses it.
+    910 │ 	h.registry.replayLlm([boolToolMessage(true)]);
+  
+
+test/service.test.ts:1421:15 lint/style/noNonNullAssertion ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  ! Forbidden non-null assertion.
+  
+    1419 │ 	const forced = await h2.service.judge(BOOL_REQ);
+    1420 │ 	assert.equal(forced.stopReason, "error");
+  > 1421 │ 	assert.match(forced.errorMessage!, /typesafe\/kev-9.9 is not available/);
+         │ 	             ^^^^^^^^^^^^^^^^^^^^
+    1422 │ 	assert.equal(h2.registry.llmCalls.length, 0);
+    1423 │ 	assert.equal(h2.registry.jevCalls.length, 0);
+  
+
+test/service.test.ts:1529:15 lint/style/noNonNullAssertion ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  ! Forbidden non-null assertion.
+  
+    1527 │ 	const result = await h.service.judge(BOOL_REQ);
+    1528 │ 	assert.equal(result.stopReason, "error");
+  > 1529 │ 	assert.match(result.errorMessage!, /synthetic native transport failure/);
+         │ 	             ^^^^^^^^^^^^^^^^^^^^
+    1530 │ 	assert.equal(h.registry.llmCalls.length, 0); // no LLM substitution
+    1531 │ 	h.registry.classify = original;
+  
+
+test/service.test.ts:1543:15 lint/style/noNonNullAssertion ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  ! Forbidden non-null assertion.
+  
+    1541 │ 	const result = await h.service.judge(BOOL_REQ);
+    1542 │ 	assert.equal(result.stopReason, "error");
+  > 1543 │ 	assert.match(result.errorMessage!, /discovery failed/);
+         │ 	             ^^^^^^^^^^^^^^^^^^^^
+    1544 │ 	h.registry.getAvailableOfType = original;
+    1545 │ });
+  
+
+test/service.test.ts:1556:15 lint/style/noNonNullAssertion ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  ! Forbidden non-null assertion.
+  
+    1554 │ 	const result = await h.service.judge(BOOL_REQ);
+    1555 │ 	assert.equal(result.stopReason, "error");
+  > 1556 │ 	assert.match(result.errorMessage!, /discovery failed/);
+         │ 	             ^^^^^^^^^^^^^^^^^^^^
+    1557 │ 	h.registry.getAvailableOfType = original;
+    1558 │ });
+  
+
+test/service.test.ts:1570:15 lint/style/noNonNullAssertion ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  ! Forbidden non-null assertion.
+  
+    1568 │ 	const result = await h.service.judge(BOOL_REQ, { timeoutMs: 80 });
+    1569 │ 	assert.equal(result.stopReason, "error");
+  > 1570 │ 	assert.match(result.errorMessage!, /selection timed out after 80ms/);
+         │ 	             ^^^^^^^^^^^^^^^^^^^^
+    1571 │ 	assert.deepEqual(result.answers, {});
+    1572 │ 	h.registry.getAvailableOfType = original;
+  
+
+test/service.test.ts:1646:16 lint/style/noNonNullAssertion  FIXABLE  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  ! Forbidden non-null assertion.
+  
+    1644 │ 	for (const b of bounds) {
+    1645 │ 		assert.ok(b, "missing internal bounds");
+  > 1646 │ 		assert.equal(b!.of, "src-1");
+         │ 		             ^^
+    1647 │ 		assert.equal(b!.total, text.length);
+    1648 │ 	}
+  
+  i Unsafe fix: Replace with optional chain operator ?. This operator includes runtime checks, so it is safer than the compile-only non-null assertion operator
+  
+    1644 1644 │     for (const b of bounds) {
+    1645 1645 │       assert.ok(b, "missing internal bounds");
+    1646      │ - → → assert.equal(b!.of,·"src-1");
+         1646 │ + → → assert.equal(b?.of,·"src-1");
+    1647 1647 │       assert.equal(b!.total, text.length);
+    1648 1648 │     }
+  
+
+test/service.test.ts:1647:16 lint/style/noNonNullAssertion  FIXABLE  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  ! Forbidden non-null assertion.
+  
+    1645 │ 		assert.ok(b, "missing internal bounds");
+    1646 │ 		assert.equal(b!.of, "src-1");
+  > 1647 │ 		assert.equal(b!.total, text.length);
+         │ 		             ^^
+    1648 │ 	}
+    1649 │ 	assert.equal(bounds[0]!.start, 0);
+  
+  i Unsafe fix: Replace with optional chain operator ?. This operator includes runtime checks, so it is safer than the compile-only non-null assertion operator
+  
+    1645 1645 │       assert.ok(b, "missing internal bounds");
+    1646 1646 │       assert.equal(b!.of, "src-1");
+    1647      │ - → → assert.equal(b!.total,·text.length);
+         1647 │ + → → assert.equal(b?.total,·text.length);
+    1648 1648 │     }
+    1649 1649 │     assert.equal(bounds[0]!.start, 0);
+  
+
+test/service.test.ts:1649:15 lint/style/noNonNullAssertion  FIXABLE  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  ! Forbidden non-null assertion.
+  
+    1647 │ 		assert.equal(b!.total, text.length);
+    1648 │ 	}
+  > 1649 │ 	assert.equal(bounds[0]!.start, 0);
+         │ 	             ^^^^^^^^^^
+    1650 │ 	assert.equal(bounds.at(-1)!.end, text.length);
+    1651 │ 	for (let i = 1; i < bounds.length; i++) {
+  
+  i Unsafe fix: Replace with optional chain operator ?. This operator includes runtime checks, so it is safer than the compile-only non-null assertion operator
+  
+    1647 1647 │       assert.equal(b!.total, text.length);
+    1648 1648 │     }
+    1649      │ - → assert.equal(bounds[0]!.start,·0);
+         1649 │ + → assert.equal(bounds[0]?.start,·0);
+    1650 1650 │     assert.equal(bounds.at(-1)!.end, text.length);
+    1651 1651 │     for (let i = 1; i < bounds.length; i++) {
+  
+
+test/service.test.ts:1650:15 lint/style/noNonNullAssertion  FIXABLE  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  ! Forbidden non-null assertion.
+  
+    1648 │ 	}
+    1649 │ 	assert.equal(bounds[0]!.start, 0);
+  > 1650 │ 	assert.equal(bounds.at(-1)!.end, text.length);
+         │ 	             ^^^^^^^^^^^^^^
+    1651 │ 	for (let i = 1; i < bounds.length; i++) {
+    1652 │ 		assert.equal(bounds[i]!.start, bounds[i - 1]!.end);
+  
+  i Unsafe fix: Replace with optional chain operator ?. This operator includes runtime checks, so it is safer than the compile-only non-null assertion operator
+  
+    1648 1648 │     }
+    1649 1649 │     assert.equal(bounds[0]!.start, 0);
+    1650      │ - → assert.equal(bounds.at(-1)!.end,·text.length);
+         1650 │ + → assert.equal(bounds.at(-1)?.end,·text.length);
+    1651 1651 │     for (let i = 1; i < bounds.length; i++) {
+    1652 1652 │       assert.equal(bounds[i]!.start, bounds[i - 1]!.end);
+  
+
+src/service.ts:1444:4 lint/suspicious/noAssignInExpressions ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  × The assignment should not be in an expression.
+  
+    1442 │ 			};
+    1443 │ 		const dimensions = sizeOf(context.state, context.questions, model.id);
+  > 1444 │ 		(flight.inputDimensions ??= []).push({
+         │ 		 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    1445 │ 			stateBytes: dimensions.stateBytes,
+    1446 │ 			questionBytes: dimensions.questionBytes,
+  
+  i The use of assignments in expressions is confusing.
+    Expressions are often considered as side-effect free.
+  
+
+check ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  × Some errors were emitted while applying fixes.
+  
+

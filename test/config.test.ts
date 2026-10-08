@@ -20,7 +20,6 @@ const fileA = configFilePath(dirA);
 const DEFAULTS = {
 	mode: "auto",
 	thinkingLevel: "off",
-	timeoutMs: 120_000,
 };
 
 test("sync operation reads match async validation, ignore timestamps and recover", async () => {
@@ -244,7 +243,7 @@ test("malformed JSON yields defaults plus diagnostic", async () => {
 	const loaded = await loadConfig(dirB);
 	assert.equal(loaded.defaults, false);
 	assert.equal(loaded.config.mode, "auto");
-	assert.equal(loaded.config.timeoutMs, 120_000);
+	assert.equal(loaded.config.timeoutMs, undefined);
 	assert.match(loaded.diagnostics[0]?.message ?? "", /malformed JSON/);
 });
 
@@ -284,11 +283,11 @@ test("classifierModel split at first slash keeps slashes in model id", () => {
 
 test("invalid timeoutMs falls back to all-defaults", () => {
 	const loaded = validateConfig({ timeoutMs: -5 });
-	assert.equal(loaded.config.timeoutMs, 120_000);
+	assert.equal(loaded.config.timeoutMs, undefined);
 	assert.equal(loaded.diagnostics.length, 1);
 
 	const nan = validateConfig({ timeoutMs: Number.NaN });
-	assert.equal(nan.config.timeoutMs, 120_000);
+	assert.equal(nan.config.timeoutMs, undefined);
 	assert.equal(nan.diagnostics.length, 1);
 });
 

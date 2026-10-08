@@ -237,11 +237,12 @@ test("classify delegates to the LLM backend with provenance and no leaked chat m
 		["answer"],
 	);
 	const passedTimeout = calls[0]?.options?.timeoutMs;
-	assert.ok(
-		typeof passedTimeout === "number" &&
-			passedTimeout >= 1230 &&
-			passedTimeout <= 1234,
-		`timeoutMs passed through (got ${String(passedTimeout)})`,
+	// The caller value is the plugin's inactivity window; it must NOT reach
+	// the provider SDK, which would interpret it as a whole-request deadline.
+	assert.equal(
+		passedTimeout,
+		undefined,
+		`timeoutMs must not become a provider request deadline (got ${String(passedTimeout)})`,
 	);
 
 	// No chat models on the emulation provider itself.
@@ -309,11 +310,10 @@ test("provider snapshots refresh metadata and retained-descriptor dispatch witho
 	assert.equal(reads, before + 1);
 	assert.equal(result.model, "fake/next");
 	assert.equal(result.stopReason, "stop");
-	const timeout = registry.recorded()[0].options?.timeoutMs as number;
-	assert.ok(
-		timeout > 0 && timeout <= 1500,
-		"configured timeout is used without caller override",
-	);
+	const timeout = registry.recorded()[0].options?.timeoutMs;
+	// Configured inactivity budget is enforced by the plugin's own clock,
+	// not forwarded as a provider whole-request timeout.
+	assert.equal(timeout, undefined);
 	registry.authReady = false;
 	assert.equal(await provider.auth.apiKey!.check!({} as never), undefined);
 	current = config({
@@ -405,12 +405,9 @@ test("in-flight provider repair keeps model, thinking and timeout across an edit
 		),
 	);
 	assert.ok(
-		seen.every(
-			(call) =>
-				typeof call.timeout === "number" &&
-				call.timeout > 1 &&
-				call.timeout <= 10000,
-		),
+		// The configured inactivity window stays plugin-owned on both the
+		// first attempt and the malformed-output repair — never forwarded.
+		seen.every((call) => call.timeout === undefined),
 	);
 });
 

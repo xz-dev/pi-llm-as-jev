@@ -811,10 +811,16 @@ test("irreducible single-question overflow fails explicitly, envelope not resent
 	assert.ok(result.errorMessage);
 	// Exactly one dispatch: the rejected exact envelope was never resent.
 	assert.equal(h.registry.jevCalls.length, 1);
+	assert.ok(result.capacity);
+	assert.equal(result.inputDimensions?.length, 1);
+	assert.ok(result.inputDimensions[0].stateBytes >= 5000);
+	assert.ok(result.inputDimensions[0].questionBytes > 0);
+	assert.ok(result.inputDimensions[0].longestQuestionBytes > 0);
 	// A second identical call is still rejected without re-sending.
 	const again = await h.service.judge(req);
 	assert.equal(again.stopReason, "error");
 	assert.equal(again.contextOverflow, true);
+	assert.deepEqual(again.inputDimensions, []);
 	assert.equal(h.registry.jevCalls.length, 1);
 });
 
@@ -3350,4 +3356,216 @@ test("F12: fragment texts are well-formed Unicode with exact coverage", async ()
 		if (p.bounds)
 			assert.equal(p.record.text, text.slice(p.bounds.start, p.bounds.end));
 	}
+});
+
+// --- Backend-specific timeout semantics (timeout slice) --------------------
+// LLM: caller timeoutMs is a transport-inactivity window per provider
+// request (including the bounded first-response wait), never a whole-call
+// countdown across questions/stages. Native classifier: one absolute
+// logical-call deadline, not reset across internal stages.
+
+test("LLM call outlives the old whole-call deadline when transport stays active", async () => {
+	const h = harness();
+	// Drip raw response bytes every 15ms for ~60ms while the adapter waits on
+	// the body: activity (bytes) is what resets the inactivity clock. The
+	// scripted transport stands in for globalThis.fetch — never a real URL.
+	const encoder = new TextEncoder();
+	const originalFetch = globalThis.fetch;
+	globalThis.fetch = (async () => {
+		let sent = 0;
+		const body = new ReadableStream<Uint8Array>({
+			async pull(controller) {
+				if (sent >= 4) {
+					controller.close();
+					return;
+				}
+				await new Promise((r) => setTimeout(r, 15));
+				sent += 1;
+				controller.enqueue(encoder.encode(`data: chunk-${sent}\n\n`));
+			},
+		});
+		return new Response(body, { status: 200 });
+	}) as typeof globalThis.fetch;
+	const original = h.registry.streamSimple.bind(h.registry);
+	h.registry.streamSimple = ((model, context, options) => {
+		const call = original(model, context, options);
+		return {
+			result: async () => {
+				const body = await options!.fetch!("https://fake.invalid/sse", {
+					signal: options?.signal,
+				});
+				const reader = body.body!.getReader();
+				while (!(await reader.read()).done) {}
+				return call.result();
+			},
+		};
+	}) as typeof h.registry.streamSimple;
+	h.registry.replayLlm([boolToolMessage(true)]);
+	const started = Date.now();
+	const result = await h.service.judge(
+		{ state: {}, questions: { q: BOOL_Q } },
+		{ timeoutMs: 30 },
+	);
+	const elapsed = Date.now() - started;
+	assert.equal(result.stopReason, "stop");
+	assert.equal(result.answers.q?.type, "bool");
+	assert.ok(
+		elapsed > 30,
+		`expected total duration to exceed 30ms idle window, took ${elapsed}ms`,
+	);
+	assert.equal(h.registry.llmCalls.length, 1);
+	h.registry.streamSimple = original;
+	globalThis.fetch = originalFetch;
+});
+
+test("LLM caller abort resolves aborted during an in-flight stream", async () => {
+	const h = harness();
+	const original = h.registry.streamSimple.bind(h.registry);
+	h.registry.streamSimple = ((model, context, options) => {
+		const call = original(model, context, options);
+		void call;
+		return {
+			result: () =>
+				new Promise<AssistantMessage>((resolve) => {
+					options?.signal?.addEventListener(
+						"abort",
+						() => resolve(llmMessage([])),
+						{ once: true },
+					);
+					// Deliberately never resolves on its own: the caller signal is
+					// the only path out, like an adapter honoring its signal.
+				}),
+		};
+	}) as typeof h.registry.streamSimple;
+	const controller = new AbortController();
+	const pending = h.service.judge(
+		{ state: {}, questions: { q: BOOL_Q } },
+		{ signal: controller.signal },
+	);
+	await new Promise((r) => setTimeout(r, 15));
+	controller.abort();
+	const result = await Promise.race([
+		pending,
+		new Promise<JudgeResult>((_, reject) =>
+			setTimeout(() => reject(new Error("abort did not settle")), 500),
+		),
+	]);
+	assert.equal(result.stopReason, "aborted");
+	assert.deepEqual(result.answers, {});
+	h.registry.streamSimple = original;
+});
+
+test("LLM inactivity window still bounds a stalled stream through the service", async () => {
+	const h = harness();
+	const original = h.registry.streamSimple.bind(h.registry);
+	h.registry.streamSimple = ((model, context, options) => {
+		const call = original(model, context, options);
+		return {
+			result: async () => {
+				// Registry ignores the signal itself but the injected fetch
+				// honors it: the plugin's inactivity abort releases the stall.
+				const body = await options!.fetch!("https://fake.invalid/sse", {
+					signal: options?.signal,
+				});
+				const reader = body.body!.getReader();
+				await reader.read(); // never returns a byte
+				return call.result();
+			},
+		};
+	}) as typeof h.registry.streamSimple;
+	// The transport never produces a byte and is released only by the
+	// request's own abort (the plugin's inactivity signal).
+	const originalFetch = globalThis.fetch;
+	globalThis.fetch = (async (_url, init) =>
+		new Response(
+			new ReadableStream<Uint8Array>({
+				start(controller) {
+					init?.signal?.addEventListener("abort", () => controller.close(), {
+						once: true,
+					});
+				},
+			}),
+			{ status: 200 },
+		)) as typeof globalThis.fetch;
+	h.registry.replayLlm([boolToolMessage(true)]);
+	const result = await h.service.judge(
+		{ state: {}, questions: { q: BOOL_Q } },
+		{ timeoutMs: 40 },
+	);
+	assert.equal(result.stopReason, "error");
+	assert.match(result.errorMessage ?? "", /timed out/i);
+	assert.deepEqual(result.answers, {});
+	h.registry.streamSimple = original;
+	globalThis.fetch = originalFetch;
+});
+
+test("LLM callers with different inactivity windows dispatch instead of joining", async () => {
+	let release: (() => void) | undefined;
+	const gate = new Promise<void>((r) => {
+		release = r;
+	});
+	const h = harness();
+	const original = h.registry.streamSimple.bind(h.registry);
+	h.registry.streamSimple = ((model, context, options) => {
+		const call = original(model, context, options);
+		return {
+			result: async () => {
+				await gate; // first call parks here so the second finds it pending
+				return call.result();
+			},
+		};
+	}) as typeof h.registry.streamSimple;
+	h.registry.replayLlm([boolToolMessage(true), boolToolMessage(true)]);
+	const first = h.service.judge(
+		{ state: {}, questions: { q: BOOL_Q } },
+		{ timeoutMs: 5000 },
+	);
+	await new Promise((r) => setTimeout(r, 10));
+	const second = h.service.judge(
+		{ state: {}, questions: { q: BOOL_Q } },
+		{ timeoutMs: 40 },
+	);
+	await new Promise((r) => setTimeout(r, 30));
+	release?.();
+	const [a, b] = await Promise.all([first, second]);
+	assert.equal(a.stopReason, "stop");
+	assert.equal(b.stopReason, "stop");
+	// Distinct inactivity windows must not share one owner clock.
+	assert.equal(h.registry.llmCalls.length, 2);
+	assert.equal(a.reuse.joined, 0);
+	assert.equal(b.reuse.joined, 0);
+	h.registry.streamSimple = original;
+});
+
+test("LLM callers with the same inactivity window still join", async () => {
+	let release: (() => void) | undefined;
+	const gate = new Promise<void>((r) => {
+		release = r;
+	});
+	const h = harness();
+	const original = h.registry.streamSimple.bind(h.registry);
+	h.registry.streamSimple = ((model, context, options) => {
+		const call = original(model, context, options);
+		return {
+			result: async () => {
+				await gate;
+				return call.result();
+			},
+		};
+	}) as typeof h.registry.streamSimple;
+	h.registry.replayLlm([boolToolMessage(true)]);
+	const req = { state: {}, questions: { q: BOOL_Q } };
+	const first = h.service.judge(req, { timeoutMs: 5000 });
+	await new Promise((r) => setTimeout(r, 10));
+	const second = h.service.judge(req, { timeoutMs: 5000 });
+	// Release only after the joiner has had time to reach the pending
+	// lookup while the owner is still in flight.
+	await new Promise((r) => setTimeout(r, 30));
+	release?.();
+	const [a, b] = await Promise.all([first, second]);
+	assert.equal(a.stopReason, "stop");
+	assert.equal(b.stopReason, "stop");
+	assert.equal(h.registry.llmCalls.length, 1);
+	assert.equal(a.reuse.joined + b.reuse.joined, 1);
+	h.registry.streamSimple = original;
 });

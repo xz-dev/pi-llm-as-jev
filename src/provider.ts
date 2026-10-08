@@ -164,6 +164,8 @@ export function createEmulatedClassifierProvider({
 			return llmClassify(registry as unknown as LlmRegistry, chat, context, {
 				thinkingLevel: config.thinkingLevel,
 				signal: options?.signal,
+				// Emulated provider: the service already resolved the window; a bare
+				// provider call gets the explicit config value or no window (host default).
 				timeoutMs: options?.timeoutMs ?? config.timeoutMs,
 			});
 		},

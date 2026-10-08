@@ -54,9 +54,9 @@ The backend SHALL clamp the configured thinking level using Pi's own supported-l
 ### Requirement: Registered as a Pi classifier provider
 The extension SHALL register a classifier provider whose single classifier model reflects the configured chat model, so that `getAvailableOfType("classifier")` lists it whenever an LLM model is configured and the underlying chat model's provider has usable credentials, and `modelRegistry.classify()` on it yields the same result as the service's LLM backend. The classifier model's `contextWindow` SHALL equal the configured chat model's context window. When no LLM model is configured, the provider SHALL expose no classifier models.
 
-Provider model-metadata queries, availability/authentication checks and classification invocations SHALL each use current global file settings for that operation, including changes saved by another already-running session. The next public model-list/availability operation SHALL reflect the current emulated model without requiring an intervening judgment, settings command, restart or reload. Metadata and availability operations SHALL NOT write settings, run paid inference or expose chat models through this classifier provider.
+Provider model-metadata queries, availability/authentication checks and classification invocations SHALL each use current global file settings for that operation. Metadata and availability operations SHALL NOT write settings, run paid inference or expose chat models through this classifier provider.
 
-Each classification SHALL freeze its configured chat model, effective thinking and applicable timeout for the whole invocation, including any existing output-repair retry. A previously obtained emulated-model descriptor SHALL NOT override current file settings when a new classification starts. Classification SHALL dispatch to the current configured chat target and report its actual identity; an unavailable or removed current target SHALL produce a structured error rather than dispatch to the descriptor's old target, the main-session model or a native classifier. An already-running classification SHALL retain its admitted snapshot when settings change.
+Each classification SHALL freeze its configured chat model, effective thinking and applicable timeout for the whole invocation, including any output-repair retry. The applicable timeout (caller-supplied, else configured) SHALL be a per-request transport-inactivity window: it bounds the wait for the first response and is reset by any response bytes (visible text, reasoning deltas, tool-argument deltas, keepalives) and by provider stream events; it SHALL NOT be passed to the chat provider as a whole-request timeout; a caller-supplied fetch or stream observer SHALL be composed with, not replaced by, the inactivity observer. An unavailable or removed current target SHALL produce a structured error rather than dispatch to the descriptor's old target, the main-session model or a native classifier.
 
 #### Scenario: Visible to codemode
 - **WHEN** an LLM model is configured and its provider has credentials
@@ -97,6 +97,14 @@ Each classification SHALL freeze its configured chat model, effective thinking a
 #### Scenario: Model removal and restoration
 - **WHEN** another session removes the LLM model and later saves a usable model again
 - **THEN** successive public classifier-list operations expose zero and then one current emulated model without restarting or reloading the receiving session
+
+#### Scenario: Reasoning-only activity
+- **WHEN** the chat model emits only reasoning deltas for longer than the inactivity window before any visible text
+- **THEN** the classification is not timed out
+
+#### Scenario: Composed observer
+- **WHEN** the caller passes its own `fetch` and `onProviderStreamEvent`
+- **THEN** both the caller's observers and the inactivity clock see every event
 
 ### Requirement: Fidelity disclosure
 The result SHALL identify the emulation provider. Numeric fields required by Pi's classifier contract SHALL be compatibility encodings, not model-reported certainty: a selected choice has a one-hot probability distribution and confidence 1, a bool becomes probability 0 or 1, and a selected score level has confidence 1. Documentation SHALL state that these fields represent a discrete selection, NOT measured or calibrated confidence. Listing this emulation as a Pi `classifier` SHALL NOT make it a native numerical-confidence source; the native picker and native discovery SHALL exclude it. Service consumers SHALL receive the discrete business answer without comparing these compatibility numbers to thresholds.

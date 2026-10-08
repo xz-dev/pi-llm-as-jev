@@ -29,19 +29,37 @@ The extension SHALL publish one process-wide judgment service handle that other 
 - **THEN** the own key and its answer/probability survive validation, serialization, cache reuse and branch restore without prototype mutation or data loss
 
 ### Requirement: Never throws
-`judge()` SHALL resolve for every input, abort, timeout, missing backend, or provider failure; such outcomes SHALL be reported through `stopReason` and `errorMessage` with an empty `answers` map.
+`judge()` and `review()` SHALL resolve for every input, abort, timeout, missing backend, or provider failure; such outcomes SHALL be reported through `stopReason` and `errorMessage` with an empty `answers` map.
+
+One admitted duration SHALL apply per call: the caller's `timeoutMs`, else the configured `timeoutMs` override, else a backend default of 60 000 ms for the native classifier and the host's `httpIdleTimeoutMs` (Pi default 300 000 ms; `0` meaning disabled) for the LLM backend. Setup (readiness, redaction preparation, backend discovery and authentication resolution) SHALL settle within that duration even when an underlying promise never observes the abort signal. For the native classifier backend the duration SHALL be one absolute logical-call deadline spanning every internal stage, using remaining wall time, never reset per stage. For the LLM backend the duration SHALL be a per-request transport-inactivity window: it restarts for each provider request (including each question batch and the single output-repair attempt), is reset by any raw response bytes or provider stream event, and SHALL NOT be forwarded to the provider SDK as a whole-request timeout. A caller abort SHALL remain an abort; a deadline or inactivity expiry SHALL be an error; a late backend result SHALL NOT be published after either.
 
 #### Scenario: No backend available
 - **WHEN** no selected/default native classifier is available and no LLM backend model is configured
-- **THEN** `judge()` resolves with `stopReason: "error"`, an `errorMessage` naming the missing configuration, and no answers
+- **THEN** the call resolves with `stopReason: "error"`, an `errorMessage` naming the missing configuration, and no answers
 
 #### Scenario: Caller aborts
 - **WHEN** the caller's abort signal fires while a request is in flight
-- **THEN** `judge()` resolves with `stopReason: "aborted"` and no partial answers are cached
+- **THEN** the call resolves with `stopReason: "aborted"` and no partial answers are cached
+
+#### Scenario: Native logical deadline
+- **WHEN** the native backend needs three internal stages and the caller passed 30000 ms
+- **THEN** the three stages share the same 30-second deadline and the call resolves with a timeout error once it passes
+
+#### Scenario: Healthy LLM stream outlasts the number
+- **WHEN** the LLM backend streams continuously for longer than `timeoutMs`
+- **THEN** the call does not time out while bytes keep arriving
+
+#### Scenario: Stalled LLM stream
+- **WHEN** the LLM response produces no bytes or events for `timeoutMs`
+- **THEN** that request is aborted and the call resolves with a timeout error and no retry
+
+#### Scenario: Hung discovery
+- **WHEN** backend discovery never resolves
+- **THEN** the call resolves with a timeout error at the admitted duration without dispatching a provider request
 
 #### Scenario: Timeout
-- **WHEN** the caller passes `timeoutMs` and the backend does not answer in time
-- **THEN** `judge()` resolves with `stopReason: "error"` and the request is not retried
+- **WHEN** the caller passes `timeoutMs` and the backend does not answer within its backend-specific interpretation of it
+- **THEN** the call resolves with `stopReason: "error"` and the request is not retried
 
 ### Requirement: Backend selection
 The service SHALL use modes `auto`, `classifier`, or `llm`. The native candidate SHALL be the explicitly configured `classifierModel` when present, otherwise an available Jev-family model using the existing default discovery preference. Explicit selection SHALL allow compatible Pi classifier models not named Jev; the service SHALL exclude its own LLM-emulation provider from native selection and SHALL NOT automatically substitute an arbitrary non-Jev classifier. A compatible native adapter SHALL support the existing question/answer contract and defined numeric-field semantics; model type alone SHALL NOT be treated as proof of calibrated confidence. Availability SHALL come from Pi's model registry, not independent credential resolution.
@@ -107,7 +125,15 @@ When the backend is `classifier`, the service SHALL apply the caller's default `
 - **THEN** the cached answer is dropped for the later caller without sending another provider request
 
 ### Requirement: Exact-match caching
-The service SHALL reuse a previously validated raw judgment when backend identity, model, effective thinking level, state, ordered evidence, question id, and complete question definition are identical, and SHALL join in-flight work for the same identity. It SHALL NOT reuse an answer across different backends, models, or thinking levels. Numeric threshold rules SHALL be applied separately to each caller's view of the raw judgment; a dropped answer SHALL never be exposed as accepted. Persisted raw judgments SHALL retain their reported native fields so thresholds can be reapplied after resume.
+The service MAY reuse a previously validated raw judgment internally when backend identity, model, effective thinking level, state, question id and complete question definition are identical, and SHALL join in-flight work for the same identity. It SHALL NOT reuse across backends, models or thinking levels, and SHALL apply thresholds per caller. Consumer-supplied cache lookup/store callbacks are deprecated: existing `version:1` callers that pass them SHALL keep working, new consumers SHALL NOT be required to supply them, and the service SHALL NOT depend on them for correctness.
+
+#### Scenario: Consumer passes no cache callbacks
+- **WHEN** a consumer calls the service with state, questions and options only
+- **THEN** the call is accepted and judged normally
+
+#### Scenario: Legacy consumer passes callbacks
+- **WHEN** a `reviewVersion:1` consumer passes cache callbacks and checkpoints
+- **THEN** behavior is unchanged from the previous release
 
 #### Scenario: Same question twice
 - **WHEN** the same state and question are judged twice on the same backend and model
@@ -141,7 +167,11 @@ Before sending, the service SHALL predict whether the request exceeds the select
 - **THEN** the next identical question sends a new model request
 
 ### Requirement: Ordered evidence recovery
-A caller SHALL be able to supply fixed JSON state plus ordered evidence records with stable unique ids and text. The service SHALL own overflow recovery over BOTH question batches and evidence batches, processing evidence in order and carrying intermediate judgments into later stages as advisory data. An oversized evidence record SHALL be split into ordered fragments that retain its source id and fragment bounds. The service SHALL return a final judgment only after every record and fragment has been processed; intermediate stage judgments SHALL NOT be delivered as complete answers. It SHALL NOT silently discard or truncate evidence, vote across independent chunks, or require the consumer to implement the recovery loop. If fixed state plus one irreducible fragment still cannot be admitted, the service SHALL return an explicit context-overflow error with no final answers.
+Ordered evidence with service-owned fragmentation SHALL remain available for callers that supply it, with the same guarantees as before. It SHALL NOT be required: a caller MAY embed its own ordered input inside `state` and rely on capacity disclosure and question splitting only. Business stage callbacks (`planStages`, `projectStage`, `onProgress`) and service checkpoints are deprecated and SHALL NOT be required for a complete result.
+
+#### Scenario: Consumer packs its own input
+- **WHEN** a consumer sends state that already fits the disclosed capacity, with no evidence array
+- **THEN** the service judges it in one provider request per question batch without fragmentation
 
 #### Scenario: Evidence dominates the request size
 - **WHEN** even a single question over all evidence exceeds backend capacity
@@ -164,19 +194,23 @@ A caller SHALL be able to supply fixed JSON state plus ordered evidence records 
 - **THEN** the service reports context overflow rather than deleting evidence or repeatedly resending the same envelope
 
 ### Requirement: Session-branch ledger
-The service SHALL persist validated raw judgments, size rejections, stage coverage metadata, and per-request diagnostics as non-context custom session entries, SHALL restore them from the active branch only when a session starts or the branch changes, and SHALL never write credentials, raw provider responses, or request state/evidence bodies into the ledger. Aborted work SHALL NOT persist new judgments. Successful completed stages before a non-abort later failure MAY remain reusable; the failed overall result SHALL have no final answers.
+The service SHALL persist internal raw judgments, size rejections and per-request diagnostics as non-context custom session entries for its own reuse and metering only, restored from the active branch at session start or branch change, never containing credentials, provider bodies or request state/evidence. The ledger SHALL NOT be the consumer's progress or business memory; consumers persist their own judgment state. Aborted work SHALL NOT persist new judgments.
 
-#### Scenario: Resume restores verdicts
-- **WHEN** a session is resumed after answers were persisted
-- **THEN** judging the same state and question returns the persisted answer without a provider request
-
-#### Scenario: Abandoned branch
-- **WHEN** the user navigates to a branch that does not contain a persisted answer
-- **THEN** that answer is not available from the cache on the new branch
+#### Scenario: Consumer progress survives a ledger-free branch
+- **WHEN** a consumer switches to a branch without service ledger entries
+- **THEN** the consumer's own persisted state is unaffected and the service simply has no internal reuse for that branch
 
 #### Scenario: Ledger entries stay out of model context
 - **WHEN** a ledger entry is written
 - **THEN** it is not shown in the transcript and not sent to the agent's model
+
+#### Scenario: Resume restores verdicts
+- **WHEN** a session is resumed after internal raw judgments were persisted
+- **THEN** judging the same state and question returns the persisted answer without a provider request
+
+#### Scenario: Abandoned branch
+- **WHEN** the user navigates to a branch that does not contain a persisted answer
+- **THEN** that answer is not available for internal reuse on the new branch
 
 #### Scenario: Legacy prototype backend tags
 - **WHEN** the active branch contains old `jev`-tagged prototype judgments

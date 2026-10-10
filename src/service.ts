@@ -71,7 +71,11 @@ import {
 	overflowConstraint,
 	PRIOR_TOKENS_PER_BYTE,
 } from "./capacity.js";
-import type { JudgmentConfig, JudgmentThinkingLevel } from "./config.js";
+import type {
+	JudgmentConfig,
+	JudgmentMode,
+	JudgmentThinkingLevel,
+} from "./config.js";
 import {
 	DEFAULT_HOST_IDLE_TIMEOUT_MS,
 	DEFAULT_NATIVE_TIMEOUT_MS,
@@ -164,6 +168,36 @@ export function resolveTimeoutMs(
 /** Error thrown internally for invalid requests; converted to a result, never surfaced. */
 class InvalidRequestError extends Error {}
 const DEADLINE_EXPIRED = Symbol("judgment deadline expired");
+const ATTEMPT_RETIRED = Symbol("backend attempt retired after failover");
+
+type Candidate =
+	| { backend: "classifier"; model: AnyClassifierModel }
+	| { backend: "llm"; model: AnyModel }
+	| { error: string };
+
+/** Fixed backend order per mode: automatic modes allow ONE switch. */
+function backendRoute(mode: JudgmentMode): ("classifier" | "llm")[] {
+	switch (mode) {
+		case "auto":
+			return ["classifier", "llm"];
+		case "auto-llm":
+			return ["llm", "classifier"];
+		default:
+			return [mode];
+	}
+}
+
+function unavailableSummary(mode: JudgmentMode): string {
+	return mode === "auto-llm"
+		? "no LLM model is configured or usable and no selected/default native classifier is available (llm-as-jev.json: model)"
+		: "no selected/default native classifier is available and no LLM model is configured (llm-as-jev.json: model)";
+}
+
+/** Bounded per-candidate outcome text for a both-failed summary (already redacted). */
+function boundedOutcome(text: string): string {
+	const oneLine = text.replace(/\s+/g, " ").trim();
+	return oneLine.length > 240 ? `${oneLine.slice(0, 237)}...` : oneLine;
+}
 
 const resultShell = (
 	backend: "classifier" | "llm",
@@ -575,6 +609,13 @@ interface InFlight {
 	 * this reference and are additionally generation-checked, so a stale
 	 * completion can never touch a newer branch's live cache. */
 	cacheRef: RawJudgmentCache;
+	/** Set once failover moves on: fences late publication from this attempt. */
+	retired?: boolean;
+	retire?: () => void;
+	/** A local orchestration fault ended the attempt: never failover permission. */
+	localFault?: boolean;
+	/** A joined owner's work ended aborted while this caller stayed live. */
+	sharedAbort?: boolean;
 	/**
 	 * Request-owned judgment commits (F4): buffered per stage and flushed to
 	 * the ledger only when the request's overall outcome is known — never on
@@ -588,6 +629,21 @@ interface InFlight {
 		thinkingLevel: string;
 		fresh?: string;
 	}[];
+}
+
+/** Operation-level validated input, shared by every backend attempt. */
+interface Admitted {
+	request: JudgeRequest;
+	policy: ThresholdPolicy;
+}
+
+/** One backend attempt's result and whether it permits the one switch. */
+interface AttemptOutcome {
+	result: JudgeResult;
+	failover: boolean;
+	/** Redacted service-authored outcome category for both-failed summaries. */
+	summary: string;
+	unavailable?: boolean;
 }
 
 export interface CreatedService extends ReviewService {
@@ -615,38 +671,57 @@ export function createJudgmentService(runtime: ServiceRuntime): CreatedService {
 	let secrets: readonly string[] = [];
 
 	/**
-	 * Resolve known provider keys through Pi only. The SELECTED native and
-	 * chat providers are always included (F1): a chat-only inventory like
-	 * `getAll()`/`getProviders()` can omit classifier-only built-ins, so
-	 * selection-derived ids are resolved explicitly. Every resolution is
-	 * individually bounded (F5): a hanging `getAuth` cannot hang readiness.
+	 * Operation-scoped known-key resolution through Pi only. The SELECTED
+	 * native and chat providers are always included (F1): a chat-only
+	 * inventory like `getAll()`/`getProviders()` can omit classifier-only
+	 * built-ins, so selection-derived ids are resolved explicitly. Each
+	 * provider is looked up once per operation and every wait is bounded by
+	 * the waiting attempt's deadline/abort (F5). A lookup that already
+	 * exhausted an earlier attempt's window is not awaited again, so one hung
+	 * provider cannot also consume the alternate's fresh window; a key it
+	 * yields later is still added to the redaction set.
 	 */
-	async function refreshSecrets(
-		selected: readonly string[] = [],
-		deadline?: number | null,
-		signal?: AbortSignal,
-	): Promise<void> {
-		const ids = new Set<string>();
-		for (const provider of runtime.registry.getProviders?.() ?? [])
-			ids.add(provider.id);
-		for (const id of selected) ids.add(id);
-		const collected: string[] = [];
-		await Promise.all(
-			[...ids].map(async (id) => {
-				try {
-					const auth = await bounded(
-						runtime.registry.getAuth(id),
-						deadline,
-						signal,
-					);
-					const key = auth?.auth?.apiKey;
-					if (typeof key === "string" && key.length > 0) collected.push(key);
-				} catch {
-					// Auth resolution failure never breaks judgment; skip provider.
-				}
-			}),
-		);
-		secrets = [...new Set([...secrets, ...collected])];
+	function secretLookups() {
+		const lookups = new Map<string, Promise<void>>();
+		const settled = new Set<string>();
+		const exhausted = new Set<string>();
+		return async (
+			selected: readonly string[],
+			deadline: number | null,
+			signal: AbortSignal | undefined,
+			required: readonly string[],
+		): Promise<void> => {
+			const ids = new Set<string>();
+			for (const provider of runtime.registry.getProviders?.() ?? [])
+				ids.add(provider.id);
+			for (const id of selected) ids.add(id);
+			const waiting = [...ids].filter(
+				(id) => required.includes(id) || !exhausted.has(id),
+			);
+			for (const id of waiting) {
+				if (lookups.has(id)) continue;
+				lookups.set(
+					id,
+					(async () => {
+						try {
+							const key = (await runtime.registry.getAuth(id))?.auth?.apiKey;
+							if (typeof key === "string" && key.length > 0)
+								secrets = [...new Set([...secrets, key])];
+						} catch {
+							// Auth resolution failure never breaks judgment; skip provider.
+						} finally {
+							settled.add(id);
+						}
+					})(),
+				);
+			}
+			await bounded(
+				Promise.all(waiting.map((id) => lookups.get(id))),
+				deadline,
+				signal,
+			);
+			for (const id of waiting) if (!settled.has(id)) exhausted.add(id);
+		};
 	}
 
 	/** Lifecycle navigation: new cache from the active branch only. */
@@ -703,45 +778,50 @@ export function createJudgmentService(runtime: ServiceRuntime): CreatedService {
 		return profile;
 	}
 
-	async function resolveBackend(
+	/**
+	 * Resolve ONE backend family lazily. Native: explicit selection honored
+	 * exactly, else default Jev discovery; resolveNativeClassifier never
+	 * substitutes another native model for a missing explicit selection.
+	 */
+	async function resolveCandidate(
 		config: JudgmentConfig,
+		backend: "classifier" | "llm",
 		signal: AbortSignal | undefined,
-	): Promise<
-		| { backend: "classifier"; model: AnyClassifierModel }
-		| { backend: "llm"; model: AnyModel }
-		| { error: string }
-	> {
-		const { mode } = config;
-		if (mode === "llm") {
+	): Promise<Candidate> {
+		if (backend === "llm") {
 			const llm = llmChatModel(config);
 			return llm
 				? { backend: "llm", model: llm }
 				: {
-						error:
-							"mode is llm but no LLM model is configured (llm-as-jev.json: model)",
+						error: `${config.mode === "llm" ? "mode is llm but " : ""}no LLM model is configured (llm-as-jev.json: model)`,
 					};
 		}
-		// Native candidate: explicit selection honored exactly, else default
-		// Jev discovery. resolveNativeClassifier never substitutes another
-		// native model for a missing/unavailable explicit selection.
 		const native = await resolveNativeClassifier(
 			runtime.registry,
 			nativeSelection(config),
 			{ signal },
 		);
-		if ("model" in native) {
-			return { backend: "classifier", model: native.model };
+		return "model" in native
+			? { backend: "classifier", model: native.model }
+			: { error: native.error };
+	}
+
+	/** Read-only view: the first usable candidate in the configured order. */
+	async function resolveBackend(
+		config: JudgmentConfig,
+		signal: AbortSignal | undefined,
+	): Promise<Candidate> {
+		const route = backendRoute(config.mode);
+		if (route.length === 1) return resolveCandidate(config, route[0], signal);
+		for (const backend of route) {
+			try {
+				const candidate = await resolveCandidate(config, backend, signal);
+				if (!("error" in candidate)) return candidate;
+			} catch {
+				// An unusable preferred candidate leaves the alternate to report.
+			}
 		}
-		// Candidate unavailable. Forced classifier mode errors; auto may fall
-		// back to the LLM (unavailability only — dispatch failures never do).
-		if (mode === "classifier") return { error: native.error };
-		const llm = llmChatModel(config);
-		return llm
-			? { backend: "llm", model: llm }
-			: {
-					error:
-						"no selected/default native classifier is available and no LLM model is configured (llm-as-jev.json: model)",
-				};
+		return { error: unavailableSummary(config.mode) };
 	}
 
 	/** Explicit-or-default native selection derived from config slots. */
@@ -905,38 +985,44 @@ export function createJudgmentService(runtime: ServiceRuntime): CreatedService {
 				const signal = rawOpts?.signal
 					? AbortSignal.any([rawOpts.signal, controller.signal])
 					: controller.signal;
-				const review: ReviewFlight = {
-					options: rawOpts ?? {},
-					unresolved: new Set(),
-					attempts: [],
-					operationId: `review-${reviewInstance}-${++reviewSerial}`,
-					settled: false,
-					observationSupported: true,
-					progress: [],
-					presplits: 0,
-					rejectedReuses: 0,
-				};
-				const result = await judgeInner(
+				// Transport observations span the operation (shared ordinals);
+				// semantic progress/unresolved/channel belong to each attempt.
+				const attempts: ReviewAttemptObservation[] = [];
+				const operationId = `review-${reviewInstance}-${++reviewSerial}`;
+				const { result, flights } = await judgeInner(
 					rawReq,
 					{ ...rawOpts, signal },
-					{
-						generation,
-						cacheRef: cache,
-						bufferedJudgments: [],
-						review,
-					},
+					() => ({
+						options: rawOpts ?? {},
+						unresolved: new Set(),
+						attempts,
+						operationId,
+						settled: false,
+						observationSupported: true,
+						progress: [],
+						presplits: 0,
+						rejectedReuses: 0,
+					}),
 				);
-				review.settled = true;
+				const reviews = flights.flatMap((f) => (f.review ? [f.review] : []));
+				const review = reviews.at(-1);
+				for (const each of reviews) each.settled = true;
 				return {
 					...result,
-					progress: { stages: [...review.progress] },
+					progress: { stages: [...(review?.progress ?? [])] },
 					diagnostics: {
-						...diagnostics(review.attempts, review.observationSupported),
-						presplits: review.presplits,
-						rejectedReuses: review.rejectedReuses,
-						...(review.channel ? { channel: review.channel } : {}),
+						...diagnostics(
+							attempts,
+							reviews.every((each) => each.observationSupported),
+						),
+						presplits: reviews.reduce((n, each) => n + each.presplits, 0),
+						rejectedReuses: reviews.reduce(
+							(n, each) => n + each.rejectedReuses,
+							0,
+						),
+						...(review?.channel ? { channel: review.channel } : {}),
 					},
-					unresolved: [...review.unresolved],
+					unresolved: [...(review?.unresolved ?? [])],
 				};
 			} catch (error) {
 				return {
@@ -1004,15 +1090,7 @@ export function createJudgmentService(runtime: ServiceRuntime): CreatedService {
 				const signal = rawOpts?.signal
 					? AbortSignal.any([rawOpts.signal, controller.signal])
 					: controller.signal;
-				return await judgeInner(
-					rawReq,
-					{ ...rawOpts, signal },
-					{
-						generation,
-						cacheRef: cache,
-						bufferedJudgments: [],
-					},
-				);
+				return (await judgeInner(rawReq, { ...rawOpts, signal })).result;
 			} catch (error) {
 				return {
 					...resultShell("llm", ""),
@@ -1078,9 +1156,34 @@ export function createJudgmentService(runtime: ServiceRuntime): CreatedService {
 		});
 	}
 
-	/** Whether this request still owns the current live cache (F4). */
+	/** Whether this request still owns the current live cache (F4); a retired attempt never does. */
 	function ownsLiveCache(flight: InFlight): boolean {
-		return flight.generation === generation && cache === flight.cacheRef;
+		return (
+			!flight.retired &&
+			flight.generation === generation &&
+			cache === flight.cacheRef
+		);
+	}
+
+	/**
+	 * Service-authored category for a failed attempt, never a provider body.
+	 * Review paths already reduce provider failures to observed categories.
+	 */
+	function failureSummary(result: JudgeResult, flight: InFlight): string {
+		const message = result.errorMessage ?? "";
+		if (result.contextOverflow || /context overflow/i.test(message))
+			return "context overflow";
+		if (/timed out/i.test(message))
+			return `timed out after ${flight.timeoutMs}ms`;
+		if (flight.review && /^(native|LLM) review \w+ failure/.test(message))
+			return message;
+		if (
+			/did not return a valid|incompatible answer|returned no answer|lacks/i.test(
+				message,
+			)
+		)
+			return "invalid or incompatible output";
+		return "provider or transport failure";
 	}
 
 	/** Flush buffered judgment commits for a finished request (F4). */
@@ -1146,13 +1249,147 @@ export function createJudgmentService(runtime: ServiceRuntime): CreatedService {
 		return undefined;
 	}
 
+	/**
+	 * One logical operation: admit ONE configuration snapshot, then run the
+	 * mode's fixed backend route. Automatic modes switch at most once, only
+	 * after an eligible backend failure; each attempt gets a fresh flight,
+	 * timeout window and stage state, while caller abort, navigation,
+	 * invalid input and local faults stay terminal. A retired attempt's
+	 * flight is fenced (its signal is aborted, its review collector closed).
+	 */
 	async function judgeInner(
 		rawReq: unknown,
 		rawOpts: JudgeOptions | undefined,
-		flight: InFlight,
-	): Promise<JudgeResult | ReviewResult> {
-		// F5: effective timeout — caller override wins, else the configured one.
+		review?: () => ReviewFlight,
+	): Promise<{ result: JudgeResult; flights: InFlight[] }> {
 		const config = structuredClone(runtime.config());
+		const route = backendRoute(config.mode);
+		const refresh = secretLookups();
+		const admission: { admitted?: Admitted } = {};
+		// Navigation is terminal for the whole operation: the alternate stays
+		// bound to the admitted generation and cannot run on a newer branch.
+		const owner = { generation, cacheRef: cache };
+		const flights: InFlight[] = [];
+		const failures: string[] = [];
+		let unavailableOnly = true;
+		let outcome: AttemptOutcome | undefined;
+		let resolvedFailure: JudgeResult | undefined;
+		for (const backend of route) {
+			if (outcome) {
+				const previous = flights[flights.length - 1];
+				const shell = resultShell(outcome.result.backend, outcome.result.model);
+				if (owner.generation !== generation || owner.cacheRef !== cache)
+					return {
+						result: {
+							...shell,
+							stopReason: "aborted",
+							errorMessage: "request aborted by session navigation",
+						},
+						flights,
+					};
+				if (rawOpts?.signal?.aborted)
+					return {
+						result: {
+							...shell,
+							stopReason: "aborted",
+							errorMessage: "request aborted by caller signal",
+						},
+						flights,
+					};
+				// A deprecated seed holds answer references, not the original input:
+				// the alternate could neither replay it nor reuse it across identities.
+				if (previous.review?.options.checkpoint !== undefined)
+					return {
+						result: {
+							...shell,
+							stopReason: "error",
+							errorMessage: redactString(
+								`${outcome.summary}; a checkpoint-seeded review cannot fail over: resubmit the complete input without checkpoint`,
+								secrets,
+							),
+						},
+						flights,
+					};
+			}
+			const flight: InFlight = {
+				...owner,
+				bufferedJudgments: [],
+				...(review ? { review: review() } : {}),
+			};
+			flights.push(flight);
+			outcome = await judgeAttempt(
+				rawReq,
+				rawOpts,
+				flight,
+				config,
+				backend,
+				admission,
+				refresh,
+			);
+			// Late adapter observations from a finished attempt are dropped.
+			if (flight.review) flight.review.settled = true;
+			if (!outcome.failover || route.length === 1)
+				return { result: outcome.result, flights };
+			flight.retire?.();
+			failures.push(
+				`${backend}${outcome.result.model ? ` ${outcome.result.model}` : ""}: ${boundedOutcome(outcome.summary)}`,
+			);
+			unavailableOnly &&= outcome.unavailable === true;
+			if (!outcome.unavailable) resolvedFailure = outcome.result;
+		}
+		// Identify the terminal attempt that resolved a model, when any did.
+		const terminal = outcome!.unavailable
+			? (resolvedFailure ?? outcome!.result)
+			: outcome!.result;
+		const head = unavailableOnly
+			? unavailableSummary(config.mode)
+			: "both automatic backend attempts failed";
+		return {
+			result: {
+				...terminal,
+				answers: {},
+				dropped: [],
+				stopReason: "error",
+				errorMessage: redactString(`${head} (${failures.join("; ")})`, secrets),
+			},
+			flights,
+		};
+	}
+
+	/**
+	 * One backend attempt of an admitted operation. `failover` marks an
+	 * eligible backend failure; `summary` is service-authored text (never a
+	 * raw provider body) used for a both-failed operation message.
+	 */
+	async function judgeAttempt(
+		rawReq: unknown,
+		rawOpts: JudgeOptions | undefined,
+		flight: InFlight,
+		config: JudgmentConfig,
+		family: "classifier" | "llm",
+		admission: { admitted?: Admitted },
+		refreshSecrets: ReturnType<typeof secretLookups>,
+	): Promise<AttemptOutcome> {
+		const terminal = (result: JudgeResult): AttemptOutcome => ({
+			result,
+			failover: false,
+			summary: "",
+		});
+		const eligible = (
+			result: JudgeResult,
+			summary: string,
+			unavailable = false,
+		): AttemptOutcome => ({
+			result,
+			failover: true,
+			summary,
+			...(unavailable ? { unavailable } : {}),
+		});
+		/** Interruption: deadline expiry is a backend failure, aborts are terminal. */
+		const stoppedOutcome = (result: JudgeResult): AttemptOutcome =>
+			result.stopReason === "error"
+				? eligible(result, `timed out after ${flight.timeoutMs}ms`)
+				: terminal(result);
 		// Setup (readiness, selection, auth) is bounded by the explicit number or,
 		// when omitted, the native default; the LLM inactivity default is applied
 		// once the backend is known (see resolveTimeoutMs).
@@ -1168,7 +1405,13 @@ export function createJudgmentService(runtime: ServiceRuntime): CreatedService {
 		const deadlineController = new AbortController();
 		let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
 		let selected: { backend: "classifier" | "llm"; model: string } | undefined;
+		let phase: "setup" | "stages" = "setup";
 		flight.canPublish = () => !requestInterruption(flight, deadline, signal);
+		// Retirement after failover fences publication and cancels cooperative work.
+		flight.retire = () => {
+			flight.retired = true;
+			deadlineController.abort(ATTEMPT_RETIRED);
+		};
 		const interrupted = (): JudgeResult | undefined => {
 			const stopped = requestInterruption(flight, deadline, signal);
 			return stopped
@@ -1210,17 +1453,25 @@ export function createJudgmentService(runtime: ServiceRuntime): CreatedService {
 				? AbortSignal.any([signal, deadlineController.signal])
 				: deadlineController.signal;
 			const beforeReadiness = interrupted();
-			if (beforeReadiness) return beforeReadiness;
-			// Redaction readiness is bounded by THIS call's deadline/abort (F5);
-			// selected providers are always included (F1).
+			if (beforeReadiness) return stoppedOutcome(beforeReadiness);
+			// Redaction readiness is bounded by THIS attempt's deadline/abort (F5);
+			// selected providers are always included (F1). This family's own
+			// provider is always awaited; another provider whose lookup already
+			// exhausted an earlier attempt's window is not awaited again.
 			const selectedProviders = [
 				...(config.provider ? [config.provider] : []),
 				...(config.classifierProvider ? [config.classifierProvider] : []),
 			];
-			const refreshed = refreshSecrets(selectedProviders, deadline, signal);
-			await bounded(refreshed, deadline, signal);
+			const ownProvider =
+				family === "llm" ? config.provider : config.classifierProvider;
+			await refreshSecrets(
+				selectedProviders,
+				deadline,
+				signal,
+				ownProvider ? [ownProvider] : [],
+			);
 			const afterReadiness = interrupted();
-			if (afterReadiness) return afterReadiness;
+			if (afterReadiness) return stoppedOutcome(afterReadiness);
 
 			// One admitted duration, including the configured default. Dispatch interprets
 			// it as native remaining wall time or LLM per-attempt inactivity.
@@ -1230,79 +1481,89 @@ export function createJudgmentService(runtime: ServiceRuntime): CreatedService {
 				timeoutMs: requestedTimeout,
 			};
 
-			let request: JudgeRequest;
-			let policy: ThresholdPolicy;
-			try {
-				request = validateRequest(rawReq);
-				validatePolicy(opts);
-				crossValidateThresholds(request.questions, opts.thresholds);
-				policy = {
-					default: opts.minConfidence,
-					perQuestion: opts.thresholds ?? {},
-				};
-			} catch (error) {
-				// Never throws at the public boundary.
-				const message =
-					error instanceof InvalidRequestError
-						? error.message
-						: error instanceof Error
-							? error.message
-							: String(error);
-				return {
-					...resultShell("llm", config.model ?? ""),
-					stopReason: "error",
-					errorMessage: redactString(`invalid request: ${message}`, secrets),
-				};
+			// Input and caller policy are validated once per operation; an
+			// invalid request is terminal and never selects an alternate.
+			let admitted = admission.admitted;
+			if (!admitted) {
+				try {
+					const request = validateRequest(rawReq);
+					validatePolicy(opts);
+					crossValidateThresholds(request.questions, opts.thresholds);
+					admitted = admission.admitted = {
+						request,
+						policy: {
+							default: opts.minConfidence,
+							perQuestion: opts.thresholds ?? {},
+						},
+					};
+				} catch (error) {
+					// Never throws at the public boundary.
+					const message =
+						error instanceof Error ? error.message : String(error);
+					return terminal({
+						...resultShell("llm", config.model ?? ""),
+						stopReason: "error",
+						errorMessage: redactString(`invalid request: ${message}`, secrets),
+					});
+				}
 			}
+			const { request, policy } = admitted;
 
 			const beforeSelection = interrupted();
-			if (beforeSelection) return beforeSelection;
+			if (beforeSelection) return stoppedOutcome(beforeSelection);
 
 			// Selection lives inside the whole-request catch/deadline boundary so
 			// a discovery throw, rejection or hang can never violate
-			// never-throws or the caller deadline.
-			let resolved: Awaited<ReturnType<typeof resolveBackend>>;
+			// never-throws or the caller deadline. Only THIS family is resolved.
+			let resolved: Candidate;
 			try {
 				const raced = await guardSelection(
-					resolveBackend(config, signal),
+					resolveCandidate(config, family, signal),
 					deadline,
 					signal,
 				);
 				if ("timeout" in raced) {
 					deadlineController.abort(DEADLINE_EXPIRED);
-					return {
-						...resultShell("llm", config.model ?? ""),
-						stopReason: "error",
-						errorMessage: redactString(
-							`native classifier selection timed out after ${requestedTimeout}ms`,
-							secrets,
-						),
-					};
+					return eligible(
+						{
+							...resultShell(family, config.model ?? ""),
+							stopReason: "error",
+							errorMessage: redactString(
+								`${family === "classifier" ? "native classifier" : "LLM"} selection timed out after ${requestedTimeout}ms`,
+								secrets,
+							),
+						},
+						`selection timed out after ${requestedTimeout}ms`,
+					);
 				}
-				if ("aborted" in raced) return abortedResult(config);
+				if ("aborted" in raced) return terminal(abortedResult(config));
 				resolved = raced.value;
 			} catch (error) {
-				if (signal?.aborted) return abortedResult(config);
-				return {
-					...resultShell("llm", config.model ?? ""),
-					stopReason: "error",
-					errorMessage: redactString(
-						`native classifier discovery failed: ${
-							error instanceof Error ? error.message : String(error)
-						}`,
-						secrets,
-					),
-				};
+				if (signal?.aborted) return terminal(abortedResult(config));
+				return eligible(
+					{
+						...resultShell(family, config.model ?? ""),
+						stopReason: "error",
+						errorMessage: redactString(
+							`native classifier discovery failed: ${
+								error instanceof Error ? error.message : String(error)
+							}`,
+							secrets,
+						),
+					},
+					"native classifier discovery failed",
+				);
 			}
 			if ("error" in resolved) {
-				return {
-					...resultShell(
-						config.mode === "classifier" ? "classifier" : "llm",
-						config.model ?? "",
-					),
-					stopReason: "error",
-					errorMessage: redactString(resolved.error, secrets),
-				};
+				return eligible(
+					{
+						...resultShell(family, config.model ?? ""),
+						stopReason: "error",
+						errorMessage: redactString(resolved.error, secrets),
+					},
+					redactString(resolved.error, secrets),
+					true,
+				);
 			}
 
 			// Freeze the actual backend, model and effective thinking for EVERY
@@ -1330,16 +1591,14 @@ export function createJudgmentService(runtime: ServiceRuntime): CreatedService {
 			// built-ins). Bounded by the remaining request budget; never an
 			// env/endpoint fallback.
 			const selectedBackendProvider = model.provider;
-			{
-				const refreshed = refreshSecrets(
-					[...selectedProviders, selectedBackendProvider],
-					deadline,
-					signal,
-				);
-				await bounded(refreshed, deadline, signal);
-			}
+			await refreshSecrets(
+				[...selectedProviders, selectedBackendProvider],
+				deadline,
+				signal,
+				[selectedBackendProvider],
+			);
 			const beforeStages = interrupted();
-			if (beforeStages) return beforeStages;
+			if (beforeStages) return stoppedOutcome(beforeStages);
 			// Auth/redaction setup must settle under the setup deadline too.
 			// Only actual LLM execution switches to per-request inactivity.
 			if (backend === "llm") {
@@ -1367,6 +1626,7 @@ export function createJudgmentService(runtime: ServiceRuntime): CreatedService {
 				profile,
 				!!flight.review,
 			);
+			phase = "stages";
 			const result = await runStages(
 				redacted,
 				opts,
@@ -1384,26 +1644,40 @@ export function createJudgmentService(runtime: ServiceRuntime): CreatedService {
 
 			if (flight.generation !== generation) {
 				// Whole work aborted by a lifecycle switch: no late result.
-				return {
+				return terminal({
 					...result,
 					answers: {},
 					dropped: [],
 					stopReason: "aborted",
 					capacity,
-				};
+				});
 			}
-			return {
+			const final: JudgeResult = {
 				...result,
 				capacity,
 				inputDimensions: flight.inputDimensions ?? [],
 			};
+			// Success (including valid negative or all-dropped views), aborts and
+			// local orchestration faults never switch backend.
+			if (
+				final.stopReason === "aborted" &&
+				flight.sharedAbort &&
+				!interrupted()
+			)
+				return eligible(
+					final,
+					"joined backend work was cancelled by its owner",
+				);
+			if (final.stopReason !== "error" || flight.localFault)
+				return terminal(final);
+			return eligible(final, failureSummary(final, flight));
 		} catch (error) {
 			// Absolute backstop: any residual throw resolves structurally.
 			const message = error instanceof Error ? error.message : String(error);
 
 			const stopped = interrupted();
-			if (stopped) return stopped;
-			return {
+			if (stopped) return stoppedOutcome(stopped);
+			const result: JudgeResult = {
 				...resultShell(
 					selected?.backend ?? "llm",
 					selected?.model ?? config.model ?? "",
@@ -1411,6 +1685,11 @@ export function createJudgmentService(runtime: ServiceRuntime): CreatedService {
 				stopReason: "error",
 				errorMessage: redactString(message, secrets),
 			};
+			// Invalid input/callback contracts and faults while executing stages
+			// are local; only a backend setup (readiness/auth) failure may switch.
+			return error instanceof InvalidRequestError || phase === "stages"
+				? terminal(result)
+				: eligible(result, "backend setup failed");
 		} finally {
 			// A synchronous registry phase may exhaust the deadline before its
 			// timer gets an event-loop turn. Cancel before clearing that timer.
@@ -2457,6 +2736,8 @@ export function createJudgmentService(runtime: ServiceRuntime): CreatedService {
 					return false;
 				}
 				if (!joined || joined.stopReason !== "stop") {
+					// Another caller's cancelled work is not this live caller's abort.
+					if (joined?.stopReason === "aborted") flight.sharedAbort = true;
 					total.stopReason = joined?.stopReason ?? "error";
 					total.errorMessage =
 						joined?.errorMessage ?? "shared classification failed";
@@ -2501,6 +2782,7 @@ export function createJudgmentService(runtime: ServiceRuntime): CreatedService {
 			// Explicitly withheld scopes are not missing native response members:
 			// no checkpoint advances, but independent final choices remain usable.
 			if (projection.unresolved?.length && !isFinalStage) {
+				flight.localFault = true;
 				total.stopReason = "error";
 				total.errorMessage =
 					"intermediate stage has locally unresolved required questions";

@@ -410,7 +410,7 @@ test("invalid config diagnostics are reported exactly once per session", async (
 // 8.1: mode command persists (classifier mode; no jev alias)
 // ---------------------------------------------------------------------------
 
-test("/llm-as-jev mode classifier persists to the config file", async () => {
+test("/llm-as-jev mode persists auto-llm and a return to auto", async () => {
 	await withAgentDir(async () => {
 		chatModels = [chatModel("fake", "alpha")];
 		const { pi, fire } = await freshExtension();
@@ -418,10 +418,19 @@ test("/llm-as-jev mode classifier persists to the config file", async () => {
 		const handler = pi.commands.get("llm-as-jev");
 		assert.ok(handler);
 		await handler.handler("mode classifier", pi.makeCtx());
-		const raw = JSON.parse(
+		await handler.handler("mode auto-llm", pi.makeCtx());
+		let raw = JSON.parse(
 			await fs.readFile(path.join(agentDir!, "llm-as-jev.json"), "utf8"),
 		);
-		assert.equal(raw.mode, "classifier");
+		assert.equal(raw.mode, "auto-llm");
+		// Round trip: auto-llm → auto restores the default preference.
+		await handler.handler("mode auto", pi.makeCtx());
+		raw = JSON.parse(
+			await fs.readFile(path.join(agentDir!, "llm-as-jev.json"), "utf8"),
+		);
+		assert.equal(raw.mode, "auto");
+		// Model slots and thinking stay untouched by mode switches.
+		assert.equal(raw.thinkingLevel, "off");
 	});
 });
 
@@ -727,6 +736,7 @@ test("completions offer every subcommand on empty prefix and filter `ll`", async
 				"llm",
 				"classifier",
 				"mode auto",
+				"mode auto-llm",
 				"mode classifier",
 				"mode llm",
 			],
@@ -737,7 +747,11 @@ test("completions offer every subcommand on empty prefix and filter `ll`", async
 		);
 		assert.deepEqual(
 			completions("mode ").map((o) => o.value),
-			["mode auto", "mode classifier", "mode llm"],
+			["mode auto", "mode auto-llm", "mode classifier", "mode llm"],
+		);
+		assert.deepEqual(
+			completions("mode auto").map((o) => o.value),
+			["mode auto", "mode auto-llm"],
 		);
 		assert.deepEqual(completions("zzz"), []);
 	});
@@ -753,7 +767,7 @@ test("description and unknown-argument usage name all entries, not the alias", a
 			"status",
 			"llm picker",
 			"classifier picker",
-			"mode <auto|classifier|llm>",
+			"mode <auto|auto-llm|classifier|llm>",
 		]) {
 			assert.ok(
 				command.description.includes(word),
@@ -770,7 +784,10 @@ test("description and unknown-argument usage name all entries, not the alias", a
 		assert.match(usage?.message ?? "", /\[status\]\s+\|/);
 		assert.match(usage?.message ?? "", /\|\s+llm\s+\|/);
 		assert.match(usage?.message ?? "", /\|\s+classifier\s+\|/);
-		assert.match(usage?.message ?? "", /mode <auto\|classifier\|llm>/);
+		assert.match(
+			usage?.message ?? "",
+			/mode <auto\|auto-llm\|classifier\|llm>/,
+		);
 		// The removed alias is never advertised.
 		assert.doesNotMatch(usage?.message ?? "", /llm-as-jev-classifier/);
 		assert.doesNotMatch(command.description, /llm-as-jev-classifier/);

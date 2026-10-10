@@ -9,7 +9,7 @@ owns selection, caching, capacity splitting, ordered-evidence recovery,
 threshold policy and a branch-scoped session ledger.
 
 > **BREAKING (prototype rename).** The prototype interface tagged the native
-> path as `jev`. It is now `classifier`: `mode` is `auto | classifier | llm`,
+> path as `jev`. It is now `classifier`: `mode` is `auto | auto-llm | classifier | llm`,
 > `JudgeResult.backend` is `"classifier" | "llm"`, and `availability().jev`
 > is `availability().classifier`. The old `jev` values are rejected (not
 > aliased). Old `jev`-tagged cache/ledger entries are stale under the new
@@ -138,13 +138,16 @@ decides what the number means:
 
 | Phase / backend | Interpretation |
 |---|---|
-| Setup (readiness, discovery, auth) | bounded by the explicit number or the native default; a hung registry promise settles as a timeout error |
+| Setup (readiness, discovery, auth) | bounded by the explicit number or the native default, **per backend attempt**; a hung registry promise settles as a timeout error that permits the one alternate |
 | Native classifier (Jev) | one absolute logical-call deadline across every internal batch/stage, using remaining wall time, never reset per stage |
 | LLM emulation | per-request transport-inactivity window: restarts for each provider request (each question batch and the single output repair); reset by any response bytes (text, reasoning, tool-argument deltas, keepalives) and provider events; **not** forwarded to the provider SDK as a whole-request timeout |
 
 Caller abort stays `aborted`; deadline/inactivity expiry is `error`; late
-backend results are never published after either. Consumers should not run
-an outer timer of their own. (`pi-jev-todo-audit` passes no value unless the
+backend results are never published after either. In automatic modes the
+timed-out backend is not restarted: its **unused alternate** gets a fresh
+window under its own interpretation (an explicit `timeoutMs` applies to both
+attempts independently; it is never a combined wall clock). Consumers should
+not run an outer timer of their own. (`pi-jev-todo-audit` passes no value unless the
 user configures one, so these defaults apply.)
 
 ### Capacity disclosure
@@ -369,7 +372,7 @@ Global `<agentDir>/llm-as-jev.json` (`PI_CODING_AGENT_DIR` or
 
 ```jsonc
 {
-	"mode": "auto",                     // auto | classifier | llm
+	"mode": "auto",                     // auto | auto-llm | classifier | llm
 	"classifierModel": "typesafe/jev-1.13", // optional explicit native pick
 	"model": "anthropic/claude-sonnet-4-5", // LLM slot (independent)
 	"thinkingLevel": "low",             // LLM-only thinking level
@@ -384,10 +387,18 @@ Global `<agentDir>/llm-as-jev.json` (`PI_CODING_AGENT_DIR` or
   (model ids may contain slashes) and fully independent: configuring one
   never mutates the other, and nothing inherits the main-session model or
   thinking level.
-- `mode: auto` uses the selected/default available native classifier and
-  otherwise falls back to the LLM **only during initial availability selection**.
-  There is no fallback after dispatch or a provider/accounting error.
-  `classifier` and `llm` never switch to the other backend.
+- `mode: auto` prefers the selected/default available native classifier;
+  `mode: auto-llm` prefers the independently configured LLM. Both automatic
+  modes switch **once** to the other backend family when the preferred one is
+  missing, unavailable or fails at runtime (discovery/auth, transport,
+  invalid output after repair, irreducible context overflow, setup or
+  execution timeout). The alternate restarts the complete logical request
+  with its own capacity, policy, stage state and timeout window; at most one
+  switch per operation, no cycling back, and the next operation starts from
+  the configured preference again. Valid negative or all-dropped results are
+  successes, and invalid requests, caller cancellation and local callback
+  faults never trigger failover. `classifier` and `llm` never switch to the
+  other backend.
 - **Jev is the default native candidate** (`typesafe`, `openrouter`,
   `cloudflare-workers-ai`, `vercel-ai-gateway`, `opencode` priority).
   Omitting `classifierModel` keeps that discovery. An explicit selection is
@@ -451,23 +462,33 @@ Global `<agentDir>/llm-as-jev.json` (`PI_CODING_AGENT_DIR` or
 | `/llm-as-jev status` | Read-only overview |
 | `/llm-as-jev llm` | Chat model → thinking level pickers |
 | `/llm-as-jev classifier` | Native classifier picker (no thinking step) |
-| `/llm-as-jev mode <auto\|classifier\|llm>` | Persist mode (old `jev` rejected) |
+| `/llm-as-jev mode <auto\|auto-llm\|classifier\|llm>` | Persist mode (old `jev` rejected) |
 
 The bare command and `status` never open a picker, write settings, send an
 inference request or touch the main-session model/thinking — in any mode,
 including non-TUI. The former `/llm-as-jev-classifier` alias is removed; the
 native entry is `/llm-as-jev classifier`. Command-line completion after
-`/llm-as-jev` offers `status`, `llm`, `classifier` and all three `mode`
+`/llm-as-jev` offers `status`, `llm`, `classifier` and all four `mode`
 forms.
 
 The overview shows labeled `Mode`, `Classifier`, `LLM`, `Thinking` and
 `Config` rows. `Mode` is `Auto(classifier)` when the selected/default
 native candidate is usable, `Auto(llm)` when only the configured LLM is
-usable, `Auto(None)` when neither is, or the forced `Classifier` / `LLM`
-label. The suffix describes an **availability snapshot only** — not quota,
-billing or a promise of successful inference — and changes nothing about
-routing: `auto` still falls back only during initial availability
-selection, never after a dispatched request fails.
+usable, `Auto(None)` when neither is; `auto-llm` shows `Auto-LLM(llm)`,
+`Auto-LLM(classifier)` or `Auto-LLM(None)` the same way; forced modes show
+`Classifier` / `LLM`. The suffix describes an **availability snapshot only** —
+not quota, billing or a promise of successful inference — and changes nothing
+about routing: automatic modes still answer through their preferred candidate
+and may switch once at runtime if that candidate fails.
+
+**Compatibility.** Runtime failover changes `auto`'s behavior after a
+backend failure (previously terminal). Callers that require exactly one
+backend should pin `mode: "classifier"` or `mode: "llm"`. Numeric thresholds
+apply only to classifier answers, so a judgment that switches from the
+classifier to the LLM is not confidence-filtered — configure per-model
+thresholds accordingly. `auto-llm` is new: before rolling back to a version
+without it, change the saved mode to a supported value, or the older parser
+falls back to all defaults.
 
 An omitted `classifierModel` displays `Jev` (default discovery) plus the
 resolved `provider/modelid` when available, or `Jev (unavailable)` when

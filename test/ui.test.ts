@@ -75,6 +75,31 @@ test("available explicit non-Jev classifier is retained exactly", () => {
 	assert.equal(overview.warning, undefined);
 });
 
+test("auto-llm shows Auto-LLM(llm), Auto-LLM(classifier), Auto-LLM(None) by availability", () => {
+	const both = formatStatus({
+		config: config({ mode: "auto-llm" }),
+		availability: { classifier: "typesafe/jev-1.13", llm: "fake/fake-model" },
+		configPath: "/x/llm-as-jev.json",
+	});
+	assert.ok(both.text.includes("Auto-LLM(llm)"));
+	assert.equal(both.warning, undefined);
+
+	const onlyNative = formatStatus({
+		config: config({ mode: "auto-llm" }),
+		availability: { classifier: "typesafe/jev-1.13" },
+		configPath: "/x/llm-as-jev.json",
+	});
+	assert.ok(onlyNative.text.includes("Auto-LLM(classifier)"));
+
+	const none = formatStatus({
+		config: config({ mode: "auto-llm" }),
+		availability: {},
+		configPath: "/x/llm-as-jev.json",
+	});
+	assert.ok(none.text.includes("Auto-LLM(None)"));
+	assert.match(none.warning ?? "", /no usable judge backend/);
+});
+
 test("Auto(None): unconfigured LLM stays None while configured refs mark unavailable", () => {
 	const none = formatStatus({
 		config: config(),

@@ -1516,11 +1516,25 @@ test("thinking mutation mid-flight does not change the dispatched level", async 
 	h.registry.streamSimple = original;
 });
 
-test("native dispatch failure never falls back to the LLM", async () => {
-	const h = harness({ mode: "auto" });
+test("auto-llm prefers the configured LLM without native discovery", async () => {
+	const h = harness({ mode: "auto-llm" });
+	h.registry.authKeys.set("fake", "test-key");
+	h.registry.getAvailableOfType = async () => {
+		throw new Error("unused native discovery must not run");
+	};
+	h.registry.replayLlm([boolToolMessage(true)]);
+	const result = await h.service.judge(BOOL_REQ);
+	assert.equal(result.stopReason, "stop", result.errorMessage ?? "");
+	assert.equal(result.backend, "llm");
+	assert.equal(result.model, "fake/fake-model");
+	assert.equal(h.registry.llmCalls.length, 1);
+});
+
+test("forced classifier dispatch failure never falls back to the LLM", async () => {
+	const h = harness({ mode: "classifier" });
 	h.registry.available = [jevModel()];
 	h.registry.replayJev([]);
-	const original = h.registry.classify.bind(h.registry);
+	h.registry.replayLlm([boolToolMessage(true)]);
 	h.registry.classify = (async () => {
 		throw new Error("synthetic native transport failure");
 	}) as typeof h.registry.classify;
@@ -1528,7 +1542,25 @@ test("native dispatch failure never falls back to the LLM", async () => {
 	assert.equal(result.stopReason, "error");
 	assert.match(result.errorMessage!, /synthetic native transport failure/);
 	assert.equal(h.registry.llmCalls.length, 0); // no LLM substitution
-	h.registry.classify = original;
+});
+
+test("auto native dispatch failure permits exactly one LLM attempt", async () => {
+	const h = harness({ mode: "auto" });
+	h.registry.available = [jevModel(), { ...jevModel(), id: "jev-other" }];
+	const nativeCalls: string[] = [];
+	h.registry.classify = (async (model) => {
+		nativeCalls.push(model.id);
+		throw new Error("synthetic native transport failure");
+	}) as typeof h.registry.classify;
+	h.registry.replayLlm([boolToolMessage(false)]);
+	const result = await h.service.judge(BOOL_REQ);
+	assert.equal(result.stopReason, "stop", result.errorMessage ?? "");
+	assert.equal(result.backend, "llm");
+	assert.equal(result.model, "fake/fake-model");
+	assert.equal(asBool(result.answers.q).probability, 0); // valid false
+	assert.equal(result.errorMessage, undefined); // no stale primary error
+	assert.equal(nativeCalls.length, 1); // no other native model substituted
+	assert.equal(h.registry.llmCalls.length, 1);
 });
 
 test("discovery sync throw resolves structured error, never rejects", async () => {

@@ -229,13 +229,14 @@ export default function extension(pi: ExtensionAPI): void {
 	//      gone: `classifier` is the sole native settings entry.
 	pi.registerCommand("llm-as-jev", {
 		description:
-			"Judge backend overview: status | llm picker | classifier picker | mode <auto|classifier|llm>",
+			"Judge backend overview: status | llm picker | classifier picker | mode <auto|auto-llm|classifier|llm>",
 		getArgumentCompletions: (prefix: string) => {
 			const options = [
 				"status",
 				"llm",
 				"classifier",
 				"mode auto",
+				"mode auto-llm",
 				"mode classifier",
 				"mode llm",
 			].filter((o) => o.startsWith(prefix));
@@ -248,12 +249,17 @@ export default function extension(pi: ExtensionAPI): void {
 			const parts = args.trim().split(/\s+/).filter(Boolean);
 			if (parts[0] === "mode") {
 				const mode = parts[1];
-				if (mode === "auto" || mode === "classifier" || mode === "llm") {
+				if (
+					mode === "auto" ||
+					mode === "auto-llm" ||
+					mode === "classifier" ||
+					mode === "llm"
+				) {
 					await setMode(mode, ctx);
 					return;
 				}
 				ctx.ui.notify(
-					`Usage: /llm-as-jev mode <auto|classifier|llm> (current: ${config.mode}; the old "jev" value is no longer accepted)`,
+					`Usage: /llm-as-jev mode <auto|auto-llm|classifier|llm> (current: ${config.mode}; the old "jev" value is no longer accepted)`,
 					"warning",
 				);
 				return;
@@ -286,7 +292,7 @@ export default function extension(pi: ExtensionAPI): void {
 				return;
 			}
 			ctx.ui.notify(
-				`Unknown argument "${parts[0]}"; usage: /llm-as-jev [status] | llm | classifier | mode <auto|classifier|llm>`,
+				`Unknown argument "${parts[0]}"; usage: /llm-as-jev [status] | llm | classifier | mode <auto|auto-llm|classifier|llm>`,
 				"warning",
 			);
 		},

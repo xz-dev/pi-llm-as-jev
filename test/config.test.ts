@@ -22,6 +22,36 @@ const DEFAULTS = {
 	thinkingLevel: "off",
 };
 
+test("auto-llm round-trips without replacing model slots, defaults or unknown keys", async () => {
+	const dir = path.join(tmpRoot, "auto-llm");
+	assert.equal((await loadConfig(dir)).config.mode, "auto");
+	await assert.rejects(fs.access(configFilePath(dir)));
+	await fs.mkdir(dir);
+	const original = {
+		model: "chat/model",
+		classifierModel: "native/family/model",
+		thinkingLevel: "low",
+		futureSetting: { enabled: true },
+	};
+	await fs.writeFile(configFilePath(dir), JSON.stringify(original));
+	assert.equal((await loadConfig(dir)).config.mode, "auto");
+	assert.deepEqual(
+		JSON.parse(await fs.readFile(configFilePath(dir), "utf8")),
+		original,
+	);
+	const selected = validateConfig({ ...original, mode: "auto-llm" });
+	assert.deepEqual(selected.diagnostics, []);
+	assert.equal(selected.config.mode, "auto-llm");
+	await saveConfig({ mode: selected.config.mode }, dir);
+	const loaded = await loadConfig(dir);
+	assert.equal(loaded.config.mode, "auto-llm");
+	assert.equal(loadConfigSync(dir).config.mode, "auto-llm");
+	assert.deepEqual(JSON.parse(await fs.readFile(configFilePath(dir), "utf8")), {
+		...original,
+		mode: "auto-llm",
+	});
+});
+
 test("sync operation reads match async validation, ignore timestamps and recover", async () => {
 	const dir = path.join(tmpRoot, "operation-reader");
 	await fs.mkdir(dir);

@@ -24,7 +24,7 @@ export type ContextLimitOverrides = Record<
 	Pick<CapacityLimits, "request" | "stateAndLongestQuestion">
 >;
 
-export type JudgmentMode = "auto" | "classifier" | "llm";
+export type JudgmentMode = "auto" | "auto-llm" | "classifier" | "llm";
 export type JudgmentThinkingLevel =
 	| "off"
 	| "minimal"
@@ -80,7 +80,12 @@ export interface LoadedConfig {
 	defaults: boolean;
 }
 
-const MODES: readonly JudgmentMode[] = ["auto", "classifier", "llm"];
+const MODES: readonly JudgmentMode[] = [
+	"auto",
+	"auto-llm",
+	"classifier",
+	"llm",
+];
 const LEVELS: readonly JudgmentThinkingLevel[] = [
 	"off",
 	"minimal",
@@ -223,7 +228,7 @@ export function validateConfig(raw: unknown): LoadedConfig {
 		} else {
 			invalid = true;
 			diagnostics.push({
-				message: `llm-as-jev.json: unknown mode ${JSON.stringify(obj.mode)} (expected auto|classifier|llm); using default settings`,
+				message: `llm-as-jev.json: unknown mode ${JSON.stringify(obj.mode)} (expected auto|auto-llm|classifier|llm); using default settings`,
 			});
 		}
 	}

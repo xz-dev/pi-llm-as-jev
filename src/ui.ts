@@ -167,6 +167,12 @@ export function formatStatus({
 			: usableLlm
 				? "Auto(llm)"
 				: "Auto(None)";
+	} else if (mode === "auto-llm") {
+		modeLabel = usableLlm
+			? "Auto-LLM(llm)"
+			: usableClassifier
+				? "Auto-LLM(classifier)"
+				: "Auto-LLM(None)";
 	} else {
 		modeLabel = DISPLAY_MODES[mode];
 	}
@@ -206,7 +212,11 @@ export function formatStatus({
 
 	let warning: string | undefined;
 	if (availability !== undefined) {
-		if (mode === "auto" && !usableClassifier && !usableLlm) {
+		if (
+			(mode === "auto" || mode === "auto-llm") &&
+			!usableClassifier &&
+			!usableLlm
+		) {
 			warning =
 				"llm-as-jev: no usable judge backend; configure an available classifier with /llm-as-jev classifier or an LLM with /llm-as-jev llm";
 		} else if (mode === "classifier" && !usableClassifier) {

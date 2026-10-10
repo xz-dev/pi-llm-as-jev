@@ -178,6 +178,62 @@ test("model metadata is the fallback; absent metadata is reported, not inferred"
 	assert.deepEqual(d2.limits, {});
 });
 
+test("auto-llm selection follows the configured order without touching native discovery", async () => {
+	let nativeProbes = 0;
+	const registry = new Registry(undefined, chat(128000));
+	const discover = registry.getAvailableOfType.bind(registry);
+	registry.getAvailableOfType = async () => {
+		nativeProbes++;
+		return discover();
+	};
+	const { svc } = service(
+		registry,
+		config({
+			mode: "auto-llm",
+			model: "fake/fake-model",
+			provider: "fake",
+			modelId: "fake-model",
+		}),
+	);
+	const d = await svc.describeSelection?.();
+	assert.ok(d && !("error" in d), JSON.stringify(d));
+	assert.equal(d.backend, "llm");
+	assert.equal(d.model, "fake/fake-model");
+	assert.equal(nativeProbes, 0); // read-only, no unused discovery
+
+	// Preferred LLM unconfigured: the view moves to the native candidate.
+	const { svc: second } = service(
+		new Registry(jev("https://api.typesafe.ai/v1", 8192), undefined),
+		config({
+			mode: "auto-llm",
+			model: undefined,
+			provider: undefined,
+			modelId: undefined,
+		}),
+	);
+	const e = await second.describeSelection?.();
+	assert.ok(e && !("error" in e));
+	assert.equal(e.backend, "classifier");
+	assert.equal(e.model, "typesafe/jev-1.13");
+});
+
+test("auto selection after a non-sticky runtime fallback still names the preferred candidate", async () => {
+	// The read-only view is a fresh snapshot: a previous operation that fell
+	// over at runtime never pins the alternate as the configured preference.
+	const { svc } = service(
+		new Registry(jev("https://api.typesafe.ai/v1", 8192), chat(128000)),
+		config({
+			mode: "auto",
+			model: "fake/fake-model",
+			provider: "fake",
+			modelId: "fake-model",
+		}),
+	);
+	const d = await svc.describeSelection?.();
+	assert.ok(d && !("error" in d));
+	assert.equal(d.backend, "classifier"); // configured order, not history
+});
+
 test("LLM selection discloses envelope overhead; config change reflected on next call", async () => {
 	const registry = new Registry(undefined, chat(128000));
 	const { svc, set } = service(

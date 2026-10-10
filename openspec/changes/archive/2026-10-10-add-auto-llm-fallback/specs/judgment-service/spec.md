@@ -1,32 +1,4 @@
-# Judgment Service Specification
-
-## Purpose
-
-An in-process service other Pi extensions call to get answers to Pi-shaped typed questions about JSON state, hiding native-classifier versus discrete-LLM selection, numeric policy, caching and complete ordered-evidence recovery, with judgments retained only on the active session branch.
-
-## Requirements
-
-### Requirement: Service discovery
-The extension SHALL publish one process-wide judgment service handle that other extensions can look up at call time without a load-order dependency. When the extension is not loaded, lookup SHALL yield nothing and callers SHALL be able to treat the feature as unavailable without error.
-
-#### Scenario: Consumer loads before the service
-- **WHEN** a consumer extension looks up the service during its own activation and the judgment extension has not activated yet
-- **THEN** lookup returns nothing, and a later lookup after the judgment extension activates returns the service
-
-#### Scenario: Service absent
-- **WHEN** the judgment extension is not installed
-- **THEN** lookup returns nothing and the consumer continues without a judgment feature
-
-### Requirement: Request and answer shape
-`judge()` SHALL accept a `state` JSON object and a `questions` map whose values are Pi-shaped `choice`, `bool`, or `score` questions. It SHALL return `answers` keyed by question id in Pi-shaped answer form, a list of `dropped` question ids, the `backend` that answered (`classifier` or `llm`), the actual `provider/modelid` used, a `stopReason` of `stop`, `error`, or `aborted`, and an `errorMessage` when not `stop`. Legal own JSON keys SHALL remain intact in questions, choice labels, answers and persisted/reused judgments.
-
-#### Scenario: Mixed question types
-- **WHEN** a request contains one `choice`, one `bool`, and one `score` question
-- **THEN** the result contains each answer in its matching answer type under the same question id
-
-#### Scenario: Special JSON identifiers
-- **WHEN** a valid question id or choice label is `__proto__`, `constructor`, or `toString`
-- **THEN** the own key and its answer/probability survive validation, serialization, cache reuse and branch restore without prototype mutation or data loss
+## MODIFIED Requirements
 
 ### Requirement: Never throws
 `judge()` and `review()` SHALL resolve for every input, abort, timeout, missing backend or provider failure. A backend failure recovered by automatic failover SHALL produce the successful alternate's result. A terminal error or abort SHALL be reported through `stopReason` and `errorMessage` with an empty `answers` map.
@@ -162,55 +134,6 @@ A missing, wrong-type or unavailable explicit native candidate SHALL NOT cause a
 - **WHEN** an earlier automatic operation succeeded through its alternate and a new public operation starts
 - **THEN** the new operation starts from its current configured preference rather than pinning the previous alternate
 
-### Requirement: Backend availability
-`availability()` SHALL expose optional `classifier` and `llm` full model references for usable selected/default native and configured chat candidates. It SHALL NOT expose a `jev` compatibility alias or treat an unconfigured LLM as the main-session model.
-
-#### Scenario: Independent candidates
-- **WHEN** a native classifier and an independently configured chat model are both usable
-- **THEN** availability reports their respective actual references under `classifier` and `llm`
-
-### Requirement: Confidence policy
-When the backend is `classifier`, the service SHALL apply the caller's default `minConfidence` to the adapter's defined choice/score confidence and bool certainty (`max(p, 1-p)`). The caller SHALL also be able to specify a per-question threshold rule that overrides that default: confidence, or the probability of a named choice label. Values SHALL be validated against the defined contract, without inventing missing probabilities, guessing a scale or claiming uniform calibration across models. Dropped ids SHALL be listed in `dropped`. Thresholds SHALL be checked on every call, including cached, joined and restored answers. When the backend is `llm`, every numeric threshold SHALL be ignored: the model directly selects the business answer and `dropped` SHALL be empty. Without a threshold rule, nothing is dropped on either backend.
-
-#### Scenario: Native classifier below threshold
-- **WHEN** backend is `classifier`, `minConfidence` is 0.8, and a choice answer has confidence 0.6
-- **THEN** that question id appears in `dropped` and not in `answers`
-
-#### Scenario: LLM ignores threshold
-- **WHEN** backend is `llm` and `minConfidence` is 0.8
-- **THEN** every answered question appears in `answers` and `dropped` is empty
-
-#### Scenario: Named-choice probability threshold
-- **WHEN** backend is `classifier`, a question's rule requires `contradicted` probability of at least 0.8, and the response has that probability 0.85 with overall confidence 0.7
-- **THEN** the answer is accepted using 0.85, not rejected using 0.7
-
-#### Scenario: A stricter caller reads cached data
-- **WHEN** an answer with confidence 0.85 was accepted at threshold 0.8 and a later identical request uses threshold 0.9
-- **THEN** the cached answer is dropped for the later caller without sending another provider request
-
-### Requirement: Exact-match caching
-The service MAY reuse a previously validated raw judgment internally when backend identity, model, effective thinking level, state, question id and complete question definition are identical, and SHALL join in-flight work for the same identity. It SHALL NOT reuse across backends, models or thinking levels, and SHALL apply thresholds per caller. Consumer-supplied cache lookup/store callbacks are deprecated: existing `version:1` callers that pass them SHALL keep working, new consumers SHALL NOT be required to supply them, and the service SHALL NOT depend on them for correctness.
-
-#### Scenario: Consumer passes no cache callbacks
-- **WHEN** a consumer calls the service with state, questions and options only
-- **THEN** the call is accepted and judged normally
-
-#### Scenario: Legacy consumer passes callbacks
-- **WHEN** a `reviewVersion:1` consumer passes cache callbacks and checkpoints
-- **THEN** behavior is unchanged from the previous release
-
-#### Scenario: Same question twice
-- **WHEN** the same state and question are judged twice on the same backend and model
-- **THEN** the second call sends no provider request and returns the cached answer
-
-#### Scenario: Backend switch
-- **WHEN** a question was answered on `classifier` and the mode is changed so the same question is judged on `llm`
-- **THEN** a new provider request is sent
-
-#### Scenario: Native model switch
-- **WHEN** the configured classifier changes from one model to another and the state/question remain identical
-- **THEN** the next request uses the new model, does not reuse the old model's judgment, and records the new actual model identity
-
 ### Requirement: Context capacity and splitting
 Before sending, the service SHALL predict whether the request exceeds the current backend attempt's input capacity using its declared context limit and learned rejections. When a multi-question request is predicted or reported to overflow, the service SHALL split unanswered questions into smaller batches and retry. When a single question with the given state is rejected for size and applicable recovery cannot complete it, that backend attempt SHALL fail with a context-overflow indication and SHALL NOT resend that exact envelope unchanged to the same backend/model. An automatic operation with an unused alternate SHALL try the full logical request under the alternate's own capacity profile; otherwise the service SHALL report `stopReason: "error"`.
 
@@ -263,36 +186,6 @@ Recovery SHALL operate within one frozen backend identity. When that attempt fai
 - **WHEN** fixed state with one minimum fragment is rejected for input size
 - **THEN** the attempt fails with context overflow rather than deleting evidence or repeatedly resending the same envelope; only an unused automatic alternate can continue the operation
 
-### Requirement: Session-branch ledger
-The service SHALL persist internal raw judgments, size rejections and per-request diagnostics as non-context custom session entries for its own reuse and metering only, restored from the active branch at session start or branch change, never containing credentials, provider bodies or request state/evidence. The ledger SHALL NOT be the consumer's progress or business memory; consumers persist their own judgment state. Aborted work SHALL NOT persist new judgments.
-
-#### Scenario: Consumer progress survives a ledger-free branch
-- **WHEN** a consumer switches to a branch without service ledger entries
-- **THEN** the consumer's own persisted state is unaffected and the service simply has no internal reuse for that branch
-
-#### Scenario: Ledger entries stay out of model context
-- **WHEN** a ledger entry is written
-- **THEN** it is not shown in the transcript and not sent to the agent's model
-
-#### Scenario: Resume restores verdicts
-- **WHEN** a session is resumed after internal raw judgments were persisted
-- **THEN** judging the same state and question returns the persisted answer without a provider request
-
-#### Scenario: Abandoned branch
-- **WHEN** the user navigates to a branch that does not contain a persisted answer
-- **THEN** that answer is not available for internal reuse on the new branch
-
-#### Scenario: Legacy prototype backend tags
-- **WHEN** the active branch contains old `jev`-tagged prototype judgments
-- **THEN** they are not relabeled or accepted as new `classifier` identity matches, and existing session entries are not rewritten
-
-### Requirement: Redaction
-State sent to any backend SHALL have every API key known to the service redacted, and error messages returned to callers SHALL not contain credentials.
-
-#### Scenario: Key inside state text
-- **WHEN** the state contains the literal value of a resolved provider key
-- **THEN** the backend receives the state with that value replaced by a placeholder
-
 ### Requirement: Operation-scoped configuration snapshots
 Each public `judge()`, `review()` and `availability()` call SHALL obtain current global file settings at operation admission, including calls through a service handle acquired before the settings changed. The configuration snapshot SHALL be fixed for that entire call. Internal stages, splitting, malformed-output retries, recovery and automatic failover SHALL NOT become new configuration-reading boundaries. A later public review call, including a resumed review, SHALL obtain a new snapshot.
 
@@ -343,6 +236,8 @@ Observing a changed configuration SHALL NOT itself cancel, restart or duplicate 
 #### Scenario: Failover ignores an intervening settings save
 - **WHEN** an automatic call captures X, its preferred backend fails, and a save to Y changes the alternate model before failover starts
 - **THEN** the call uses X's alternate model, thinking level, timeout override and limits; the next public call observes Y
+
+## ADDED Requirements
 
 ### Requirement: Automatic failover result isolation
 After automatic failover, final answers, dropped ids, backend/model identity, capacity and capacity-related input measurements SHALL describe the terminal backend attempt, not a mixture of both attempts. The alternate SHALL evaluate the complete logical request under its own confidence policy. A successful result SHALL contain no terminal `errorMessage` from the failed preferred attempt. If neither candidate succeeds, the result SHALL have no answers and SHALL describe both failures or unavailable candidates in a bounded, redacted `errorMessage`. If a model was resolved for the terminal attempt, its backend/model SHALL identify that attempt.

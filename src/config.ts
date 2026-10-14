@@ -16,6 +16,7 @@
 
 import { readFileSync } from "node:fs";
 import * as fs from "node:fs/promises";
+import { homedir } from "node:os";
 import type { CapacityLimits } from "./capacity.js";
 
 /** Exact provider/model references; an override replaces the default profile. */
@@ -110,13 +111,16 @@ const KNOWN_KEYS = [
 ] as const;
 let saveSeq = 0;
 
-/** Resolve `<agentDir>`: `PI_CODING_AGENT_DIR` or `~/.pi/agent`. */
+/**
+ * Resolve `<agentDir>`: `PI_CODING_AGENT_DIR` or `~/.pi/agent`. Windows has no
+ * `HOME` unless a shell injects it, so fall back to `os.homedir()` like Pi.
+ */
 export function agentDir(): string {
 	const env = process.env.PI_CODING_AGENT_DIR;
 	if (env && env.trim() !== "") {
 		return env;
 	}
-	const home = process.env.HOME ?? "";
+	const home = (process.env.HOME || homedir()).replace(/\\/g, "/");
 	return home === "" ? "" : `${home.replace(/\/+$/, "")}/.pi/agent`;
 }
 

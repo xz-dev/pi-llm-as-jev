@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import * as fs from "node:fs/promises";
+import { homedir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 import {
@@ -319,6 +320,20 @@ test("invalid timeoutMs falls back to all-defaults", () => {
 	const nan = validateConfig({ timeoutMs: Number.NaN });
 	assert.equal(nan.config.timeoutMs, undefined);
 	assert.equal(nan.diagnostics.length, 1);
+});
+
+test("os home fallback when HOME unset (Windows)", () => {
+	const prev = process.env.PI_CODING_AGENT_DIR;
+	const home = process.env.HOME;
+	delete process.env.PI_CODING_AGENT_DIR;
+	delete process.env.HOME;
+	try {
+		const expected = `${homedir().replace(/\\/g, "/").replace(/\/+$/, "")}/.pi/agent`;
+		assert.equal(agentDir(), expected);
+	} finally {
+		if (home !== undefined) process.env.HOME = home;
+		if (prev !== undefined) process.env.PI_CODING_AGENT_DIR = prev;
+	}
 });
 
 test("home fallback when env unset", () => {

@@ -192,3 +192,41 @@ test("classifyWithModel dispatches the already-selected model without rediscover
 	assert.equal(registry.classifyCalls[0]?.provider, "openrouter");
 	assert.equal(registry.classifyCalls[0]?.id, "jaredpalmer/kev-4b");
 });
+
+// ---------------------------------------------------------------------------
+// classifierBaseUrl: third-party host of the selected model's API
+// ---------------------------------------------------------------------------
+
+test("classifierBaseUrl replaces only the explicit model's endpoint", async () => {
+	const registry = new FakeRegistry();
+	const original = classifier("typesafe", "jev-latest");
+	registry.available = [original];
+	for (const url of [
+		"https://proxy.example.com/v1",
+		"https://proxy.example.com/v1/",
+		"https://proxy.example.com/v1/systemone",
+	]) {
+		const resolved = await resolveNativeClassifier(registry, {
+			classifierModel: "typesafe/jev-latest",
+			classifierBaseUrl: url,
+		});
+		assert.ok("model" in resolved);
+		if ("model" in resolved) {
+			assert.equal(resolved.model.baseUrl, "https://proxy.example.com/v1");
+			assert.equal(resolved.model.provider, "typesafe");
+		}
+	}
+	assert.equal(original.baseUrl, "https://unused.invalid");
+});
+
+test("classifierBaseUrl keeps a systemone path for non-System-One APIs", async () => {
+	const registry = new FakeRegistry();
+	registry.available = [classifier("custom", "clf", "custom-api")];
+	const resolved = await resolveNativeClassifier(registry, {
+		classifierModel: "custom/clf",
+		classifierBaseUrl: "https://host.example/systemone",
+	});
+	assert.ok("model" in resolved);
+	if ("model" in resolved)
+		assert.equal(resolved.model.baseUrl, "https://host.example/systemone");
+});

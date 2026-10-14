@@ -374,6 +374,7 @@ Global `<agentDir>/llm-as-jev.json` (`PI_CODING_AGENT_DIR` or
 {
 	"mode": "auto",                     // auto | auto-llm | classifier | llm
 	"classifierModel": "typesafe/jev-1.13", // optional explicit native pick
+	"classifierBaseUrl": "https://jev-proxy.example.com/v1", // optional third-party endpoint for that pick
 	"model": "anthropic/claude-sonnet-4-5", // LLM slot (independent)
 	"thinkingLevel": "low",             // LLM-only thinking level
 	"timeoutMs": 90000,                  // optional override for BOTH backends; omit for backend defaults
@@ -407,6 +408,19 @@ Global `<agentDir>/llm-as-jev.json` (`PI_CODING_AGENT_DIR` or
   another native model (auto may use the LLM; forced classifier errors).
 - Removing `classifierModel` restores default Jev discovery without
   touching LLM settings.
+- `classifierBaseUrl` (optional, http/https) sends the explicit
+  `classifierModel` to a third-party host of the **same API** — for example a
+  TypeSafe System One mirror for `typesafe/jev-latest`. It requires
+  `classifierModel` and affects only judgment calls; Pi's own catalog and other
+  extensions keep the original endpoint. For System One APIs, give the base
+  (`https://host/v1`); Pi appends `systemone`, and a pasted
+  `.../v1/systemone` is reduced to its base. Credentials still come from that
+  provider in Pi (for `typesafe`, `TYPESAFE_API_KEY` or `/login`). Built-in
+  TypeSafe/OpenRouter channel limits apply only to their known endpoints; set
+  `contextLimits` for the third-party host if needed. Picking a different
+  classifier with `/llm-as-jev classifier` drops the URL.
+  For an endpoint shared by all of Pi, override the provider's `baseUrl` in
+  Pi's `models.json` instead.
 - An unknown chat model means *no LLM backend*, never a main-session
   fallback.
 - Every new `judge()`, `review()`, `availability()`, settings command and

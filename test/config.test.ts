@@ -650,3 +650,49 @@ test("disk and returned config agree for independent slots (3.2)", async () => {
 	// Return value is the same effective config as the disk reload.
 	assert.deepEqual(loaded.config, saved.config);
 });
+
+test("classifierBaseUrl parses with classifierModel and rejects bad values", () => {
+	const ok = validateConfig({
+		classifierModel: "typesafe/jev-latest",
+		classifierBaseUrl: "https://proxy.example.com/v1",
+	});
+	assert.deepEqual(ok.diagnostics, []);
+	assert.equal(ok.config.classifierBaseUrl, "https://proxy.example.com/v1");
+	for (const raw of [
+		{ classifierBaseUrl: "https://proxy.example.com/v1" },
+		{ classifierModel: "typesafe/jev-latest", classifierBaseUrl: "ftp://x" },
+		{ classifierModel: "typesafe/jev-latest", classifierBaseUrl: "not a url" },
+		{ classifierModel: "typesafe/jev-latest", classifierBaseUrl: 1 },
+	]) {
+		const bad = validateConfig(raw);
+		assert.equal(bad.diagnostics.length, 1);
+		assert.equal(bad.config.classifierBaseUrl, undefined);
+		assert.equal(bad.config.classifierModel, undefined);
+	}
+});
+
+test("saveConfig keeps classifierBaseUrl only while the same classifier stays selected", async () => {
+	const dir = path.join(tmpRoot, "base-url");
+	await fs.mkdir(dir, { recursive: true });
+	await fs.writeFile(
+		configFilePath(dir),
+		JSON.stringify({
+			classifierModel: "typesafe/jev-latest",
+			classifierBaseUrl: "https://proxy.example.com/v1",
+		}),
+	);
+	const kept = await saveConfig({ mode: "classifier" }, dir);
+	assert.equal(kept.config.classifierBaseUrl, "https://proxy.example.com/v1");
+	const same = await saveConfig(
+		{ classifierModel: "typesafe/jev-latest" },
+		dir,
+	);
+	assert.equal(same.config.classifierBaseUrl, "https://proxy.example.com/v1");
+	const switched = await saveConfig(
+		{ classifierModel: "openrouter/typesafe/jev-1.13" },
+		dir,
+	);
+	assert.equal(switched.config.classifierBaseUrl, undefined);
+	const onDisk = JSON.parse(await fs.readFile(configFilePath(dir), "utf8"));
+	assert.equal(onDisk.classifierBaseUrl, undefined);
+});

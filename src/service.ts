@@ -595,6 +595,8 @@ interface ReviewFlight {
 
 interface InFlight {
 	generation: number;
+	/** Admitted setup bound (explicit duration, else the native default). */
+	setupTimeoutMs?: number;
 	/** Projected input dimensions for each logical backend dispatch, not SDK HTTP attempts. */
 	inputDimensions?: NonNullable<JudgeResult["inputDimensions"]>;
 	timeoutMs?: number;
@@ -1460,6 +1462,7 @@ export function createJudgmentService(runtime: ServiceRuntime): CreatedService {
 				);
 			}
 			flight.timeoutMs = requestedTimeout;
+			flight.setupTimeoutMs = requestedTimeout;
 			// Bounded setup: readiness + selection stay under the caller's
 			// absolute budget even when the registry ignores its signal. The
 			// timer is cleared for the LLM backend once execution starts —
@@ -2466,11 +2469,12 @@ export function createJudgmentService(runtime: ServiceRuntime): CreatedService {
 					overflowConstraint(profile, fixedSize, limits) === "state"
 				) {
 					// An LLM attempt has no absolute deadline once executing, so bound
-					// this lookup itself; timeout or abort falls through to sending.
+					// this setup-like lookup by the setup duration (explicit, else 60 s),
+					// not the LLM idle window; timeout or abort falls through to sending.
 					const raced = await guardSelection(
 						flight.alternateReady(opts.signal),
 						deadline ??
-							Date.now() + (flight.timeoutMs || DEFAULT_NATIVE_TIMEOUT_MS),
+							Date.now() + (flight.setupTimeoutMs ?? DEFAULT_NATIVE_TIMEOUT_MS),
 						opts.signal,
 					);
 					const stopped = requestInterruption(flight, deadline, opts.signal);

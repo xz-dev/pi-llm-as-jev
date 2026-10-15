@@ -397,8 +397,9 @@ Global `<agentDir>/llm-as-jev.json` (`PI_CODING_AGENT_DIR` or
   question already exceed the preferred attempt's state limit
   (`stateAndLongestQuestion`, else its context window) by the local estimate,
   and the alternate resolves, the request goes straight to the alternate
-  without being sent to the preferred backend. The alternate restarts the complete logical request
-  with its own capacity, policy, stage state and timeout window; at most one
+  without being sent to the preferred backend. The alternate restarts the
+  complete logical request with its own capacity, policy, stage state and
+  timeout window; at most one
   switch per operation, no cycling back, and the next operation starts from
   the configured preference again. Valid negative or all-dropped results are
   successes, and invalid requests, caller cancellation and local callback

@@ -972,4 +972,19 @@ test("review: indivisible fixed snapshot over the native limit skips native", as
 	assert.equal(h.counts.llm, 1);
 	assert.equal(r.diagnostics.attempts.length, 0); // no native transport attempt
 	assert.ok(!h.rows.some((row) => row.kind === "rejected"));
+	// The fake LLM lacks observable transport, so the alternate fails honestly;
+	// the native side must be the local check, not a provider rejection.
+	assert.match(r.errorMessage ?? "", /classifier[^;]*context overflow/);
+});
+
+test("auto-llm: a hung alternate lookup is bounded and the LLM request is sent", async () => {
+	const h = harness(
+		"auto-llm",
+		{ discover: () => never() },
+		{ contextLimits: { "llmco/chat": { stateAndLongestQuestion: 200 } } },
+	);
+	const r = await h.service.judge(BIG, { timeoutMs: 300 });
+	assert.equal(r.stopReason, "stop", r.errorMessage ?? "");
+	assert.equal(r.backend, "llm");
+	assert.deepEqual([h.calls.discover, h.calls.native, h.calls.llm], [1, 0, 1]);
 });

@@ -2465,9 +2465,12 @@ export function createJudgmentService(runtime: ServiceRuntime): CreatedService {
 					flight.alternateReady &&
 					overflowConstraint(profile, fixedSize, limits) === "state"
 				) {
+					// An LLM attempt has no absolute deadline once executing, so bound
+					// this lookup itself; timeout or abort falls through to sending.
 					const raced = await guardSelection(
 						flight.alternateReady(opts.signal),
-						deadline,
+						deadline ??
+							Date.now() + (flight.timeoutMs || DEFAULT_NATIVE_TIMEOUT_MS),
 						opts.signal,
 					);
 					const stopped = requestInterruption(flight, deadline, opts.signal);

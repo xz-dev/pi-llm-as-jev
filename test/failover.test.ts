@@ -879,3 +879,97 @@ test("success after failover reports only the terminal attempt", async () => {
 		["classifier", "llm"],
 	);
 });
+
+// ---------------------------------------------------------------------------
+// failover-on-predicted-state-overflow: local pre-dispatch floor check
+// ---------------------------------------------------------------------------
+
+/** Fixed state (≈1000 bytes × 1/1.75 ≈ 600 tokens) far above a 200-token state limit. */
+const BIG: JudgeRequest = {
+	state: { text: "x".repeat(1000) },
+	questions: { q: Q },
+};
+const TINY_NATIVE = {
+	contextLimits: { "typesafe/jev-1.13": { stateAndLongestQuestion: 200 } },
+};
+const rejectedRows = (rows: LedgerRecord[]) =>
+	rows.filter((row) => row.kind === "rejected");
+
+test("auto: oversized fixed state goes to the LLM without a native request", async () => {
+	const h = harness("auto", {}, TINY_NATIVE);
+	const r = await h.service.judge(BIG);
+	assert.equal(r.stopReason, "stop", r.errorMessage ?? "");
+	assert.equal(r.backend, "llm");
+	assert.deepEqual([h.calls.native, h.calls.llm], [0, 1]);
+	assert.equal(rejectedRows(h.rows).length, 0); // a local check, not a rejection
+	assert.equal(r.inputDimensions?.length, 1); // LLM dispatch only
+});
+
+test("auto: several questions over the floor are not split into native requests", async () => {
+	const h = harness("auto", {}, TINY_NATIVE);
+	const r = await h.service.judge({
+		...BIG,
+		questions: { a: Q, b: Q, c: Q },
+	});
+	assert.equal(r.backend, "llm");
+	assert.equal(h.calls.native, 0);
+});
+
+test("auto-llm: oversized state for the LLM goes to native without an LLM request", async () => {
+	const h = harness(
+		"auto-llm",
+		{},
+		{ contextLimits: { "llmco/chat": { stateAndLongestQuestion: 200 } } },
+	);
+	const r = await h.service.judge(BIG);
+	assert.equal(r.stopReason, "stop", r.errorMessage ?? "");
+	assert.equal(r.backend, "classifier");
+	assert.deepEqual([h.calls.llm, h.calls.native], [0, 1]);
+});
+
+test("without a usable alternate the oversized request is still sent once", async () => {
+	for (const [mode, script] of [
+		["classifier", {}],
+		["auto", { llmConfigured: false }],
+	] as const) {
+		const h = harness(mode, script, TINY_NATIVE);
+		const r = await h.service.judge(BIG);
+		assert.equal(h.calls.native, 1, mode);
+		assert.equal(h.calls.llm, 0, mode);
+		assert.equal(r.backend, "classifier", mode);
+		assert.equal(r.stopReason, "stop", mode); // the provider's answer decides
+	}
+});
+
+test("a resolvable alternate that then fails never cycles back to send native", async () => {
+	const h = harness(
+		"auto",
+		{ llm: async () => llmError("HTTP 500") },
+		TINY_NATIVE,
+	);
+	const r = await h.service.judge(BIG);
+	assert.equal(r.stopReason, "error");
+	assert.deepEqual([h.calls.native, h.calls.llm], [0, 1]);
+	assert.match(r.errorMessage ?? "", /both automatic backend attempts failed/);
+	assert.match(r.errorMessage ?? "", /classifier[^;]*context overflow/);
+});
+
+test("a fitting request still goes to native and never resolves the LLM early", async () => {
+	const h = harness("auto", {}, TINY_NATIVE);
+	const r = await h.service.judge(REQ); // {x:1} fits 200 tokens
+	assert.equal(r.backend, "classifier");
+	assert.deepEqual([h.calls.native, h.calls.llm], [1, 0]);
+});
+
+test("review: indivisible fixed snapshot over the native limit skips native", async () => {
+	const h = observableNative(() => false);
+	// jev contextWindow is 100000 tokens: ~175 KB at the prior ratio.
+	const r = await h.service.review({
+		state: { macroSnapshot: "x".repeat(200_000) },
+		questions: { q: Q },
+	});
+	assert.equal(h.counts.native, 0);
+	assert.equal(h.counts.llm, 1);
+	assert.equal(r.diagnostics.attempts.length, 0); // no native transport attempt
+	assert.ok(!h.rows.some((row) => row.kind === "rejected"));
+});

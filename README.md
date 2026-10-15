@@ -393,7 +393,11 @@ Global `<agentDir>/llm-as-jev.json` (`PI_CODING_AGENT_DIR` or
   modes switch **once** to the other backend family when the preferred one is
   missing, unavailable or fails at runtime (discovery/auth, transport,
   invalid output after repair, irreducible context overflow, setup or
-  execution timeout). The alternate restarts the complete logical request
+  execution timeout). When fixed state, unsplittable evidence and the longest
+  question already exceed the preferred attempt's state limit
+  (`stateAndLongestQuestion`, else its context window) by the local estimate,
+  and the alternate resolves, the request goes straight to the alternate
+  without being sent to the preferred backend. The alternate restarts the complete logical request
   with its own capacity, policy, stage state and timeout window; at most one
   switch per operation, no cycling back, and the next operation starts from
   the configured preference again. Valid negative or all-dropped results are
@@ -463,7 +467,10 @@ Global `<agentDir>/llm-as-jev.json` (`PI_CODING_AGENT_DIR` or
 - Capacity uses the actual serialized envelope and transport-scoped learning.
   Predictions are not exact token counts. Later usable lower-density successes
   correct estimates, including after reload. Overestimated fixed facts get one
-  useful unanswered-batch admission; known exact rejections stay protected.
+  useful unanswered-batch admission unless an automatic route has a usable
+  alternate, which then receives the request unsent (not recorded as a
+  rejection; with the prior ratio this can occasionally skip a request the
+  preferred backend would have admitted). Known exact rejections stay protected.
   Only recognized context overflow permits recovery. Auth/quota/rate/validation/
   generic payload errors do not justify subdivision. Required facts are never
   silently cropped to fit.

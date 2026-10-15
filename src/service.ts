@@ -617,6 +617,12 @@ interface InFlight {
 	/** A joined owner's work ended aborted while this caller stayed live. */
 	sharedAbort?: boolean;
 	/**
+	 * Automatic route only, absent on its last attempt: whether the unused
+	 * alternate currently resolves. Consulted lazily, only when the local
+	 * irreducible-floor check says the request cannot fit this attempt.
+	 */
+	alternateReady?: (signal: AbortSignal | undefined) => Promise<boolean>;
+	/**
 	 * Request-owned judgment commits (F4): buffered per stage and flushed to
 	 * the ledger only when the request's overall outcome is known — never on
 	 * abort, and only while the request still owns the current generation.
@@ -1275,7 +1281,7 @@ export function createJudgmentService(runtime: ServiceRuntime): CreatedService {
 		let unavailableOnly = true;
 		let outcome: AttemptOutcome | undefined;
 		let resolvedFailure: JudgeResult | undefined;
-		for (const backend of route) {
+		for (const [index, backend] of route.entries()) {
 			if (outcome) {
 				const previous = flights[flights.length - 1];
 				const shell = resultShell(outcome.result.backend, outcome.result.model);
@@ -1317,6 +1323,20 @@ export function createJudgmentService(runtime: ServiceRuntime): CreatedService {
 				bufferedJudgments: [],
 				...(review ? { review: review() } : {}),
 			};
+			const next = route[index + 1];
+			// A deprecated checkpoint seed cannot fail over (see above), so it has
+			// no alternate to hand an oversized request to.
+			if (
+				next !== undefined &&
+				flight.review?.options.checkpoint === undefined
+			) {
+				let ready: Promise<boolean> | undefined;
+				flight.alternateReady = (signal) =>
+					(ready ??= resolveCandidate(config, next, signal).then(
+						(candidate) => !("error" in candidate),
+						() => false,
+					));
+			}
 			flights.push(flight);
 			outcome = await judgeAttempt(
 				rawReq,
@@ -2434,6 +2454,35 @@ export function createJudgmentService(runtime: ServiceRuntime): CreatedService {
 						),
 					);
 				const irreducible = misses.length === 1 && !evidenceCanSplit;
+
+				// Local pre-dispatch check: fixed state, unsplittable evidence and the
+				// longest unanswered question already exceed this attempt's state
+				// limit, so no batching can make it fit. With a usable unused
+				// alternate, hand the request over instead of sending it. This is a
+				// local estimate, not a rejection: nothing is recorded as rejected.
+				if (
+					!rejected &&
+					flight.alternateReady &&
+					overflowConstraint(profile, fixedSize, limits) === "state"
+				) {
+					const raced = await guardSelection(
+						flight.alternateReady(opts.signal),
+						deadline,
+						opts.signal,
+					);
+					const stopped = requestInterruption(flight, deadline, opts.signal);
+					if (stopped) {
+						Object.assign(total, stopped);
+						return false;
+					}
+					if ("value" in raced && raced.value) {
+						total.stopReason = "error";
+						total.contextOverflow = true;
+						total.errorMessage =
+							"context overflow (local check, not sent): the required fixed state plus the longest question exceeds this backend's state limit";
+						return false;
+					}
+				}
 
 				if (rejected && flight.review) flight.review.rejectedReuses += 1;
 				if (rejected && !irreducible) {

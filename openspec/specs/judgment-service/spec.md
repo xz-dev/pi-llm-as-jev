@@ -212,7 +212,7 @@ The service MAY reuse a previously validated raw judgment internally when backen
 - **THEN** the next request uses the new model, does not reuse the old model's judgment, and records the new actual model identity
 
 ### Requirement: Context capacity and splitting
-Before sending, the service SHALL predict whether the request exceeds the current backend attempt's input capacity using its declared context limit and learned rejections. When a multi-question request is predicted or reported to overflow, the service SHALL split unanswered questions into smaller batches and retry. When a single question with the given state is rejected for size and applicable recovery cannot complete it, that backend attempt SHALL fail with a context-overflow indication and SHALL NOT resend that exact envelope unchanged to the same backend/model. An automatic operation with an unused alternate SHALL try the full logical request under the alternate's own capacity profile; otherwise the service SHALL report `stopReason: "error"`.
+Before sending, the service SHALL predict whether the request exceeds the current backend attempt's input capacity using its declared context limit and learned rejections. When a multi-question request is predicted or reported to overflow, the service SHALL split unanswered questions into smaller batches and retry. When a single question with the given state is rejected for size and applicable recovery cannot complete it, that backend attempt SHALL fail with a context-overflow indication and SHALL NOT resend that exact envelope unchanged to the same backend/model. When the irreducible floor — the given state, evidence that cannot be split and the longest unanswered question — is predicted to exceed the attempt's state limit (`stateAndLongestQuestion`, else the declared context window) and an automatic route has an unused alternate whose candidate currently resolves, that backend attempt SHALL fail with a context-overflow indication before dispatch; without such an alternate the request SHALL still be sent once. An automatic operation with an unused alternate SHALL try the full logical request under the alternate's own capacity profile after either confirmed or predicted irreducible overflow; otherwise the service SHALL report `stopReason: "error"`.
 
 #### Scenario: Batch overflows
 - **WHEN** a request with eight questions is rejected by the provider for input size
@@ -233,6 +233,14 @@ Before sending, the service SHALL predict whether the request exceeds the curren
 #### Scenario: Smaller alternate cannot fit
 - **WHEN** a failed preferred attempt is followed by an alternate whose capacity cannot fit the logical request even after applicable recovery
 - **THEN** the operation returns a structured error rather than truncating evidence, borrowing the first backend's limits or cycling back
+
+#### Scenario: Predicted irreducible overflow skips to the alternate
+- **WHEN** a single-question `judge()` state is predicted above the preferred backend's state limit and the unused alternate resolves
+- **THEN** the preferred backend receives no request and the alternate's result is returned
+
+#### Scenario: Alternate unusable keeps the admission check
+- **WHEN** the same prediction occurs but the route's alternate is unconfigured or does not resolve
+- **THEN** the preferred backend receives the request once and its actual outcome decides the result
 
 ### Requirement: Ordered evidence recovery
 Ordered evidence with service-owned fragmentation SHALL remain available for callers that supply it, with the same completeness and metadata guarantees as before. It SHALL NOT be required: callers SHALL be able to embed ordered input inside `state` and rely on capacity disclosure and question splitting only. Business stage callbacks (`planStages`, `projectStage`, `onProgress`) and service checkpoints are deprecated and SHALL NOT be required for a complete result.

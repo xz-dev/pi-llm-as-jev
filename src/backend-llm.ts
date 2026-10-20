@@ -1,5 +1,5 @@
 /**
- * Discrete LLM classifier backend (design D4 + llm-classifier-backend spec).
+ * Discrete LLM classifier backend (version two waiting contract).
  *
  * Answers jev-style questions with an ordinary chat model through
  * `modelRegistry.streamSimple()`, so the registry keeps owning credentials,
@@ -7,11 +7,21 @@
  * for a discrete business selection (choice label, bool value, or integer
  * score level); Pi's numeric compatibility fields are encoded locally and
  * never requested from the model.
+ *
+ * Waiting: the caller supplies ONE combined attempt signal plus a progress
+ * callback (service/direct-provider entries own the clocks). Idle renews
+ * only on genuine generation progress — nonempty normalized text, thinking
+ * or tool-argument deltas observed on the SDK event stream, or a validated
+ * completed question answer — never on heartbeats, headers, empty events,
+ * request starts or retries. The idle duration is never forwarded to the
+ * provider SDK as a whole-request timeout.
  */
 
 import type {
 	Api,
 	AssistantMessage,
+	AssistantMessageEvent,
+	AssistantMessageEventStream,
 	ClassifierAnswer,
 	ClassifierApi,
 	ClassifierContext,
@@ -49,28 +59,24 @@ export interface LlmRegistry {
 			onProviderStreamEvent?: (data: unknown, model: AnyModel) => void;
 			reasoning?: Exclude<JudgmentThinkingLevel, "off">;
 		},
-	): { result(): Promise<AssistantMessage> };
+	): AssistantMessageEventStream;
 }
 
 export interface LlmClassifyOptions {
 	thinkingLevel?: JudgmentThinkingLevel;
-	/** Service review hook for independently validated finite members; never whole-stage success. */
+	/** Reports one validated completed question answer (renews idle). */
 	onAnswer?: (id: string, answer: ClassifierAnswer) => void;
+	/** Combined attempt signal owned by the caller's clocks. */
 	signal?: AbortSignal;
+	/**
+	 * Genuine-generation callback invoked on each nonempty normalized
+	 * text/thinking/tool-argument delta; the owning clock renews idle there.
+	 */
+	progress?: () => void;
 	/** Any provider event or activity observer supplied by the caller. */
 	onProviderStreamEvent?: (data: unknown, model: AnyModel) => void;
-	/** Optional caller fetch; llmClassify composes activity observation
-	 *  through it without swallowing the supplied implementation. */
+	/** Optional caller fetch, forwarded through Pi's transport seam. */
 	fetch?: typeof globalThis.fetch;
-	/**
-	 * Transport INACTIVITY window (ms) applied independently to every
-	 * provider request this call makes — including the bounded wait for the
-	 * first response byte. Raw transport activity (SSE data or keepalive
-	 * bytes, reasoning and tool-argument deltas, provider stream events)
-	 * resets the clock; a continuous stream may outlive this window without
-	 * ever being timed out. It is never a total deadline across questions.
-	 */
-	timeoutMs?: number;
 }
 
 /**
@@ -272,151 +278,49 @@ function sumUsage(usages: Usage[]): Usage | undefined {
 	return total;
 }
 
-/**
- * Per-attempt transport inactivity clock (LLM policy). Any observed
- * activity — response-body bytes through the request-scoped fetch, a
- * provider stream event, or the settled result — resets the window; the
- * attempt is aborted only after `timeoutMs` of silence. The same clock
- * covers the pre-first-byte wait, so a stalled connection fails boundedly
- * while a continuously streaming call can run far past `timeoutMs` total.
- */
-type InactivityClock = {
-	/** Abort this attempt's transport; fires the combined signal. */
-	abort(): void;
-	/** Record observed transport activity (resets the idle timer). */
-	activity(): void;
-	/** Stop the timer; the attempt settled or no window applies. */
-	dispose(): void;
-};
-
-function newInactivityClock(
-	timeoutMs: number | undefined,
-	controller: AbortController,
-): InactivityClock {
-	if (timeoutMs === undefined || !Number.isFinite(timeoutMs)) {
-		return {
-			abort: () => controller.abort(IDLE_TIMEOUT),
-			activity: () => {},
-			dispose: () => {},
-		};
-	}
-	let timer: ReturnType<typeof setTimeout> | undefined;
-	let disposed = false;
-	const arm = () => {
-		if (disposed) return;
-		if (timer !== undefined) clearTimeout(timer);
-		timer = setTimeout(() => controller.abort(IDLE_TIMEOUT), timeoutMs);
-	};
-	arm();
-	return {
-		abort: () => controller.abort(IDLE_TIMEOUT),
-		// Late events after settlement must not rearm the timer.
-		activity: arm,
-		dispose: () => {
-			disposed = true;
-			if (timer !== undefined) clearTimeout(timer);
-		},
-	};
-}
-
-const IDLE_TIMEOUT = Symbol("llm transport inactivity timeout");
-
-/**
- * Request-scoped fetch wrapper reporting raw transport activity: each
- * response-headers arrival and every body chunk (any bytes — visible text,
- * reasoning deltas, keepalives) mark the attempt live. The stream is
- * transparently forwarded; nothing is buffered, logged or mutated.
- */
-function activityFetch(
-	clock: InactivityClock,
-	inner: typeof globalThis.fetch,
-): typeof globalThis.fetch {
-	return async (url, init) => {
-		const response = await inner(url, init);
-		clock.activity();
-		const body = response.body;
-		if (!body) return response;
-		const reader = body.getReader();
-		const tapped = new ReadableStream<Uint8Array>({
-			async pull(controller) {
-				try {
-					const part = await reader.read();
-					if (part.done) {
-						controller.close();
-						return;
-					}
-					clock.activity();
-					controller.enqueue(part.value);
-				} catch (error) {
-					controller.error(error);
-				}
-			},
-			cancel(reason) {
-				return reader.cancel(reason);
-			},
-		});
-		return new Response(tapped, {
-			status: response.status,
-			statusText: response.statusText,
-			headers: response.headers,
-		});
-	};
+/** Nonempty normalized deltas are the only stream events that mean progress. */
+function isGenerationDelta(event: AssistantMessageEvent): boolean {
+	return (
+		(event.type === "text_delta" ||
+			event.type === "thinking_delta" ||
+			event.type === "toolcall_delta") &&
+		event.delta.trim().length > 0
+	);
 }
 
 /**
- * Race a registry promise against the combined caller/inactivity signal so
- * the caller settles even when streamSimple never observes it. The
- * inactivity controller's abort is reported as a timeout; a caller abort
- * stays an abort. A late registry resolution is dropped. A rejection
- * settles as `threw` (caller-abort precedence is decided by the caller)
- * rather than propagating out of the race.
+ * Consume one question's event stream to settlement while reporting genuine
+ * generation progress. Heartbeats, headers, empty deltas and lifecycle
+ * events never qualify. Resolves the terminal AssistantMessage; the owning
+ * caller races this against its combined clock signal, so a stalled or
+ * non-cooperative stream cannot hold the caller even if `result()` never
+ * settles after abort.
  */
-async function guardRace<T>(
-	promise: Promise<T>,
+async function consumeStream(
+	stream: AssistantMessageEventStream,
+	progress: (() => void) | undefined,
 	signal: AbortSignal | undefined,
-	idle: AbortSignal | undefined,
-): Promise<
-	{ value: T } | { timeout: true } | { aborted: true } | { threw: Error }
-> {
-	const run = async (): Promise<
-		{ value: T } | { timeout: true } | { aborted: true } | { threw: Error }
-	> => {
-		try {
-			return { value: await promise };
-		} catch (error) {
-			return {
-				threw: error instanceof Error ? error : new Error(String(error)),
-			};
+): Promise<AssistantMessage | undefined> {
+	const result = stream.result();
+	const events = (async () => {
+		for await (const event of stream) {
+			if (isGenerationDelta(event)) progress?.();
 		}
-	};
-	const timedOut = () => idle?.aborted === true;
-	if (!signal && !idle) return run();
-	let onAbort: (() => void) | undefined;
-	const settle = (
-		resolve: (r: { timeout: true } | { aborted: true }) => void,
-	) => {
-		resolve(timedOut() ? { timeout: true } : { aborted: true });
-	};
-	try {
-		return (await Promise.race([
-			run(),
-			new Promise<{ timeout: true } | { aborted: true }>((resolve) => {
-				if (!signal || signal.aborted) settle(resolve);
-				else {
-					onAbort = () => settle(resolve);
-					signal.addEventListener("abort", onAbort, { once: true });
-				}
-			}),
-		])) as
-			| { value: T }
-			| { timeout: true }
-			| { aborted: true }
-			| { threw: Error };
-	} finally {
-		if (onAbort !== undefined && signal) {
-			signal.removeEventListener("abort", onAbort);
-		}
-	}
+	})();
+	// Success waits for both; either rejection must fail promptly, even if
+	// its peer stalls. Both promises stay handled after cancellation.
+	const completed = Promise.all([result, events]).then(([message]) => message);
+	if (!signal) return completed;
+	return Promise.race([
+		completed,
+		new Promise<undefined>((resolve) => {
+			if (signal.aborted) resolve(undefined);
+			else
+				signal.addEventListener("abort", () => resolve(undefined), {
+					once: true,
+				});
+		}),
+	]);
 }
 
 function resultShell(
@@ -438,20 +342,14 @@ function resultShell(
 /**
  * Classify through an ordinary chat model, one discrete tool call per
  * question. Never rejects; failures return `stopReason: "error"` /
- * `"aborted"`. Malformed model output gets exactly one retry; provider,
- * auth and timeout errors do not.
+ * `"aborted"`. Malformed model output gets exactly one repair request; the
+ * repair runs inside the SAME attempt clocks — it never renews the hard
+ * limit — and a second invalid response fails without guessed answers.
+ * Provider, auth, cancellation and timeout errors never trigger repair.
  *
- * Waiting policy (backend-specific, per the canonical `timeoutMs`
- * contract): `options.timeoutMs` is a TRANSPORT-INACTIVITY window applied
- * independently to every per-question provider request, including the
- * bounded wait for the first response byte. Raw transport activity —
- * response-body bytes observed through the request-scoped `fetch` option
- * and provider stream events on adapters that emit them — resets the
- * clock, so a continuously streaming call can outlive the window while a
- * stalled connection or silent stream fails boundedly. It is NOT a
- * deadline shared across questions. Caller/branch cancellation stays
- * effective throughout; a request that ignores its combined signal still
- * settles via the abort-guard race.
+ * Every wait observes the caller's combined attempt `signal`; an attempt
+ * whose owner retired it (idle, hard or caller) settles through the signal
+ * race even when the provider stream never observes cancellation.
  */
 export async function llmClassify(
 	registry: LlmRegistry,
@@ -462,15 +360,6 @@ export async function llmClassify(
 	if (options?.signal?.aborted) {
 		return resultShell(model, "aborted");
 	}
-	// A non-positive inactivity window is already expired: fail boundedly
-	// without dispatching a provider request.
-	if (options?.timeoutMs !== undefined && options.timeoutMs <= 0) {
-		return resultShell(
-			model,
-			"error",
-			`LLM classification timed out after ${options.timeoutMs}ms`,
-		);
-	}
 	const reasoning = reasoningForRequest(model, options?.thinkingLevel ?? "off");
 
 	const entries = Object.entries(context.questions);
@@ -480,6 +369,8 @@ export async function llmClassify(
 	const usages: Usage[] = [];
 
 	for (const [id, question] of entries) {
+		if (options?.signal?.aborted)
+			return { ...resultShell(model, "aborted"), usage: sumUsage(usages) };
 		const request = {
 			systemPrompt: buildSystemPrompt(),
 			messages: [
@@ -500,91 +391,41 @@ export async function llmClassify(
 		let failure: { reason: "error" | "aborted"; message?: string } | undefined;
 
 		for (let attempt = 0; attempt < 2 && selection === undefined; attempt++) {
-			// One inactivity controller per provider request: the window restarts
-			// for the single malformed-output repair attempt and for every
-			// question — never a shared countdown.
-			const idleController = new AbortController();
-			const clock = newInactivityClock(options?.timeoutMs, idleController);
-			const signal = options?.signal
-				? AbortSignal.any([options.signal, idleController.signal])
-				: idleController.signal;
-			const timeoutMessage = `LLM classification timed out after ${options?.timeoutMs}ms`;
-
-			// streamSimple() can throw synchronously (missing auth) and
-			// result() can throw or reject; every path below is a structured
-			// failure, never an exception out of llmClassify, and none of
-			// them is a malformed-output retry.
-			let raced: Awaited<ReturnType<typeof guardRace<AssistantMessage>>>;
+			// Each provider request observes the SAME attempt signal: neither a
+			// question nor the single repair ever renews the hard clock.
+			let message: AssistantMessage | undefined;
 			try {
 				const stream = registry.streamSimple(model, request, {
-					signal,
-					// Do NOT forward `timeoutMs`: provider SDKs read it as a whole-
-					// request deadline, which would reintroduce a total clock over
-					// an active stream. The plugin's inactivity abort is
-					// authoritative; the provider keeps its own default transport
-					// policy (e.g. HTTP header/body idle) underneath.
+					signal: options?.signal,
+					// Do NOT forward a timeout: the caller's clocks are
+					// authoritative; provider transport policy stays underneath.
 					toolChoice: "auto",
 					reasoning,
-					fetch: activityFetch(clock, options?.fetch ?? globalThis.fetch),
-					onProviderStreamEvent: (data, eventModel) => {
-						clock.activity();
-						return options?.onProviderStreamEvent?.(data, eventModel);
-					},
+					fetch: options?.fetch,
+					onProviderStreamEvent: (data, eventModel) =>
+						options?.onProviderStreamEvent?.(data, eventModel),
 				});
-				raced = await guardRace(stream.result(), signal, idleController.signal);
+				message = await consumeStream(
+					stream,
+					options?.progress,
+					options?.signal,
+				);
 			} catch (error) {
-				// Sync streamSimple throw: only an already-fired caller cancel
-				// wins over the provider failure.
+				// Provider failures, including asynchronous stream rejection:
+				// only an already-fired caller cancel wins over the failure.
 				failure = {
 					reason: options?.signal?.aborted ? "aborted" : "error",
 					message: error instanceof Error ? error.message : String(error),
 				};
-				clock.dispose();
-				break;
-			} finally {
-				clock.dispose();
-			}
-			if ("timeout" in raced) {
-				failure = {
-					reason: "error",
-					message: timeoutMessage,
-				};
 				break;
 			}
-			if ("aborted" in raced) {
+			if (options?.signal?.aborted || message === undefined) {
 				failure = { reason: "aborted" };
 				break;
 			}
-			if ("threw" in raced) {
-				// A rejection racing an in-flight caller cancel: give a cancel
-				// scheduled in the same tick one macrotask to land, because a
-				// canceled call must never surface as a provider error.
-				const aborted = await new Promise<boolean>((resolve) =>
-					setTimeout(() => resolve(Boolean(options?.signal?.aborted)), 0),
-				);
-				failure = aborted
-					? { reason: "aborted" }
-					: { reason: "error", message: raced.threw.message };
-				break;
-			}
-			const message = raced.value;
 			if (message.usage) usages.push(message.usage);
-			if (options?.signal?.aborted) {
-				failure = { reason: "aborted" };
-				break;
-			}
 			if (message.stopReason === "aborted") {
-				// Reaching here means the caller did not abort: an aborted message
-				// with the inactivity controller fired is an idle timeout, else the
-				// adapter aborted for its own reason (reported as aborted, since
-				// the caller did cancel through the combined signal or the adapter
-				// settled early).
-				failure = idleController.signal.aborted
-					? {
-							reason: "error",
-							message: timeoutMessage,
-						}
-					: { reason: "aborted" };
+				failure = { reason: "aborted" };
 				break;
 			}
 			if (message.stopReason === "error") {
@@ -596,7 +437,7 @@ export async function llmClassify(
 				break;
 			}
 			selection = parseToolAnswer(question, message);
-			// undefined on the first attempt → one retry; on the second → malformed error.
+			// undefined on the first attempt → one repair; on the second → malformed error.
 		}
 
 		if (failure) {
@@ -617,13 +458,16 @@ export async function llmClassify(
 				usage: sumUsage(usages),
 			};
 		}
+		const answer = compatAnswer(question, selection);
 		Object.defineProperty(answers, id, {
-			value: compatAnswer(question, selection),
+			value: answer,
 			enumerable: true,
 			writable: true,
 			configurable: true,
 		});
-		options?.onAnswer?.(id, structuredClone(answers[id]));
+		// A validated completed question answer is generation progress.
+		options?.progress?.();
+		options?.onAnswer?.(id, structuredClone(answer));
 	}
 
 	return {

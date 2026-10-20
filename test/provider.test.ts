@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import type { JudgmentConfig } from "../src/config.ts";
 import {
 	createEmulatedClassifierProvider,
@@ -47,7 +48,7 @@ function config(overrides: Partial<JudgmentConfig> = {}): JudgmentConfig {
 		provider: "fake",
 		modelId: "fake-model",
 		thinkingLevel: "off",
-		timeoutMs: 5000,
+		timeouts: { llm: { idleTimeoutMs: 5000 } },
 		...overrides,
 	};
 }
@@ -121,7 +122,9 @@ class FakeRegistry {
 			stopReason: "stop",
 			timestamp: Date.now(),
 		};
-		return { result: async () => message };
+		const stream = createAssistantMessageEventStream();
+		stream.end(message);
+		return stream;
 	}
 }
 
@@ -220,6 +223,8 @@ test("classify delegates to the LLM backend with provenance and no leaked chat m
 			},
 		},
 	};
+	// Standard Pi whole-invocation deadline for the direct entry: forwarded
+	// to the plugin's own attempt clock, never to the provider SDK.
 	const result: ClassifierResult = await provider.classify(model, context, {
 		signal: undefined,
 		timeoutMs: 1234,
@@ -288,11 +293,15 @@ test("provider snapshots refresh metadata and retained-descriptor dispatch witho
 			return current;
 		},
 	});
-	const old = provider.getAllModels!()[0] as NonNullable<
+	const old = provider.getAllModels?.()[0] as NonNullable<
 		ReturnType<typeof emulatedClassifierModel>
 	>;
-	current = config({ model: "fake/next", modelId: "next", timeoutMs: 1500 });
-	const model = provider.getAllModels!()[0] as typeof old;
+	current = config({
+		model: "fake/next",
+		modelId: "next",
+		timeouts: { llm: { idleTimeoutMs: 1500 } },
+	});
+	const model = provider.getAllModels?.()[0] as typeof old;
 	assert.equal(model.id, "fake/next");
 	assert.equal(model.contextWindow, 24000);
 	const context: ClassifierContext = {
@@ -306,7 +315,8 @@ test("provider snapshots refresh metadata and retained-descriptor dispatch witho
 		},
 	};
 	const before = reads;
-	const result = await provider.classify!(old, context);
+	const result = await provider.classify?.(old, context);
+	assert.ok(result);
 	assert.equal(reads, before + 1);
 	assert.equal(result.model, "fake/next");
 	assert.equal(result.stopReason, "stop");
@@ -315,14 +325,15 @@ test("provider snapshots refresh metadata and retained-descriptor dispatch witho
 	// not forwarded as a provider whole-request timeout.
 	assert.equal(timeout, undefined);
 	registry.authReady = false;
-	assert.equal(await provider.auth.apiKey!.check!({} as never), undefined);
+	assert.equal(await provider.auth.apiKey?.check?.({} as never), undefined);
 	current = config({
 		model: undefined,
 		provider: undefined,
 		modelId: undefined,
 	});
-	assert.deepEqual(provider.getAllModels!(), []);
-	const removed = await provider.classify!(old, context);
+	assert.deepEqual(provider.getAllModels?.(), []);
+	const removed = await provider.classify?.(old, context);
+	assert.ok(removed);
 	assert.equal(removed.stopReason, "error");
 	assert.equal(
 		registry.recorded().length,
@@ -330,15 +341,16 @@ test("provider snapshots refresh metadata and retained-descriptor dispatch witho
 		"removed target never dispatches old descriptor",
 	);
 	current = config();
-	assert.equal(
-		(provider.getAllModels!()[0] as typeof old).id,
-		"fake/fake-model",
-	);
+	const restored = provider.getAllModels?.()[0] as typeof old | undefined;
+	assert.equal(restored?.id, "fake/fake-model");
 });
 
 test("in-flight provider repair keeps model, thinking and timeout across an edit", async () => {
 	const registry = new FakeRegistry();
-	let current = config({ thinkingLevel: "high", timeoutMs: 10000 });
+	let current = config({
+		thinkingLevel: "high",
+		timeouts: { llm: { idleTimeoutMs: 10000 } },
+	});
 	registry.getModel = ((_provider: string, id: string) => ({
 		...chatModel(),
 		id,
@@ -360,24 +372,25 @@ test("in-flight provider repair keeps model, thinking and timeout across an edit
 			reasoning: options?.reasoning,
 			timeout: options?.timeoutMs,
 		});
-		const message = stream(model, context, options);
-		if (seen.length !== 1) return message;
-		return {
-			result: async () => {
-				entered();
-				await barrier;
-				return { ...(await message.result()), content: [] };
-			},
-		};
+		const inner = stream(model, context, options);
+		if (seen.length !== 1) return inner;
+		const delayed = createAssistantMessageEventStream();
+		void (async () => {
+			entered();
+			await barrier;
+			const message = await inner.result();
+			delayed.end({ ...message, content: [] });
+		})();
+		return delayed;
 	};
 	const provider: EmulatedProvider = createEmulatedClassifierProvider({
 		registry,
 		config: () => current,
 	});
-	const old = provider.getAllModels!()[0] as NonNullable<
+	const old = provider.getAllModels?.()[0] as NonNullable<
 		ReturnType<typeof emulatedClassifierModel>
 	>;
-	const pending = provider.classify!(old, {
+	const pending = provider.classify?.(old, {
 		state: {},
 		questions: {
 			q: {
@@ -392,10 +405,11 @@ test("in-flight provider repair keeps model, thinking and timeout across an edit
 		model: "fake/next",
 		modelId: "next",
 		thinkingLevel: "low",
-		timeoutMs: 1,
+		timeouts: { llm: { idleTimeoutMs: 1, modelTimeoutMs: 1 } },
 	});
 	release();
 	const result = await pending;
+	assert.ok(result);
 	assert.equal(result.model, "fake/fake-model");
 	assert.equal(result.stopReason, "stop");
 	assert.equal(seen.length, 2, "malformed output repaired once");

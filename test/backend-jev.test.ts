@@ -6,15 +6,15 @@ import type {
 	ClassifierResult,
 } from "@earendil-works/pi-ai";
 import {
-	classifyWithJev,
 	classifyWithModel,
-	classifyWithNative,
 	findJevModel,
 	isJevClassifierModel,
 	JEV_PROVIDER_PRIORITY,
 	type JevRegistry,
+	resolveNativeClassifier,
 	selectJevModel,
 } from "../src/backend-jev.ts";
+import { newAttemptClocks } from "../src/service.ts";
 
 type AnyClassifierModel = ClassifierModel<ClassifierApi>;
 
@@ -51,21 +51,9 @@ class FakeJevRegistry implements JevRegistry {
 	error: Error | undefined;
 	delayMs = 0;
 	signalSeen: AbortSignal[] = [];
-	/** When set, discovery never settles and ignores its abort signal. */
-	discoveryHangs = false;
-	/** Optional discovery latency in ms (settles normally after the delay). */
-	discoveryDelayMs = 0;
 
-	getAvailableOfType(): Promise<readonly AnyClassifierModel[]> {
-		if (this.discoveryHangs) {
-			return new Promise(() => {});
-		}
-		if (this.discoveryDelayMs > 0) {
-			return new Promise((resolve) => {
-				setTimeout(() => resolve([...this.available]), this.discoveryDelayMs);
-			});
-		}
-		return Promise.resolve([...this.available]);
+	async getAvailableOfType(): Promise<readonly AnyClassifierModel[]> {
+		return [...this.available];
 	}
 
 	classify(
@@ -99,6 +87,15 @@ class FakeJevRegistry implements JevRegistry {
 	}
 }
 
+/** Clocks shorthand: caller signal plus the given idle/hard durations. */
+function clocks(
+	signal?: AbortSignal,
+	idleTimeoutMs = 10_000,
+	modelTimeoutMs?: number,
+) {
+	return newAttemptClocks({ idleTimeoutMs, modelTimeoutMs }, signal);
+}
+
 test("jev identity filter keeps jev variants, rejects other classifiers", () => {
 	assert.equal(
 		isJevClassifierModel(classifier("typesafe", "jev-latest")),
@@ -120,7 +117,6 @@ test("jev identity filter keeps jev variants, rejects other classifiers", () => 
 		isJevClassifierModel(classifier("vercel-ai-gateway", "typesafe-ai/jev")),
 		true,
 	);
-	// Non-jev classifiers hosted on the same supported providers.
 	assert.equal(
 		isJevClassifierModel(classifier("openrouter", "jaredpalmer/kev-4b")),
 		false,
@@ -150,7 +146,6 @@ test("jev identity filter keeps jev variants, rejects other classifiers", () => 
 		isJevClassifierModel(classifier("llm-as-jev", "typesafe/jev")),
 		false,
 	);
-	// Prefix must be segment-anchored: kev-jev-like ids do not qualify.
 	assert.equal(isJevClassifierModel(classifier("typesafe", "notjev-1")), false);
 });
 
@@ -198,195 +193,52 @@ test("findJevModel returns undefined when nothing jev is available", async () =>
 	assert.equal(await findJevModel(registry), undefined);
 });
 
-test("classifyWithJev delegates to the selected model and registry result", async () => {
+test("resolveNativeClassifier pins an explicit non-Jev selection exactly", async () => {
 	const registry = new FakeJevRegistry();
-	const typesafe = classifier("typesafe", "jev-latest");
-	const opencode = classifier("opencode", "jev-1.13");
+	const kev = classifier("openrouter", "jaredpalmer/kev-4b");
+	registry.available = [kev, classifier("typesafe", "jev-latest")];
+	const resolved = await resolveNativeClassifier(registry, {
+		classifierModel: "openrouter/jaredpalmer/kev-4b",
+	});
+	assert.ok("model" in resolved);
+	if ("model" in resolved)
+		assert.equal(resolved.model.id, "jaredpalmer/kev-4b");
+});
+
+test("resolveNativeClassifier missing explicit model never substitutes", async () => {
+	const registry = new FakeJevRegistry();
+	registry.available = [classifier("typesafe", "jev-latest")];
+	const resolved = await resolveNativeClassifier(registry, {
+		classifierModel: "ghost/net-clf",
+	});
+	assert.ok("error" in resolved);
+	if ("error" in resolved) assert.match(resolved.error, /ghost\/net-clf/);
+});
+
+test("resolveNativeClassifier excludes own emulation even when listed", async () => {
+	const registry = new FakeJevRegistry();
 	registry.available = [
-		classifier("openrouter", "jaredpalmer/kev-4b"),
-		opencode,
-		typesafe,
+		classifier("llm-as-jev", "fake/fake-model"),
+		classifier("typesafe", "jev-latest"),
 	];
-	registry.result = {
-		api: typesafe.api,
-		provider: typesafe.provider,
-		model: typesafe.id,
-		answers: { q: { type: "bool", probability: 0.8 } },
-		stopReason: "stop",
-		timestamp: Date.now(),
-	};
-	const result = await classifyWithJev(registry, {
-		state: {},
-		questions: {},
+	const resolved = await resolveNativeClassifier(registry, {
+		classifierModel: "llm-as-jev/fake/fake-model",
 	});
-	assert.equal(result.stopReason, "stop");
-	assert.equal(registry.classifyCalls.length, 1);
-	assert.equal(registry.classifyCalls[0]?.model.provider, "typesafe");
+	assert.ok("error" in resolved);
 });
-
-test("none-available error is structured, not thrown", async () => {
-	const registry = new FakeJevRegistry();
-	const result = await classifyWithJev(registry, { state: {}, questions: {} });
-	assert.equal(result.stopReason, "error");
-	assert.match(
-		result.errorMessage ?? "",
-		/No Jev classifier model is available/,
-	);
-	assert.equal(registry.classifyCalls.length, 0);
-});
-
-test("pre-aborted caller yields aborted without discovery or classify", async () => {
-	const registry = new FakeJevRegistry();
-	const controller = new AbortController();
-	controller.abort();
-	const result = await classifyWithJev(
-		registry,
-		{ state: {}, questions: {} },
-		{
-			signal: controller.signal,
-		},
-	);
-	assert.equal(result.stopReason, "aborted");
-	assert.equal(registry.classifyCalls.length, 0);
-});
-
-test("abort during classification surfaces the registry's aborted result", async () => {
-	const registry = new FakeJevRegistry();
-	registry.available = [classifier("typesafe", "jev-latest")];
-	registry.delayMs = 60;
-	const controller = new AbortController();
-	const pending = classifyWithJev(
-		registry,
-		{ state: {}, questions: {} },
-		{ signal: controller.signal },
-	);
-	await new Promise((resolve) => setTimeout(resolve, 5));
-	controller.abort();
-	const result = await pending;
-	assert.equal(result.stopReason, "aborted");
-	assert.equal(registry.classifyCalls.length, 1);
-});
-
-test("timeout returns a structured timeout error without waiting forever", async () => {
-	const registry = new FakeJevRegistry();
-	registry.available = [classifier("typesafe", "jev-latest")];
-	registry.delayMs = 5_000;
-	const result = await classifyWithJev(
-		registry,
-		{ state: {}, questions: {} },
-		{ timeoutMs: 40 },
-	);
-	assert.equal(result.stopReason, "error");
-	assert.match(result.errorMessage ?? "", /timed out after 40ms/);
-});
-
-test("classify rejection is a structured error, never thrown", async () => {
-	const registry = new FakeJevRegistry();
-	registry.available = [classifier("typesafe", "jev-latest")];
-	registry.error = new Error("401 unauthorized");
-	const result = await classifyWithJev(registry, { state: {}, questions: {} });
-	assert.equal(result.stopReason, "error");
-});
-
-test("hung discovery settles as a timeout error even when the registry ignores the signal", async () => {
-	const registry = new FakeJevRegistry();
-	registry.available = [classifier("typesafe", "jev-latest")];
-	registry.discoveryHangs = true;
-	const result = await withTimeout(
-		classifyWithJev(registry, { state: {}, questions: {} }, { timeoutMs: 15 }),
-		200,
-		"classifyWithJev did not settle within 200ms",
-	);
-	assert.equal(result.stopReason, "error");
-	assert.match(result.errorMessage ?? "", /timed out after 15ms/);
-	assert.equal(registry.classifyCalls.length, 0);
-});
-
-test("caller abort during hung discovery yields aborted, not error", async () => {
-	const registry = new FakeJevRegistry();
-	registry.available = [classifier("typesafe", "jev-latest")];
-	registry.discoveryHangs = true;
-	const controller = new AbortController();
-	const pending = classifyWithJev(
-		registry,
-		{ state: {}, questions: {} },
-		{ signal: controller.signal },
-	);
-	await sleep(20);
-	controller.abort();
-	const result = await withTimeout(
-		pending,
-		200,
-		"classifyWithJev did not settle after caller abort",
-	);
-	assert.equal(result.stopReason, "aborted");
-	assert.equal(registry.classifyCalls.length, 0);
-});
-
-test("expired deadline after discovery returns timeout error without dispatching classify", async () => {
-	const registry = new FakeJevRegistry();
-	const model = classifier("typesafe", "jev-latest");
-	registry.available = [model];
-	registry.delayMs = 5_000;
-	// Consume the whole budget inside discovery: classify must never dispatch.
-	registry.discoveryDelayMs = 25;
-	const result = await classifyWithJev(
-		registry,
-		{ state: {}, questions: {} },
-		{ timeoutMs: 10 },
-	);
-	assert.equal(result.stopReason, "error");
-	assert.match(result.errorMessage ?? "", /timed out after 10ms/);
-	assert.equal(registry.classifyCalls.length, 0);
-});
-
-test("no-dispatch guarantee holds even for a slow classify result arriving late", async () => {
-	const registry = new FakeJevRegistry();
-	registry.available = [classifier("typesafe", "jev-latest")];
-	registry.delayMs = 5_000;
-	const result = await classifyWithJev(
-		registry,
-		{ state: {}, questions: {} },
-		{ timeoutMs: 30 },
-	);
-	assert.equal(result.stopReason, "error");
-	assert.match(result.errorMessage ?? "", /timed out after 30ms/);
-});
-
-function sleep(ms: number): Promise<void> {
-	return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-async function withTimeout<T>(
-	promise: Promise<T>,
-	ms: number,
-	message: string,
-): Promise<T> {
-	let timer: ReturnType<typeof setTimeout> | undefined;
-	const guard = new Promise<never>((_, reject) => {
-		timer = setTimeout(() => reject(new Error(message)), ms);
-	});
-	try {
-		return await Promise.race([promise, guard]);
-	} finally {
-		if (timer !== undefined) clearTimeout(timer);
-	}
-}
-
-// ---------------------------------------------------------------------------
-// classifyWithModel pinned dispatch + explicit-classifier selection (task 5.1)
-// ---------------------------------------------------------------------------
 
 test("classifyWithModel dispatches the pinned model without rediscovery", async () => {
 	const registry = new FakeJevRegistry();
 	const pinned = classifier("openrouter", "jaredpalmer/kev-4b");
 	registry.available = [classifier("typesafe", "jev-latest")];
+	const c = clocks();
 	const result = await classifyWithModel(
 		registry,
 		pinned,
 		{ state: {}, questions: {} },
-		{ timeoutMs: 5000 },
+		{ signal: c.signal },
 	);
+	c.dispose();
 	assert.equal(result.stopReason, "stop");
 	assert.equal(registry.classifyCalls.length, 1);
 	assert.equal(registry.classifyCalls[0]?.model.provider, "openrouter");
@@ -398,99 +250,66 @@ test("classifyWithModel honors caller abort before dispatch", async () => {
 	const pinned = classifier("typesafe", "jev-latest");
 	const controller = new AbortController();
 	controller.abort();
+	const c = clocks(controller.signal);
 	const result = await classifyWithModel(
 		registry,
 		pinned,
 		{ state: {}, questions: {} },
-		{ signal: controller.signal },
+		{ signal: c.signal },
 	);
+	c.dispose();
 	assert.equal(result.stopReason, "aborted");
 	assert.equal(registry.classifyCalls.length, 0);
 });
 
-test("classifyWithModel never dispatches after the deadline", async () => {
+test("classifyWithModel abort settles when the registry stops on the signal", async () => {
 	const registry = new FakeJevRegistry();
 	const pinned = classifier("typesafe", "jev-latest");
 	registry.delayMs = 5_000;
+	const controller = new AbortController();
+	const c = clocks(controller.signal);
+	const pending = classifyWithModel(
+		registry,
+		pinned,
+		{ state: {}, questions: {} },
+		{ signal: c.signal },
+	);
+	await new Promise((resolve) => setTimeout(resolve, 10));
+	controller.abort();
+	const result = await pending;
+	c.dispose();
+	assert.equal(result.stopReason, "aborted");
+});
+
+test("classifyWithModel settles when the attempt clock fires on a hung registry", async () => {
+	const registry = new FakeJevRegistry();
+	const pinned = classifier("typesafe", "jev-latest");
+	// Registry classify hangs forever but never observes its signal.
+	registry.classify = () => new Promise<ClassifierResult>(() => {});
+	const c = clocks(undefined, 30);
 	const result = await classifyWithModel(
 		registry,
 		pinned,
 		{ state: {}, questions: {} },
-		{ timeoutMs: 30 },
+		{ signal: c.signal },
 	);
+	c.dispose();
+	// Signal race settles the call as aborted; the service maps it to the
+	// clock that actually fired (idle vs hard vs caller).
+	assert.equal(result.stopReason, "aborted");
+});
+
+test("classify rejection is a structured error, never thrown", async () => {
+	const registry = new FakeJevRegistry();
+	const pinned = classifier("typesafe", "jev-latest");
+	registry.error = new Error("401 unauthorized");
+	const c = clocks();
+	const result = await classifyWithModel(
+		registry,
+		pinned,
+		{ state: {}, questions: {} },
+		{ signal: c.signal },
+	);
+	c.dispose();
 	assert.equal(result.stopReason, "error");
-	assert.match(result.errorMessage ?? "", /timed out after 30ms/);
-});
-
-test("classifyWithNative explicit non-Jev selection pins that exact model", async () => {
-	const registry = new FakeJevRegistry();
-	const kev = classifier("openrouter", "jaredpalmer/kev-4b");
-	registry.available = [kev, classifier("typesafe", "jev-latest")];
-	const result = await classifyWithNative(
-		registry,
-		{ classifierModel: "openrouter/jaredpalmer/kev-4b" },
-		{ state: {}, questions: {} },
-		{ timeoutMs: 5000 },
-	);
-	assert.equal(result.stopReason, "stop");
-	assert.equal(registry.classifyCalls.length, 1);
-	assert.equal(registry.classifyCalls[0]?.model.id, "jaredpalmer/kev-4b");
-});
-
-test("classifyWithNative missing explicit model does not substitute another native model", async () => {
-	const registry = new FakeJevRegistry();
-	registry.available = [classifier("typesafe", "jev-latest")];
-	const result = await classifyWithNative(
-		registry,
-		{ classifierModel: "ghost/net-clf" },
-		{ state: {}, questions: {} },
-		{ timeoutMs: 5000 },
-	);
-	assert.equal(result.stopReason, "error");
-	assert.match(result.errorMessage ?? "", /ghost\/net-clf/);
-	assert.equal(registry.classifyCalls.length, 0);
-});
-
-test("classifyWithNative own emulation reference is rejected, never dispatched", async () => {
-	const registry = new FakeJevRegistry();
-	registry.available = [
-		classifier("llm-as-jev", "fake/fake-model"),
-		classifier("typesafe", "jev-latest"),
-	];
-	const result = await classifyWithNative(
-		registry,
-		{ classifierModel: "llm-as-jev/fake/fake-model" },
-		{ state: {}, questions: {} },
-		{ timeoutMs: 5000 },
-	);
-	assert.equal(result.stopReason, "error");
-	assert.equal(registry.classifyCalls.length, 0);
-});
-
-test("classifyWithNative default still prefers Jev by provider priority", async () => {
-	const registry = new FakeJevRegistry();
-	registry.available = [
-		classifier("opencode", "jev-1.13"),
-		classifier("typesafe", "jev-latest"),
-	];
-	const result = await classifyWithNative(
-		registry,
-		{},
-		{ state: {}, questions: {} },
-		{ timeoutMs: 5000 },
-	);
-	assert.equal(result.stopReason, "stop");
-	assert.equal(registry.classifyCalls[0]?.model.provider, "typesafe");
-});
-
-test("classifyWithJev keeps working as the standalone Jev entry point", async () => {
-	const registry = new FakeJevRegistry();
-	registry.available = [classifier("typesafe", "jev-latest")];
-	const result = await classifyWithJev(registry, {
-		state: {},
-		questions: {},
-	});
-	assert.equal(result.stopReason, "stop");
-	assert.equal(registry.classifyCalls.length, 1);
-	assert.equal(registry.classifyCalls[0]?.model.provider, "typesafe");
 });

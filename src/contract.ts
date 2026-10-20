@@ -1,5 +1,5 @@
 /**
- * Public judgment-service contract (design D1/D2).
+ * Public judgment-service contract (design D1/D2, version two).
  *
  * The canonical, self-contained, copy-able client lives at
  * `client/judgment-client.ts` and owns every type definition. This module is
@@ -8,6 +8,7 @@
  */
 
 export type {
+	CapacityDisclosure,
 	ClassifierAnswer,
 	ClassifierBoolAnswer,
 	ClassifierBoolQuestion,
@@ -16,24 +17,12 @@ export type {
 	ClassifierQuestion,
 	ClassifierScoreAnswer,
 	ClassifierScoreQuestion,
-	EvidenceRecord,
 	JsonObject,
 	JsonValue,
 	JudgeOptions,
 	JudgeRequest,
 	JudgeResult,
 	JudgmentService,
-	ReviewAttemptObservation,
-	ReviewDiagnostics,
-	ReviewEvidenceFrame,
-	ReviewOptions,
-	ReviewProgress,
-	ReviewResult,
-	ReviewService,
-	ReviewStageProgress,
-	ReviewStageProjection,
-	ReviewUsageField,
-	ReviewUsageTotals,
 	ThresholdRule,
 	Usage,
 } from "../client/judgment-client.ts";

@@ -1,5 +1,5 @@
 /**
- * Native classifier backend (design D3).
+ * Native classifier backend (design D3, version two waiting contract).
  *
  * Selection honors an explicit `classifierModel` (`provider/modelid`)
  * exactly — including compatible non-Jev models — and otherwise falls back
@@ -11,8 +11,10 @@
  * Handoff to core: after `resolveNativeClassifier` picks a model, dispatch
  * MUST go through `classifyWithModel` with that already-selected model so a
  * changed catalog can never substitute a different model mid-request.
- * `classifyWithJev` retains standalone Jev discovery+dispatch for existing
- * callers; `classifyWithNative` composes selection + pinned dispatch.
+ *
+ * Waiting: the caller's combined attempt signal bounds the whole native
+ * classification; a non-streaming adapter simply idles out when it produces
+ * no progress within the idle window.
  */
 
 import type {
@@ -20,7 +22,6 @@ import type {
 	ClassifierContext,
 	ClassifierResult,
 } from "@earendil-works/pi-ai";
-import { observeNativeFetch } from "./native-observations.js";
 import { EMULATED_PROVIDER_ID } from "./provider.js";
 
 /** Any classifier model regardless of api. */
@@ -59,13 +60,10 @@ export interface JevRegistry {
 export type NativeRegistry = JevRegistry;
 
 export interface JevClassifyOptions {
+	/** Combined attempt signal owned by the caller's clocks. */
 	signal?: AbortSignal;
-	/** Deadline shared across discovery and classification, not reset per leaf. */
-	timeoutMs?: number;
-	/** Plugin-owned review metadata. These fields are never sent to Pi. */
-	observe?: true;
-	/** Synchronous diagnostic callback; failures stay isolated. */
-	onAttempt?: (event: never) => void;
+	/** Genuine-generation callback; native adapters rarely stream, so this is advisory. */
+	progress?: () => void;
 	/** Public HTTP transport seam; defaults to global fetch. */
 	fetch?: typeof globalThis.fetch;
 }
@@ -83,7 +81,7 @@ export function isJevClassifierModel(model: AnyClassifierModel): boolean {
 
 /**
  * Pick one Jev classifier by provider priority, then `provider/id`
- * localeCompare as a deterministic tiebreak. Returns undefined when no
+ * codepoint order as a deterministic tiebreak. Returns undefined when no
  * candidate is a Jev identity.
  */
 export function selectJevModel(
@@ -212,131 +210,38 @@ function resultShell(): ClassifierResult {
 }
 
 /**
- * One combined caller/deadline signal applied across discovery and
- * classification (D3: the deadline is not reset for each leaf). The abort
- * reason records whether the caller or the deadline fired, so expiry and
- * caller abort stay distinguishable.
+ * Race a registry promise against the caller's combined attempt signal so
+ * the caller settles even when the registry never observes it. The guarded
+ * promise is left un-awaited; a late registry resolution is dropped.
  */
-function deadlineSignal(
-	options: JevClassifyOptions | undefined,
-	deadline: number | null,
-): {
-	signal: AbortSignal | undefined;
-	expired: () => boolean;
-	cleanup: () => void;
-} {
-	if (!options?.signal && deadline === null) {
-		return { signal: undefined, expired: () => false, cleanup: () => {} };
-	}
-	const controller = new AbortController();
-	let callerAborted = false;
-	let timedOut = false;
-	const caller = options?.signal;
-	const onCallerAbort = () => {
-		callerAborted = true;
-		controller.abort();
-	};
-	if (caller) {
-		if (caller.aborted) {
-			onCallerAbort();
-		} else {
-			caller.addEventListener("abort", onCallerAbort, { once: true });
-		}
-	}
-	let timer: ReturnType<typeof setTimeout> | undefined;
-	if (deadline !== null) {
-		timer = setTimeout(
-			() => {
-				timedOut = true;
-				controller.abort();
-			},
-			Math.max(0, deadline - Date.now()),
-		);
-	}
-	return {
-		signal: controller.signal,
-		expired: () =>
-			callerAborted
-				? false
-				: timedOut || (deadline !== null && Date.now() >= deadline),
-		cleanup: () => {
-			if (timer !== undefined) clearTimeout(timer);
-			if (caller) {
-				caller.removeEventListener("abort", onCallerAbort);
-			}
-		},
-	};
-}
-
-/**
- * Race a registry promise against caller abort and deadline expiry so the
- * caller settles even when the registry never observes its signal. The
- * guarded promise is left un-awaited; a late registry resolution is dropped.
- */
-async function guardRace<T>(
+async function guarded<T>(
 	promise: Promise<T>,
-	deadline: number | null,
 	signal: AbortSignal | undefined,
-	expired: () => boolean,
-): Promise<{ value: T } | { timeout: true } | { aborted: true }> {
-	if (deadline === null && !signal) return { value: await promise };
-	let timer: ReturnType<typeof setTimeout> | undefined;
+): Promise<T | undefined> {
+	void promise.catch(() => {});
+	if (!signal) return await promise;
+	if (signal.aborted) return undefined;
 	let onAbort: (() => void) | undefined;
-	const settleAbort = (
-		resolve: (r: { timeout: true } | { aborted: true }) => void,
-	) => {
-		// Deadline-driven abort is a timeout, not a caller abort.
-		resolve(expired() ? { timeout: true } : { aborted: true });
-	};
 	try {
-		return (await Promise.race([
+		const raced = (await Promise.race([
 			promise.then((value) => ({ value }) as const),
-			new Promise<{ timeout: true } | { aborted: true }>((resolve) => {
-				if (deadline !== null) {
-					timer = setTimeout(
-						() => resolve({ timeout: true }),
-						Math.max(0, deadline - Date.now()),
-					);
-				}
-				if (signal) {
-					if (signal.aborted) settleAbort(resolve);
-					else {
-						onAbort = () => settleAbort(resolve);
-						signal.addEventListener("abort", onAbort, { once: true });
-					}
-				}
+			new Promise<{ dropped: true }>((resolve) => {
+				onAbort = () => resolve({ dropped: true });
+				signal.addEventListener("abort", onAbort, { once: true });
 			}),
-		])) as { value: T } | { timeout: true } | { aborted: true };
+		])) as { value: T } | { dropped: true };
+		return "value" in raced ? raced.value : undefined;
 	} finally {
-		if (timer !== undefined) clearTimeout(timer);
-		if (onAbort !== undefined && signal) {
-			signal.removeEventListener("abort", onAbort);
-		}
+		if (onAbort !== undefined) signal.removeEventListener("abort", onAbort);
 	}
 }
-
-/**
- * @deprecated Prefer `resolveNativeClassifier` + `classifyWithModel`. Kept
- * for existing callers/tests: equivalent to `classifyWithNative` with no
- * explicit selection (Jev discovery only).
- */
-export async function classifyWithJev(
-	registry: JevRegistry,
-	context: ClassifierContext,
-	options?: JevClassifyOptions,
-): Promise<ClassifierResult> {
-	return classifyWithNative(registry, {}, context, options);
-}
-
-/** Options for the pinned-model dispatch handoff (`classifyWithModel`). */
-export interface NativeClassifyOptions extends JevClassifyOptions {}
 
 /**
  * Pinned dispatch (handoff to core): classify with an ALREADY-SELECTED
  * model. Dispatch never rediscovers, so a changed catalog can never
- * substitute a different model mid-request. Selection stays in
- * `resolveNativeClassifier`; combined discovery+dispatch for legacy callers
- * stays in `classifyWithJev`/`classifyWithNative`.
+ * substitute a different model mid-request. The caller's combined attempt
+ * signal (idle + optional hard + caller abort) bounds the whole call; this
+ * module starts no second competing clock.
  */
 export async function classifyWithModel(
 	registry: JevRegistry,
@@ -347,178 +252,16 @@ export async function classifyWithModel(
 	if (options?.signal?.aborted) {
 		return { ...resultShell(), stopReason: "aborted" };
 	}
-	const deadline =
-		options?.timeoutMs !== undefined ? Date.now() + options.timeoutMs : null;
-	const { signal, expired, cleanup } = deadlineSignal(options, deadline);
-	try {
-		return await classifySelected(
-			registry,
-			model,
-			context,
-			options,
-			deadline,
-			signal,
-			expired,
-		);
-	} finally {
-		cleanup();
-	}
-}
-
-/**
- * Selection + pinned dispatch composed for existing callers. Explicit
- * `classifierModel` pins the candidate; otherwise Jev discovery applies.
- */
-export async function classifyWithNative(
-	registry: JevRegistry,
-	selection: NativeSelection,
-	context: ClassifierContext,
-	options?: JevClassifyOptions,
-): Promise<ClassifierResult> {
-	if (options?.signal?.aborted) {
-		return { ...resultShell(), stopReason: "aborted" };
-	}
-	const deadline =
-		options?.timeoutMs !== undefined ? Date.now() + options.timeoutMs : null;
-	const { signal, expired, cleanup } = deadlineSignal(options, deadline);
-	try {
-		return await classifyWithNativeGuarded(
-			registry,
-			selection,
-			context,
-			options,
-			deadline,
-			signal,
-			expired,
-		);
-	} finally {
-		cleanup();
-	}
-}
-
-async function classifyWithNativeGuarded(
-	registry: JevRegistry,
-	selection: NativeSelection,
-	context: ClassifierContext,
-	options: JevClassifyOptions | undefined,
-	deadline: number | null,
-	signal: AbortSignal | undefined,
-	expired: () => boolean,
-): Promise<ClassifierResult> {
-	const timeoutError = (): ClassifierResult => ({
-		...resultShell(),
-		errorMessage: `Native classifier timed out after ${options?.timeoutMs}ms`,
-	});
-
-	// Discovery: settle even when the registry ignores the abort signal.
-	let model: AnyClassifierModel | undefined;
-	try {
-		const raced = await guardRace(
-			resolveNativeClassifier(registry, selection, { signal }),
-			deadline,
-			signal,
-			expired,
-		);
-		if ("timeout" in raced) return timeoutError();
-		if ("aborted" in raced) return { ...resultShell(), stopReason: "aborted" };
-		if ("error" in raced.value) {
-			return { ...resultShell(), errorMessage: raced.value.error };
-		}
-		model = raced.value.model;
-	} catch (error) {
-		if (options?.signal?.aborted) {
-			return { ...resultShell(), stopReason: "aborted" };
-		}
-		if (expired()) return timeoutError();
-		return {
-			...resultShell(),
-			errorMessage: `Native classifier discovery failed: ${
-				error instanceof Error ? error.message : String(error)
-			}`,
-		};
-	}
-	if (options?.signal?.aborted) {
-		return { ...resultShell(), stopReason: "aborted" };
-	}
-	if (!model) {
-		return {
-			...resultShell(),
-			errorMessage:
-				"No Jev classifier model is available from any configured provider",
-		};
-	}
-	return classifySelected(
-		registry,
-		model,
-		context,
-		options,
-		deadline,
-		signal,
-		expired,
-	);
-}
-
-/**
- * Dispatch one frozen model through `registry.classify`. The `signal`
- * argument is the combined caller/deadline signal from the caller's
- * `deadlineSignal()` when dispatched via `classifyWithNative`/`classifyWithModel`;
- * standalone direct calls may pass the caller signal itself.
- * Caller abort beats deadline: a registry "aborted" caused by our own
- * deadline is a timeout, never a caller abort.
- */
-async function classifySelected(
-	registry: JevRegistry,
-	model: AnyClassifierModel,
-	context: ClassifierContext,
-	options: JevClassifyOptions | undefined,
-	deadline: number | null,
-	signal: AbortSignal | undefined,
-	expired: () => boolean,
-): Promise<ClassifierResult> {
-	const timeoutError = (): ClassifierResult => ({
-		...resultShell(),
-		errorMessage: `Native classifier timed out after ${options?.timeoutMs}ms`,
-	});
-	// No dispatch after the deadline has expired (a non-positive remaining
-	// budget counts as expired: there is nothing left to spend).
-	const remaining =
-		deadline !== null ? deadline - Date.now() : Number.POSITIVE_INFINITY;
-	if (expired() || remaining <= 0) return timeoutError();
-	if (options?.observe) {
-		const observed = observeNativeFetch(model, context, { ...options, signal });
-		try {
-			return observed.finish(
-				await classifySelected(
-					registry,
-					model,
-					context,
-					{
-						...options,
-						observe: undefined,
-						onAttempt: undefined,
-						fetch: observed.fetch,
-					},
-					deadline,
-					signal,
-					expired,
-				),
-			);
-		} finally {
-			observed.close();
-		}
-	}
 	let classification: Promise<ClassifierResult>;
 	try {
 		classification = registry.classify(model, context, {
-			signal,
-			timeoutMs: Number.isFinite(remaining) ? remaining : undefined,
+			signal: options?.signal,
 			...(options?.fetch ? { fetch: options.fetch } : {}),
 		});
 	} catch (error) {
 		if (options?.signal?.aborted) {
 			return { ...resultShell(), stopReason: "aborted" };
 		}
-		if (expired()) return timeoutError();
 		// Registry classify never rejects in practice; keep the no-throw contract.
 		return {
 			...resultShell(),
@@ -530,17 +273,13 @@ async function classifySelected(
 		};
 	}
 
-	let winner: ClassifierResult;
+	let winner: ClassifierResult | undefined;
 	try {
-		const raced = await guardRace(classification, deadline, signal, expired);
-		if ("timeout" in raced) return timeoutError();
-		if ("aborted" in raced) return { ...resultShell(), stopReason: "aborted" };
-		winner = raced.value;
+		winner = await guarded(classification, options?.signal);
 	} catch (error) {
 		if (options?.signal?.aborted) {
 			return { ...resultShell(), stopReason: "aborted" };
 		}
-		if (expired()) return timeoutError();
 		return {
 			...resultShell(),
 			provider: model.provider,
@@ -550,10 +289,13 @@ async function classifySelected(
 			}`,
 		};
 	}
+	if (winner === undefined) {
+		// Settled through the signal race: the owning attempt reports the
+		// exact clock that fired (idle vs hard vs caller abort).
+		return { ...resultShell(), stopReason: "aborted" };
+	}
 	if (winner.stopReason === "aborted" && options?.signal?.aborted) {
 		return winner;
 	}
-	// A registry "aborted" caused by our own deadline (not the caller) is a timeout.
-	if (winner.stopReason === "aborted" && expired()) return timeoutError();
 	return winner;
 }

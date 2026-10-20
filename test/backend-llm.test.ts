@@ -2,10 +2,12 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import type {
 	AssistantMessage,
+	AssistantMessageEvent,
 	ClassifierQuestion,
 	ToolCall,
 	Usage,
 } from "@earendil-works/pi-ai";
+import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import {
 	ANSWER_TOOL_NAME,
 	buildAnswerTool,
@@ -85,7 +87,26 @@ function chatModel(reasoning = false) {
 
 type ChatModel = Parameters<typeof llmClassify>[1];
 
-/** Scripted streamSimple fake: records every call, returns queued messages. */
+/** Build a real event stream that plays `events`, then ends with `final`. */
+function streamOf(events: AssistantMessageEvent[], final: AssistantMessage) {
+	const stream = createAssistantMessageEventStream();
+	for (const event of events) stream.push(event);
+	stream.end(final);
+	return stream;
+}
+
+/** A stream that ends on signal abort, or never settles without one. */
+function hangingStream(signal: AbortSignal | undefined) {
+	const stream = createAssistantMessageEventStream();
+	const abort = () => stream.end(assistantMessage([], "aborted"));
+	if (signal) {
+		if (signal.aborted) abort();
+		else signal.addEventListener("abort", abort, { once: true });
+	}
+	return stream;
+}
+
+/** Scripted streamSimple fake: records every call, returns scripted streams. */
 class FakeLlmRegistry implements LlmRegistry {
 	calls: {
 		options: Record<string, unknown> | undefined;
@@ -93,23 +114,12 @@ class FakeLlmRegistry implements LlmRegistry {
 		userContent: string;
 	}[] = [];
 	private queue: AssistantMessage[] = [];
-	/** When set, result() never settles (uncooperative registry). */
+	/** Events to push before the terminal message for each scripted call. */
+	eventScripts: AssistantMessageEvent[][] = [];
+	/** When set, streams never produce a terminal message unless aborted. */
 	hang = false;
-	/** When set, result() resolves with an aborted message once the signal fires. */
-	abortOnSignal = false;
 	/** When set, streamSimple() throws synchronously (sync auth failure). */
 	throwSync = false;
-	/** When set, result() throws synchronously. */
-	throwResultSync = false;
-	/** When set, result() rejects asynchronously. */
-	rejectResult = false;
-	/** Scripted per-call behaviors: `useFetch` makes the adapter consume the
-	 *  request-scoped `options.fetch` body (real adapter behavior). */
-	scripts: {
-		delayMs?: number;
-		useFetch?: boolean;
-		events?: unknown[];
-	}[] = [];
 	/** Optional hook after a dispatch is recorded. */
 	onDispatch: (() => void) | undefined = undefined;
 
@@ -127,74 +137,14 @@ class FakeLlmRegistry implements LlmRegistry {
 			toolNames: context.tools.map((tool) => tool.name),
 			userContent: String((context.messages[0] as { content: string }).content),
 		});
-		const next = this.queue.shift() ?? assistantMessage([]);
-		const script = this.scripts.shift() ?? {};
-		const signal = options?.signal;
 		this.onDispatch?.();
 		if (this.throwSync) {
 			throw new Error("synthetic auth failure");
 		}
-		if (this.throwResultSync) {
-			return {
-				result: () => {
-					throw new Error("synthetic transport failure");
-				},
-			};
-		}
-		if (this.rejectResult) {
-			return {
-				result: () =>
-					Promise.reject(
-						new Error("synthetic transport failure"),
-					) as Promise<AssistantMessage>,
-			};
-		}
-		if (this.hang) {
-			return {
-				result: () =>
-					new Promise<AssistantMessage>(() => {}) as Promise<AssistantMessage>,
-			};
-		}
-		if (this.abortOnSignal) {
-			return {
-				result: () =>
-					new Promise<AssistantMessage>((resolve) => {
-						if (signal) {
-							if (signal.aborted) {
-								resolve(assistantMessage([], "aborted"));
-							} else {
-								signal.addEventListener(
-									"abort",
-									() => resolve(assistantMessage([], "aborted")),
-									{ once: true },
-								);
-							}
-						} else {
-							resolve(next);
-						}
-					}) as Promise<AssistantMessage>,
-			};
-		}
-		return {
-			result: async () => {
-				if (script.delayMs)
-					await new Promise((r) => setTimeout(r, script.delayMs));
-				if (script.useFetch) {
-					// Scripted transport: read the body through the request-scoped
-					// fetch option, like real adapters — byte gaps reach the
-					// plugin's inactivity observer.
-					const response = await options!.fetch!("https://fake.invalid/x", {
-						signal,
-					});
-					const reader = response.body?.getReader();
-					if (reader) while (!(await reader.read()).done) {}
-				}
-				for (const event of script.events ?? [])
-					await options?.onProviderStreamEvent?.(event, _model);
-				if (options?.signal?.aborted) return assistantMessage([], "aborted");
-				return next;
-			},
-		};
+		if (this.hang) return hangingStream(options?.signal);
+		const final = this.queue.shift() ?? assistantMessage([]);
+		const events = this.eventScripts.shift() ?? [];
+		return streamOf(events, final);
 	}
 }
 
@@ -241,13 +191,10 @@ test("answer tool schemas are discrete and carry no confidence inputs", () => {
 		bool.parameters,
 		score.parameters,
 	]);
-	// Tool schemas carry no probability/confidence/certainty inputs.
 	assert.equal(
 		/confidence|probability|percent|certainty|likelihood/i.test(schemaText),
 		false,
 	);
-	// The system prompt forbids self-report while leaving legal discrete
-	// score levels selectable.
 	const prompt = buildSystemPrompt();
 	assert.match(prompt, /Never report likelihoods, confidence or certainty/i);
 	assert.doesNotMatch(prompt, /[Nn]umeric scores/);
@@ -325,7 +272,6 @@ test("thinking levels: supported off sends no reasoning, unsupported clamps up",
 	const reasoning = chatModel(true);
 	assert.equal(reasoningForRequest(reasoning, "off"), undefined);
 	const capped = { ...reasoning, thinkingLevelMap: { xhigh: null } } as never;
-	// Spec scenario: xhigh requested, supported only up to high → sent with high.
 	assert.equal(effectiveThinkingLevel(capped, "xhigh"), "high");
 	const withMax = {
 		...reasoning,
@@ -443,67 +389,83 @@ test("caller abort yields stopReason aborted before any call", async () => {
 	assert.equal(registry.calls.length, 0);
 });
 
-test("already-expired inactivity value yields a structured timeout error", async () => {
-	const registry = new FakeLlmRegistry();
-	const result = await llmClassify(
-		registry,
-		chatModel(),
-		{
-			state: {},
-			questions: { q: CHOICE_QUESTION },
-		},
-		{ timeoutMs: 0 },
-	);
-	assert.equal(result.stopReason, "error");
-	assert.match(result.errorMessage ?? "", /timed out/);
-	assert.equal(registry.calls.length, 0);
-});
-
-test("hung streamSimple settles as a timeout error even when it ignores the signal", async () => {
+test("caller abort mid-flight settles aborted even when the stream ignores it", async () => {
 	const registry = new FakeLlmRegistry();
 	registry.hang = true;
+	const controller = new AbortController();
+	registry.onDispatch = () => setTimeout(() => controller.abort(), 10);
 	const result = await withTimeout(
 		llmClassify(
 			registry,
 			chatModel(),
 			{ state: {}, questions: { q: CHOICE_QUESTION } },
-			{ timeoutMs: 15 },
+			{ signal: controller.signal },
 		),
-		200,
-		"llmClassify did not settle within 200ms",
+		500,
+		"abort did not settle the call",
 	);
-	assert.equal(result.stopReason, "error");
-	assert.match(result.errorMessage ?? "", /timed out after 15ms/);
+	assert.equal(result.stopReason, "aborted");
 	assert.equal(registry.calls.length, 1);
 });
 
-test("deadline-driven abort message is a timeout error, not aborted", async () => {
+test("generation deltas renew progress; heartbeats and empty events do not", async () => {
 	const registry = new FakeLlmRegistry();
-	// Registry reports "aborted" only after the combined signal fires.
-	registry.abortOnSignal = true;
+	const progress: number[] = [];
+	registry.replay([assistantMessage([toolCall({ choice: "ship" })])]);
+	registry.eventScripts = [
+		[
+			{ type: "start", partial: assistantMessage([]) },
+			// Empty/heartbeat-shaped deltas never qualify.
+			{
+				type: "text_delta",
+				contentIndex: 0,
+				delta: "  ",
+				partial: assistantMessage([]),
+			},
+			{
+				type: "thinking_start",
+				contentIndex: 0,
+				partial: assistantMessage([]),
+			},
+			{
+				type: "thinking_delta",
+				contentIndex: 0,
+				delta: "reasoning",
+				partial: assistantMessage([]),
+			},
+			{
+				type: "toolcall_delta",
+				contentIndex: 1,
+				delta: '{"choice":',
+				partial: assistantMessage([]),
+			},
+			{
+				type: "toolcall_end",
+				contentIndex: 1,
+				toolCall: toolCall({ choice: "ship" }),
+				partial: assistantMessage([]),
+			},
+		],
+	];
 	const result = await llmClassify(
 		registry,
 		chatModel(),
 		{ state: {}, questions: { q: CHOICE_QUESTION } },
-		{ timeoutMs: 20 },
+		{ progress: () => progress.push(Date.now()) },
 	);
-	assert.equal(result.stopReason, "error");
-	assert.match(result.errorMessage ?? "", /timed out after 20ms/);
-	assert.equal(registry.calls.length, 1);
+	assert.equal(result.stopReason, "stop");
+	// thinking_delta + toolcall_delta + validated answer progress.
+	assert.equal(progress.length, 3);
 });
 
-test("timeout failure does not trigger the malformed-output retry", async () => {
+test("no progress callback keeps prior behavior (no observation needed)", async () => {
 	const registry = new FakeLlmRegistry();
-	registry.hang = true;
-	const result = await llmClassify(
-		registry,
-		chatModel(),
-		{ state: {}, questions: { q: CHOICE_QUESTION } },
-		{ timeoutMs: 15 },
-	);
-	assert.equal(result.stopReason, "error");
-	// Exactly one dispatch: the deadline consumed the attempt, no retry.
-	assert.equal(registry.calls.length, 1);
+	registry.replay([assistantMessage([toolCall({ choice: "ship" })])]);
+	const result = await llmClassify(registry, chatModel(), {
+		state: {},
+		questions: { q: CHOICE_QUESTION },
+	});
+	assert.equal(result.stopReason, "stop");
 });
 
 test("system prompt treats state as untrusted data", () => {
@@ -515,11 +477,9 @@ test("system prompt treats state as untrusted data", () => {
 
 test("system prompt forbids confidence self-report without banning score levels", () => {
 	const prompt = buildSystemPrompt();
-	// Likelihood/confidence self-report stays forbidden.
 	assert.match(prompt, /Never report likelihoods/i);
 	assert.match(prompt, /confidence/i);
 	assert.match(prompt, /certainty/i);
-	// It must not ban numeric scores: score questions legally select an integer level.
 	assert.doesNotMatch(prompt, /[Nn]umeric scores/);
 	assert.doesNotMatch(prompt, /Never report.*score/i);
 });
@@ -539,231 +499,71 @@ test("synchronous streamSimple throw resolves as structured error with one dispa
 	assert.equal(registry.calls.length, 1);
 });
 
-test("synchronous result() throw resolves as structured error with one dispatch", async () => {
-	const registry = new FakeLlmRegistry();
-	registry.throwResultSync = true;
-	const result = await llmClassify(registry, chatModel(), {
-		state: {},
-		questions: { q: CHOICE_QUESTION },
-	});
-	assert.equal(result.stopReason, "error");
-	assert.match(result.errorMessage ?? "", /synthetic transport failure/);
-	assert.deepEqual(result.answers, {});
-	assert.equal(registry.calls.length, 1);
-});
+for (const source of ["result", "iterator"] as const) {
+	for (const peer of ["settled", "pending"] as const) {
+		test(`${source} rejection with ${peer} peer is a prompt backend error, not abort or repair`, async () => {
+			const stream = createAssistantMessageEventStream();
+			if (peer === "settled")
+				stream.end(assistantMessage([toolCall({ choice: "ship" })]));
+			if (source === "result") {
+				stream.result = () => Promise.reject(new Error("result rejected"));
+			} else {
+				stream[Symbol.asyncIterator] = () => ({
+					next: () => Promise.reject(new Error("iterator rejected")),
+				});
+			}
+			let calls = 0;
+			let progress = 0;
+			const controller = new AbortController();
+			const result = await withTimeout(
+				llmClassify(
+					{
+						streamSimple() {
+							calls++;
+							return stream;
+						},
+					},
+					chatModel(),
+					{ state: {}, questions: { q: CHOICE_QUESTION } },
+					{
+						signal: controller.signal,
+						progress: () => progress++,
+					},
+				),
+				500,
+				`${source} rejection did not settle the call`,
+			);
+			assert.equal(controller.signal.aborted, false);
+			assert.equal(result.stopReason, "error");
+			assert.equal(result.errorMessage, `${source} rejected`);
+			assert.deepEqual(result.answers, {});
+			assert.equal(calls, 1);
+			assert.equal(progress, 0);
+		});
+	}
+}
 
-test("asynchronous result() rejection resolves as structured error with one dispatch", async () => {
-	const registry = new FakeLlmRegistry();
-	registry.rejectResult = true;
-	const result = await llmClassify(registry, chatModel(), {
-		state: {},
-		questions: { q: CHOICE_QUESTION },
+test("caller abort settles an ignoring stream and handles both late rejections", async () => {
+	const stream = createAssistantMessageEventStream();
+	let reject!: (error: Error) => void;
+	const pending = new Promise<never>((_resolve, fail) => {
+		reject = fail;
 	});
-	assert.equal(result.stopReason, "error");
-	assert.match(result.errorMessage ?? "", /synthetic transport failure/);
-	assert.deepEqual(result.answers, {});
-	assert.equal(registry.calls.length, 1);
-});
-
-test("canceled caller plus rejection resolves as aborted, not an unhandled rejection", async () => {
-	const registry = new FakeLlmRegistry();
-	registry.rejectResult = true;
+	stream.result = () => pending;
+	stream[Symbol.asyncIterator] = () => ({ next: () => pending });
 	const controller = new AbortController();
-	// Abort lands after dispatch but before the rejection resolves.
-	registry.onDispatch = () => {
-		setTimeout(() => controller.abort(), 1);
-	};
-	const result = await llmClassify(
-		registry,
+	const run = llmClassify(
+		{ streamSimple: () => stream },
 		chatModel(),
 		{ state: {}, questions: { q: CHOICE_QUESTION } },
 		{ signal: controller.signal },
 	);
+	controller.abort();
+	const result = await withTimeout(run, 500, "ignoring stream blocked abort");
 	assert.equal(result.stopReason, "aborted");
 	assert.deepEqual(result.answers, {});
-	assert.equal(registry.calls.length, 1);
-});
-
-// --- backend-specific timeout semantics (LLM = inactivity) ---
-
-/** SSE-ish byte stream that emits `count` chunks with `gapMs` between. */
-function streamingFetch(
-	chunks: number,
-	gapMs: number,
-): typeof globalThis.fetch {
-	return async () => {
-		const encoder = new TextEncoder();
-		let sent = 0;
-		const body = new ReadableStream<Uint8Array>({
-			async pull(controller) {
-				if (sent >= chunks) {
-					controller.close();
-					return;
-				}
-				await new Promise((r) => setTimeout(r, gapMs));
-				sent += 1;
-				controller.enqueue(encoder.encode(`data: chunk-${sent}\n\n`));
-			},
-		});
-		return new Response(body, { status: 200 });
-	};
-}
-
-/** Fetch that never resolves (provider accepted the request, no response). */
-function firstByteHangFetch(): typeof globalThis.fetch {
-	return () => new Promise<Response>(() => {});
-}
-
-test("LLM total duration beyond timeoutMs succeeds while gaps stay under it", async () => {
-	const registry = new FakeLlmRegistry();
-	registry.replay([
-		assistantMessage([toolCall({ choice: "ship" })]),
-		assistantMessage([toolCall({ value: true })]),
-	]);
-	// Each question's transport drips 4 chunks at 15ms gaps: ~60ms per
-	// question, ~120ms total — the OLD whole-call 40ms budget would fail.
-	registry.scripts = [{ useFetch: true }, { useFetch: true }];
-	const result = await withTimeout(
-		llmClassify(
-			registry,
-			chatModel(),
-			{ state: {}, questions: { v: CHOICE_QUESTION, g: BOOL_QUESTION } },
-			{ timeoutMs: 40, fetch: streamingFetch(4, 15) },
-		),
-		1000,
-		"llmClassify hung past streaming drain",
-	);
-	assert.equal(result.stopReason, "stop");
-	assert.equal(result.answers.v?.type, "choice");
-	assert.equal(result.answers.g?.type, "bool");
-	assert.equal(registry.calls.length, 2);
-	// The inactivity observer travelled through options.fetch on both calls.
-	assert.equal(registry.calls.length, 2);
-});
-
-test("LLM inactivity resets per question and per raw chunk", async () => {
-	const registry = new FakeLlmRegistry();
-	registry.replay([
-		assistantMessage([toolCall({ choice: "ship" })]),
-		assistantMessage([toolCall({ value: true })]),
-	]);
-	// Question 1 drips ~65ms through the scripted fetch tap; question 2 is a
-	// quick normal call. Each provider request gets a fresh clock, so a
-	// total beyond timeoutMs is legal while each gap stays below it.
-	registry.scripts = [{ useFetch: true }, { delayMs: 5 }];
-	const started = Date.now();
-	const result = await llmClassify(
-		registry,
-		chatModel(),
-		{ state: {}, questions: { v: CHOICE_QUESTION, g: BOOL_QUESTION } },
-		{ timeoutMs: 30, fetch: streamingFetch(5, 13) },
-	);
-	assert.equal(result.stopReason, "stop");
-	assert.ok(Date.now() - started > 30, "total exceeded the idle window");
-	assert.equal(registry.calls.length, 2);
-});
-
-test("LLM silent body stall fails boundedly at the inactivity window", async () => {
-	const registry = new FakeLlmRegistry();
-	// The adapter reads the response body through options.fetch; its stream
-	// stays silent until the plugin's inactivity signal aborts it.
-	const silentFetch: typeof globalThis.fetch = async () =>
-		new Response(
-			new ReadableStream<Uint8Array>({
-				pull() {
-					return new Promise(() => {});
-				},
-			}),
-			{ status: 200 },
-		);
-	registry.scripts = [{ useFetch: true }];
-	const result = await withTimeout(
-		llmClassify(
-			registry,
-			chatModel(),
-			{ state: {}, questions: { q: CHOICE_QUESTION } },
-			{ timeoutMs: 30, fetch: silentFetch },
-		),
-		500,
-		"silent stream did not settle boundedly",
-	);
-	assert.equal(result.stopReason, "error");
-	assert.match(result.errorMessage ?? "", /timed out after 30ms/);
-	assert.equal(registry.calls.length, 1);
-});
-
-test("LLM no-first-response fails boundedly even when registry ignores signal", async () => {
-	const registry = new FakeLlmRegistry();
-	// fetch promise never resolves AND result() waits on the fetch: the
-	// plugin's own inactivity signal aborts the stalled fetch.
-	registry.scripts = [{ useFetch: true }];
-	registry.hang = true;
-	const result = await withTimeout(
-		llmClassify(
-			registry,
-			chatModel(),
-			{ state: {}, questions: { q: CHOICE_QUESTION } },
-			{ timeoutMs: 30, fetch: firstByteHangFetch() },
-		),
-		500,
-		"first-byte stall did not settle boundedly",
-	);
-	assert.equal(result.stopReason, "error");
-	assert.match(result.errorMessage ?? "", /timed out after 30ms/);
-});
-
-test("provider stream events count as activity (reasoning/tool adapters)", async () => {
-	const registry = new FakeLlmRegistry();
-	registry.replay([assistantMessage([toolCall({ choice: "ship" })])]);
-	// Adapter emits provider stream events (reasoning deltas etc.) every
-	// 10ms for 45ms, then answers. No fetch body needed for this adapter.
-	registry.scripts = [{ events: [null, null, null, null], delayMs: 55 }];
-	// Emit one event per ~11ms inside result(): spread via the script's
-	// event list consumed in a loop with a small wait.
-	const original = registry.streamSimple.bind(registry);
-	registry.streamSimple = (model: never, context, options) => {
-		const call = original(model, context, options);
-		let fired = 0;
-		const beat = setInterval(() => {
-			fired += 1;
-			void options?.onProviderStreamEvent?.(
-				{ type: "reasoning-delta", n: fired },
-				model,
-			);
-			if (fired >= 5) clearInterval(beat);
-		}, 10);
-		return {
-			result: async () => {
-				const message = await call.result();
-				clearInterval(beat);
-				return message;
-			},
-		};
-	};
-	const result = await withTimeout(
-		llmClassify(
-			registry,
-			chatModel(),
-			{ state: {}, questions: { q: CHOICE_QUESTION } },
-			{ timeoutMs: 35 },
-		),
-		500,
-		"event-driven activity did not keep the call alive",
-	);
-	assert.equal(result.stopReason, "stop");
-	assert.equal(result.answers.q?.type, "choice");
-});
-
-test("no timeoutMs keeps prior behavior (no plugin inactivity timer)", async () => {
-	const registry = new FakeLlmRegistry();
-	registry.replay([assistantMessage([toolCall({ choice: "ship" })])]);
-	registry.scripts = [{ delayMs: 5 }];
-	const result = await llmClassify(registry, chatModel(), {
-		state: {},
-		questions: { q: CHOICE_QUESTION },
-	});
-	assert.equal(result.stopReason, "stop");
-	assert.equal(registry.calls[0]?.options?.timeoutMs, undefined);
+	reject(new Error("late transport rejection"));
+	await new Promise<void>((resolve) => setImmediate(resolve));
 });
 
 // --- own-key preservation for legal JSON labels and question ids ---
@@ -788,8 +588,6 @@ test("__proto__ choice label survives compatibility probabilities", () => {
 	);
 	assert.equal(Object.hasOwn(answer.probabilities, "__proto__"), true);
 	assert.equal(answer.probabilities.__proto__, 1);
-	// Own key recorded without breaking the plain-object shape consumers
-	// deep-compare against.
 	assert.equal(
 		Object.getPrototypeOf(answer.probabilities) === Object.prototype,
 		true,

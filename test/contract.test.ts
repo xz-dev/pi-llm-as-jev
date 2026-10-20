@@ -61,13 +61,14 @@ test("contract shapes typecheck against pi-ai classifier values", () => {
 				criteria: ["low", "high"],
 			},
 		},
-		evidence: [
-			{ id: "e1", text: "first", metadata: { k: 1 } },
-			{ id: "e2", text: "second" },
-		],
 	};
 	assert.equal(Object.keys(request.questions).length, 3);
-	assert.equal(request.evidence?.length, 2);
+	// v2: evidence packed into state, never a separate legacy array.
+	const packed: JudgeRequest = {
+		state: { evidence: [{ id: "e1", text: "first" }] },
+		questions: request.questions,
+	};
+	assert.equal(packed.state.evidence !== undefined, true);
 
 	const answers: Record<string, ClassifierAnswer> = {
 		choice: {

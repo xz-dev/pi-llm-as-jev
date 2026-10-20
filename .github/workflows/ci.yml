@@ -1,0 +1,39 @@
+name: CI
+
+on: [push, pull_request, workflow_dispatch]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '26'
+          cache: npm
+      - run: npm ci
+      - run: npm run check
+      - name: Generated clients must be committed
+        run: git diff --exit-code -- client/judgment-client.js client/judgment-client.d.ts
+      - name: Verify Git-source package contents
+        run: |
+          npm pack --json --pack-destination "$RUNNER_TEMP" > "$RUNNER_TEMP/package.json"
+          node --input-type=module -e '
+            import fs from "node:fs";
+            import assert from "node:assert/strict";
+            const [pack] = JSON.parse(fs.readFileSync(process.env.RUNNER_TEMP + "/package.json"));
+            const files = new Set(pack.files.map(f => f.path));
+            for (const file of ["src/index.ts", "src/service.ts", "client/judgment-client.ts", "client/judgment-client.js", "client/judgment-client.d.ts", "README.md"]) assert(files.has(file), file);
+            for (const file of files) assert(!/^(test\/|PLAN\/|\.serena\/)|^src\/(cache|ledger|capacity|review-observations|native-observations|llm-observations)\./.test(file), file);
+            assert.equal(JSON.parse(fs.readFileSync("package.json")).private, true);
+            console.log(pack.filename, pack.integrity, pack.files.length);
+          '
+      - uses: actions/upload-artifact@v4
+        with:
+          name: git-source-package
+          path: ${{ runner.temp }}/pi-llm-as-jev-*.tgz
+          if-no-files-found: error

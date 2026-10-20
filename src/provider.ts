@@ -19,7 +19,12 @@ import type {
 	Provider,
 } from "@earendil-works/pi-ai";
 import { type LlmRegistry, llmClassify } from "./backend-llm.js";
-import type { JudgmentConfig } from "./config.js";
+import {
+	DEFAULT_LLM_IDLE_TIMEOUT_MS,
+	type JudgmentConfig,
+	resolveTimeouts,
+} from "./config.js";
+import { newAttemptClocks } from "./service.js";
 
 /** Any chat model regardless of api. */
 type AnyModel = Model<Api>;
@@ -39,6 +44,8 @@ export interface ProviderRegistry {
 export interface EmulatedClassifierOptions {
 	registry: ProviderRegistry;
 	config: JudgmentConfig | (() => JudgmentConfig);
+	/** Settings problem blocking inference (e.g. legacy timeout migration). */
+	settingsError?: () => string | undefined;
 }
 
 /**
@@ -102,6 +109,7 @@ async function underlyingAvailable(
 export function createEmulatedClassifierProvider({
 	registry,
 	config: source,
+	settingsError,
 }: EmulatedClassifierOptions): Provider {
 	const snapshot = () =>
 		structuredClone(typeof source === "function" ? source() : source);
@@ -143,9 +151,28 @@ export function createEmulatedClassifierProvider({
 		classify: async (
 			model: AnyClassifierModel,
 			context: ClassifierContext,
-			options?: { signal?: AbortSignal; timeoutMs?: number },
+			options?: {
+				signal?: AbortSignal;
+				/** Whole-invocation hard deadline for this DIRECT entry; overrides
+				 *  the configured LLM hard limit. Never an idle duration. */
+				timeoutMs?: number;
+				fetch?: typeof globalThis.fetch;
+				onProviderStreamEvent?: (data: unknown, model: Model<Api>) => void;
+			},
 		): Promise<ClassifierResult> => {
 			const config = snapshot();
+			const blockedMessage = settingsError?.();
+			if (blockedMessage !== undefined) {
+				return {
+					api: model.api,
+					provider: EMULATED_PROVIDER_ID,
+					model: config.model ?? "",
+					answers: {},
+					stopReason: "error",
+					errorMessage: blockedMessage,
+					timestamp: Date.now(),
+				};
+			}
 			const chat =
 				config.provider && config.modelId
 					? registry.getModel(config.provider, config.modelId)
@@ -161,13 +188,51 @@ export function createEmulatedClassifierProvider({
 					timestamp: Date.now(),
 				};
 			}
-			return llmClassify(registry as unknown as LlmRegistry, chat, context, {
-				thinkingLevel: config.thinkingLevel,
-				signal: options?.signal,
-				// Emulated provider: the service already resolved the window; a bare
-				// provider call gets the explicit config value or no window (host default).
-				timeoutMs: options?.timeoutMs ?? config.timeoutMs,
-			});
+			// Direct entry owns its own attempt clocks: configured LLM idle
+			// (default 15s), plus a hard cap from the caller's `timeoutMs` — the
+			// standard Pi whole-invocation deadline — or else the configured
+			// LLM hard limit. Neither is ever forwarded as an SDK request timeout.
+			const effective = resolveTimeouts(config, "llm", undefined);
+			const clocks = newAttemptClocks(
+				{
+					idleTimeoutMs: effective.idleTimeoutMs ?? DEFAULT_LLM_IDLE_TIMEOUT_MS,
+					modelTimeoutMs: options?.timeoutMs ?? effective.modelTimeoutMs,
+				},
+				options?.signal,
+			);
+			try {
+				const result = await llmClassify(
+					registry as unknown as LlmRegistry,
+					chat,
+					context,
+					{
+						thinkingLevel: config.thinkingLevel,
+						signal: clocks.signal,
+						progress: () => clocks.progress(),
+						fetch: options?.fetch,
+						onProviderStreamEvent: options?.onProviderStreamEvent,
+					},
+				);
+				if (clocks.hardExpired())
+					return {
+						...result,
+						answers: {},
+						stopReason: "error",
+						errorMessage: `LLM classification timed out after ${options?.timeoutMs ?? effective.modelTimeoutMs}ms`,
+					};
+				if (clocks.idleExpired())
+					return {
+						...result,
+						answers: {},
+						stopReason: "error",
+						errorMessage: `LLM classification produced no generation progress for ${effective.idleTimeoutMs}ms`,
+					};
+				if (options?.signal?.aborted)
+					return { ...result, answers: {}, stopReason: "aborted" };
+				return result;
+			} finally {
+				clocks.dispose();
+			}
 		},
 	};
 }

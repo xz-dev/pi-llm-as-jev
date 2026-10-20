@@ -63,7 +63,10 @@ test("sync operation reads match async validation, ignore timestamps and recover
 		assert.equal(loaded.defaults, asynchronous.defaults);
 		assert.equal(loaded.diagnostics.length, asynchronous.diagnostics.length);
 		if (loaded.diagnostics.length)
-			assert.match(loaded.diagnostics[0].message, /using default settings/);
+			assert.match(
+				loaded.diagnostics[0].message,
+				/using default settings|requires migration/,
+			);
 		return loaded;
 	};
 	assert.deepEqual((await read()).config, DEFAULTS);
@@ -81,7 +84,10 @@ test("sync operation reads match async validation, ignore timestamps and recover
 	assert.equal((await read()).config.model, "p/y");
 	assert.equal(first.model, "p/x", "earlier snapshots are not mutated");
 	await fs.writeFile(file, JSON.stringify({ model: "p/y", timeoutMs: -1 }));
-	assert.deepEqual((await read()).config, DEFAULTS);
+	// Legacy field: other settings still apply; migration is flagged.
+	const migrated = await read();
+	assert.equal(migrated.config.model, "p/y");
+	assert.equal(migrated.migrationRequired, true);
 	await fs.writeFile(file, "{");
 	assert.equal((await read()).diagnostics.length, 1);
 	await fs.rm(file);
@@ -130,7 +136,7 @@ test("any invalid known field defaults ALL known fields", () => {
 		classifierModel: "prov/clf",
 		model: "prov/id",
 		thinkingLevel: "turbo",
-		timeoutMs: 2500,
+		timeouts: { classifier: { idleTimeoutMs: 2500 } },
 	});
 	assert.deepEqual(loaded.config, DEFAULTS);
 	assert.equal(loaded.diagnostics.length, 1);
@@ -141,7 +147,6 @@ test("an invalid model reference also defaults the whole file", () => {
 	const loaded = validateConfig({
 		mode: "classifier",
 		model: "no-slash",
-		timeoutMs: 2500,
 	});
 	assert.deepEqual(loaded.config, DEFAULTS);
 	assert.equal(loaded.diagnostics.length, 1);
@@ -167,9 +172,12 @@ test("mixed valid/invalid file on disk defaults all known fields", async () => {
 	);
 	const loaded = await loadConfig(dirG);
 	assert.deepEqual(loaded.config, DEFAULTS);
-	assert.equal(loaded.diagnostics.length, 2);
+	// thinkingLevel is invalid (all-defaults); legacy timeoutMs separately
+	// flags migration rather than contributing an invalid-field diagnostic.
+	assert.equal(loaded.migrationRequired, true);
+	assert.ok(loaded.diagnostics.length >= 2);
 	assert.match(loaded.diagnostics[0]?.message ?? "", /unknown thinkingLevel/);
-	assert.match(loaded.diagnostics[1]?.message ?? "", /timeoutMs/);
+	assert.match(loaded.diagnostics[1]?.message ?? "", /requires migration/);
 });
 
 test("old jev mode value is invalid, not silently aliased", () => {
@@ -219,18 +227,19 @@ test("saveConfig temporary names are unique across rapid sequential saves", asyn
 	// stale temps remain. Temp name = path.tmp-pid-ms-seq; seq is monotonic.
 	const before = await fs.readdir(dirH).catch(() => [] as string[]);
 	await Promise.all([
-		saveConfig({ timeoutMs: 1000 }, dirH),
-		saveConfig({ timeoutMs: 1001 }, dirH),
-		saveConfig({ timeoutMs: 1002 }, dirH),
+		saveConfig({ timeouts: { classifier: { idleTimeoutMs: 1000 } } }, dirH),
+		saveConfig({ timeouts: { classifier: { idleTimeoutMs: 1001 } } }, dirH),
+		saveConfig({ timeouts: { classifier: { idleTimeoutMs: 1002 } } }, dirH),
 	]);
 	const after = await fs.readdir(dirH);
 	assert.equal(after.length, 1);
 	assert.equal(after[0], "llm-as-jev.json");
 	assert.equal(before.length, 0);
-	// Final file is valid JSON from one complete write.
 	const onDisk = JSON.parse(await fs.readFile(configFilePath(dirH), "utf8"));
 	assert.equal(onDisk.mode, "auto");
-	assert.ok([1000, 1001, 1002].includes(onDisk.timeoutMs));
+	assert.ok(
+		[1000, 1001, 1002].includes(onDisk.timeouts.classifier.idleTimeoutMs),
+	);
 });
 
 test("missing file yields defaults, no diagnostics", async () => {
@@ -249,12 +258,16 @@ test("valid file parses all fields including an independent classifierModel", as
 			classifierModel: "custom-net/family/clf-2",
 			model: "anthropic/claude/sonnet",
 			thinkingLevel: "high",
-			timeoutMs: 5000,
+			timeouts: {
+				classifier: { idleTimeoutMs: 5000, modelTimeoutMs: 30000 },
+				llm: { idleTimeoutMs: 20000 },
+			},
 		}),
 	);
 	const loaded = await loadConfig(dirA);
 	assert.equal(loaded.defaults, false);
 	assert.equal(loaded.diagnostics.length, 0);
+	assert.equal(loaded.migrationRequired ?? false, false);
 	assert.equal(loaded.config.mode, "classifier");
 	assert.equal(loaded.config.classifierModel, "custom-net/family/clf-2");
 	assert.equal(loaded.config.classifierProvider, "custom-net");
@@ -263,7 +276,9 @@ test("valid file parses all fields including an independent classifierModel", as
 	assert.equal(loaded.config.provider, "anthropic");
 	assert.equal(loaded.config.modelId, "claude/sonnet");
 	assert.equal(loaded.config.thinkingLevel, "high");
-	assert.equal(loaded.config.timeoutMs, 5000);
+	assert.equal(loaded.config.timeouts?.classifier?.idleTimeoutMs, 5000);
+	assert.equal(loaded.config.timeouts?.classifier?.modelTimeoutMs, 30000);
+	assert.equal(loaded.config.timeouts?.llm?.idleTimeoutMs, 20000);
 });
 
 test("malformed JSON yields defaults plus diagnostic", async () => {
@@ -273,7 +288,7 @@ test("malformed JSON yields defaults plus diagnostic", async () => {
 	const loaded = await loadConfig(dirB);
 	assert.equal(loaded.defaults, false);
 	assert.equal(loaded.config.mode, "auto");
-	assert.equal(loaded.config.timeoutMs, undefined);
+	assert.equal(loaded.config.timeouts, undefined);
 	assert.match(loaded.diagnostics[0]?.message ?? "", /malformed JSON/);
 });
 
@@ -311,14 +326,34 @@ test("classifierModel split at first slash keeps slashes in model id", () => {
 	assert.equal(loaded.config.classifierModelId, "family/clf");
 });
 
-test("invalid timeoutMs falls back to all-defaults", () => {
-	const loaded = validateConfig({ timeoutMs: -5 });
-	assert.equal(loaded.config.timeoutMs, undefined);
+test("legacy top-level timeoutMs requires migration, keeping other fields", () => {
+	const loaded = validateConfig({ timeoutMs: 5000, model: "a/b" });
+	assert.equal(loaded.migrationRequired, true);
+	assert.equal(loaded.config.model, "a/b"); // valid fields still apply
 	assert.equal(loaded.diagnostics.length, 1);
-
+	assert.match(loaded.diagnostics[0]?.message ?? "", /requires migration/);
+	// Any legacy value — even invalid-shaped — is a migration flag, not an
+	// all-defaults invalid field.
 	const nan = validateConfig({ timeoutMs: Number.NaN });
-	assert.equal(nan.config.timeoutMs, undefined);
-	assert.equal(nan.diagnostics.length, 1);
+	assert.equal(nan.migrationRequired, true);
+	assert.equal(nan.config.mode, "auto");
+});
+
+test("invalid new timeouts member falls back to all-defaults", () => {
+	for (const bad of [0, -5, 1.5, "fast", Number.NaN, 2_147_483_648]) {
+		const loaded = validateConfig({
+			model: "a/b",
+			timeouts: { llm: { idleTimeoutMs: bad } },
+		});
+		assert.deepEqual(loaded.config, DEFAULTS);
+		assert.equal(loaded.migrationRequired ?? false, false);
+		assert.ok(loaded.diagnostics.length >= 1);
+	}
+	const missing = validateConfig({
+		timeouts: { llm: { modelTimeoutMs: 100 } },
+	});
+	assert.equal(missing.diagnostics.length, 0);
+	assert.equal(missing.config.timeouts?.llm?.modelTimeoutMs, 100);
 });
 
 test("home fallback when env unset", () => {
@@ -362,34 +397,177 @@ test("saveConfig round-trips, preserves unknown keys and independent slots", asy
 			classifierModel: "prov/clf-1",
 			model: "a/b",
 			thinkingLevel: "low",
-			timeoutMs: 1000,
+			timeouts: { classifier: { idleTimeoutMs: 1000 } },
 			futureSetting: { nested: [1, 2] },
 		}),
 	);
-	const saved = await saveConfig({ mode: "llm", timeoutMs: 2000 }, dirC);
+	const saved = await saveConfig(
+		{ mode: "llm", timeouts: { llm: { modelTimeoutMs: 2000 } } },
+		dirC,
+	);
 	assert.equal(saved.config.mode, "llm");
-	assert.equal(saved.config.timeoutMs, 2000);
+	assert.equal(saved.config.timeouts?.llm?.modelTimeoutMs, 2000);
+	// The unaddressed classifier slot survives an llm-only timeouts update.
+	assert.equal(saved.config.timeouts?.classifier?.idleTimeoutMs, 1000);
 	assert.equal(saved.config.model, "a/b");
-	// Independent native slot survives an LLM-only update.
 	assert.equal(saved.config.classifierModel, "prov/clf-1");
 	assert.equal(saved.diagnostics.length, 0);
 
 	const onDisk = JSON.parse(await fs.readFile(fileC, "utf8"));
 	assert.deepEqual(onDisk.futureSetting, { nested: [1, 2] });
 	assert.equal(onDisk.mode, "llm");
-	assert.equal(onDisk.timeoutMs, 2000);
+	assert.equal(onDisk.timeouts.llm.modelTimeoutMs, 2000);
+	assert.equal(onDisk.timeouts.classifier.idleTimeoutMs, 1000);
 	assert.equal(onDisk.thinkingLevel, "low");
 	assert.equal(onDisk.model, "a/b");
 	assert.equal(onDisk.classifierModel, "prov/clf-1");
 
 	const reloaded = await loadConfig(dirC);
 	assert.equal(reloaded.config.mode, "llm");
-	assert.equal(reloaded.config.timeoutMs, 2000);
+	assert.equal(reloaded.config.timeouts?.llm?.modelTimeoutMs, 2000);
 	assert.equal(reloaded.config.provider, "a");
 	assert.equal(reloaded.config.modelId, "b");
 	assert.equal(reloaded.config.classifierProvider, "prov");
 	assert.equal(reloaded.config.classifierModelId, "clf-1");
 	assert.equal(reloaded.diagnostics.length, 0);
+});
+
+for (const update of [
+	{ model: "fake/new" },
+	{ classifierModel: "native/new" },
+	{ mode: "auto-llm" },
+	{ thinkingLevel: "high" },
+] as const) {
+	test(`saveConfig preserves legacy timeout migration on ${Object.keys(update)[0]} saves`, async () => {
+		for (const withTimeouts of [false, true]) {
+			const dir = path.join(
+				tmpRoot,
+				`legacy-${Object.keys(update)[0]}-${withTimeouts}`,
+			);
+			await fs.mkdir(dir);
+			const original = {
+				mode: "llm",
+				model: "fake/old",
+				classifierModel: "native/old",
+				thinkingLevel: "low",
+				timeoutMs: 60000,
+				...(withTimeouts
+					? { timeouts: { llm: { modelTimeoutMs: 45000 } } }
+					: {}),
+				unrelated: { keep: true },
+			};
+			await fs.writeFile(configFilePath(dir), JSON.stringify(original));
+			const saved = await saveConfig(update, dir);
+			assert.deepEqual(
+				JSON.parse(await fs.readFile(configFilePath(dir), "utf8")),
+				{ ...original, ...update },
+			);
+			for (const loaded of [
+				saved,
+				await loadConfig(dir),
+				loadConfigSync(dir),
+			]) {
+				assert.equal(loaded.migrationRequired, true);
+				assert.deepEqual(loaded.config, saved.config);
+				assert.equal(loaded.diagnostics.length, 1);
+				assert.match(
+					loaded.diagnostics[0].message,
+					/legacy "timeoutMs" requires migration:.*inference is disabled/,
+				);
+			}
+		}
+	});
+}
+
+test("timing saves preserve legacy presence until explicit file migration, reading fresh settings", async () => {
+	const dir = path.join(tmpRoot, "legacy-freshness");
+	await fs.mkdir(dir);
+	const file = configFilePath(dir);
+	await fs.writeFile(file, JSON.stringify({ model: "chat/old" }));
+	const earlier = await loadConfig(dir);
+	// Another session adds the legacy field and timing policy after our read.
+	await fs.writeFile(
+		file,
+		JSON.stringify({
+			model: "chat/current",
+			timeoutMs: 60000,
+			timeouts: { classifier: { idleTimeoutMs: 12000 } },
+			unrelated: "keep",
+		}),
+	);
+	const saved = await saveConfig(
+		{ timeouts: { llm: { modelTimeoutMs: 45000 } } },
+		dir,
+	);
+	assert.equal(saved.migrationRequired, true);
+	assert.equal(saved.config.model, "chat/current");
+	assert.deepEqual(saved.config.timeouts, {
+		classifier: { idleTimeoutMs: 12000 },
+		llm: { modelTimeoutMs: 45000 },
+	});
+	assert.equal(earlier.config.model, "chat/old");
+	assert.equal(earlier.migrationRequired, false);
+	assert.equal(JSON.parse(await fs.readFile(file, "utf8")).timeoutMs, 60000);
+	const reset = await saveConfig({ timeouts: null }, dir);
+	assert.equal(reset.migrationRequired, true);
+	assert.equal(reset.config.timeouts, undefined);
+	const migrated = JSON.parse(await fs.readFile(file, "utf8"));
+	assert.equal(migrated.timeoutMs, 60000);
+	// Explicit file edit removes legacy ambiguity; save must not restore it.
+	delete migrated.timeoutMs;
+	migrated.timeouts = { llm: { idleTimeoutMs: 17000 } };
+	await fs.writeFile(file, JSON.stringify(migrated));
+	const after = await saveConfig({ thinkingLevel: "high" }, dir);
+	assert.equal(after.migrationRequired, false);
+	assert.deepEqual(after.diagnostics, []);
+	assert.deepEqual(after.config.timeouts, migrated.timeouts);
+	assert.equal(
+		Object.hasOwn(JSON.parse(await fs.readFile(file, "utf8")), "timeoutMs"),
+		false,
+	);
+	assert.equal(JSON.parse(await fs.readFile(file, "utf8")).unrelated, "keep");
+	assert.deepEqual(await loadConfig(dir), after);
+});
+
+test("legacy presence survives invalid-known normalization; invalid updates still write nothing", async () => {
+	const dir = path.join(tmpRoot, "legacy-invalid-known");
+	await fs.mkdir(dir);
+	const file = configFilePath(dir);
+	for (const timeoutMs of [null, 0, "fast", { old: true }]) {
+		await fs.writeFile(
+			file,
+			JSON.stringify({
+				mode: "llm",
+				model: "fake/old",
+				thinkingLevel: "invalid",
+				timeoutMs,
+				unrelated: "keep",
+			}),
+		);
+		const before = await loadConfig(dir);
+		assert.deepEqual(before.config, DEFAULTS);
+		assert.equal(before.migrationRequired, true);
+		const saved = await saveConfig({ model: "fake/new" }, dir);
+		assert.equal(saved.migrationRequired, true);
+		assert.deepEqual(
+			saved.config,
+			validateConfig({ model: "fake/new" }).config,
+		);
+		assert.deepEqual(JSON.parse(await fs.readFile(file, "utf8")), {
+			...DEFAULTS,
+			model: "fake/new",
+			timeoutMs,
+			unrelated: "keep",
+		});
+		assert.deepEqual(await loadConfig(dir), saved);
+		const text = await fs.readFile(file, "utf8");
+		await assert.rejects(
+			saveConfig({ timeouts: { llm: { idleTimeoutMs: 0 } } }, dir),
+			/timeouts requires/,
+		);
+		assert.equal(await fs.readFile(file, "utf8"), text);
+		assert.deepEqual(await fs.readdir(dir), ["llm-as-jev.json"]);
+	}
 });
 
 test("saveConfig classifier-only update leaves the LLM slot untouched", async () => {
@@ -603,7 +781,10 @@ test("unknown own __proto__/constructor/toString extras survive without prototyp
 		fileR,
 		'{"mode":"auto","model":"a/b","__proto__":{"keep":1},"constructor":{"keep":2},"toString":{"keep":3}}',
 	);
-	const saved = await saveConfig({ timeoutMs: 5000 }, dirR);
+	const saved = await saveConfig(
+		{ timeouts: { llm: { idleTimeoutMs: 5000 } } },
+		dirR,
+	);
 	const onDisk = JSON.parse(await fs.readFile(fileR, "utf8")) as Record<
 		string,
 		unknown
@@ -625,7 +806,7 @@ test("unknown own __proto__/constructor/toString extras survive without prototyp
 	);
 	// Object's own prototype unchanged by the copy.
 	assert.equal(Object.getPrototypeOf(onDisk), Object.prototype);
-	assert.equal(saved.config.timeoutMs, 5000);
+	assert.equal(saved.config.timeouts?.llm?.idleTimeoutMs, 5000);
 });
 
 test("disk and returned config agree for independent slots (3.2)", async () => {

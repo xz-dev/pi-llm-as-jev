@@ -160,7 +160,9 @@ const fakeHost = {
 	getAvailableOfType: async (_type: "classifier") =>
 		nativeModels.filter((m) => m.provider !== EMULATED) as never,
 	getProviderAuth: async (providerId: string) =>
-		providerId === "fake" || providerId === "native"
+		providerId === "fake" ||
+		providerId === "native" ||
+		providerId === "typesafe"
 			? { auth: { apiKey: "pseudo-native-key" }, source: "fixture" }
 			: providerId === EMULATED
 				? { auth: { apiKey: "emulated" }, source: "delegated" }
@@ -261,11 +263,11 @@ test("handle published after registry bind and cleared on shutdown (identity-che
 		await fire("session_start");
 		const service = getJudgmentService();
 		assert.ok(service, "service handle published after session_start");
-		assert.equal(service.version, 1);
+		assert.equal(service.version, 2);
 
 		// A replacement instance's handle must survive our shutdown.
 		const replacement = {
-			version: 1,
+			version: 2,
 			judge: async () => ({}) as never,
 			availability: async () => ({}),
 		};
@@ -344,7 +346,8 @@ test("judge() dispatches through the adapted registry to the host classify", asy
 			minConfidence: 0.99,
 		});
 		assert.equal(strict.backend, "classifier");
-		assert.equal(strict.reuse.sent, 0); // cache hit, no second dispatch
+		// Stateless v2: the stricter call runs fresh inference.
+		assert.equal(nativeCalls.length, 2);
 		assert.deepEqual([...strict.dropped].sort(), [
 			"green",
 			"severity",
@@ -1169,13 +1172,10 @@ test("retained production handle reads each admission once and preserves overlap
 			assert.equal(getJudgmentService(), handle);
 			assert.deepEqual(await handle.availability(), { classifier: "native/y" });
 			const calls = nativeCalls.length;
-			assert.equal((await handle.judge(request)).reuse.hits, 1);
-			assert.equal(
-				nativeCalls.length,
-				calls,
-				"refresh preserves identity-qualified cache",
-			);
-			assert.ok(pi.entries.length > 0, "refresh preserves ledger writes");
+			// Stateless v2: fresh inference each call, nothing persisted or restored.
+			assert.equal((await handle.judge(request)).stopReason, "stop");
+			assert.equal(nativeCalls.length, calls + 1, "fresh inference, no cache");
+			assert.equal(pi.entries.length, 0, "no ledger writes in v2");
 		} finally {
 			release();
 			fakeHost.classify = original;
@@ -1263,8 +1263,8 @@ test("status rows and availability share one snapshot across discovery", async (
 		};
 		try {
 			const status = pi.commands
-				.get("llm-as-jev")!
-				.handler("status", pi.makeCtx());
+				.get("llm-as-jev")
+				?.handler("status", pi.makeCtx());
 			await admission;
 			await fs.writeFile(
 				file,
@@ -1345,7 +1345,7 @@ for (const cancelAt of [0, 1, 2]) {
 				classifierModel: "native/y",
 				model: "fake/beta",
 				thinkingLevel: "high",
-				timeoutMs: 2500,
+				timeouts: { classifier: { idleTimeoutMs: 2500 } },
 				unknown: { keep: true },
 			};
 			let step = 0;
@@ -1371,7 +1371,7 @@ for (const cancelAt of [0, 1, 2]) {
 				);
 				return cancelAt === step ? undefined : selected;
 			};
-			await pi.commands.get("llm-as-jev")!.handler("llm", ctx as never);
+			await pi.commands.get("llm-as-jev")?.handler("llm", ctx as never);
 			const actual = JSON.parse(await fs.readFile(file, "utf8"));
 			assert.deepEqual(
 				actual,
@@ -1402,7 +1402,7 @@ test("failed dialog confirmation does not publish tentative settings", async () 
 			await fs.mkdir(file); // deterministic rename failure, including for root
 			return "high";
 		};
-		await pi.commands.get("llm-as-jev")!.handler("llm", ctx as never);
+		await pi.commands.get("llm-as-jev")?.handler("llm", ctx as never);
 		assert.ok(
 			pi.uiNotifications.some((notice) =>
 				/could not save settings/.test(notice.message),
@@ -1422,7 +1422,7 @@ test("failed dialog confirmation does not publish tentative settings", async () 
 	});
 });
 
-test("ledger append routes through two-argument appendEntry and branch restore runs", async () => {
+test("v2: no ledger writes; historical entries never restore answers", async () => {
 	await withAgentDir(async () => {
 		await fs.writeFile(
 			path.join(agentDir!, "llm-as-jev.json"),
@@ -1445,7 +1445,22 @@ test("ledger append routes through two-argument appendEntry and branch restore r
 			green: { type: "bool", probability: 0.8 },
 			severity: { type: "score", score: 1, confidence: 0.85 },
 		};
-		const branch: unknown[] = [];
+		// A branch seeded with historical ledger records is left untouched
+		// and never consumed as reusable judgments.
+		const branch: unknown[] = [
+			{
+				type: "custom",
+				customType: "llm-as-jev-ledger",
+				data: {
+					kind: "judgment",
+					key: "deadbeef",
+					answer: { type: "bool", probability: 0.1 },
+					backend: "classifier",
+					model: "native/kev-2.1",
+					thinkingLevel: "off",
+				},
+			},
+		];
 		const { pi, fire } = await freshExtension();
 		const ctx = {
 			modelRegistry: fakeHost,
@@ -1455,25 +1470,21 @@ test("ledger append routes through two-argument appendEntry and branch restore r
 		await fire("session_start", ctx);
 		const service = getJudgmentService();
 		assert.ok(service);
-		await service.judge(mixedRequest());
-		const judgments = pi.entries.filter(
-			(e) =>
-				e.type === "llm-as-jev-ledger" &&
-				(e.data as { kind?: string }).kind === "judgment",
+		const result = await service.judge(mixedRequest());
+		assert.equal(result.stopReason, "stop");
+		assert.equal(result.answers.green?.type, "bool");
+		assert.equal(nativeCalls.length, 1, "fresh inference; no restore");
+		assert.equal(
+			pi.entries.filter((e) => e.type === "llm-as-jev-ledger").length,
+			0,
+			"no ledger writes in v2",
 		);
-		assert.equal(judgments.length, 3); // one per question
-		// Branch replay: same branch entries on a navigation restore the cache.
-		branch.push(
-			...pi.entries.map((e) => ({
-				type: "custom",
-				customType: e.type,
-				data: e.data,
-			})),
-		);
+		// Navigation cancels work but never rewrites or deletes history.
 		await fire("session_tree", ctx);
+		assert.equal(branch.length, 1);
 		nativeCalls.length = 0;
-		const resumed = await service.judge(mixedRequest());
-		assert.equal(resumed.stopReason, "stop");
-		assert.equal(nativeCalls.length, 0, "restored from ledger, no dispatch");
+		const again = await service.judge(mixedRequest());
+		assert.equal(again.stopReason, "stop");
+		assert.equal(nativeCalls.length, 1, "independent fresh inference");
 	});
 });

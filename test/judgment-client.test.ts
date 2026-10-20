@@ -21,7 +21,7 @@ test("returns undefined when no service is published", () => {
 test("returns the published object", () => {
 	const prev = holder[KEY];
 	const stub: JudgmentService = {
-		version: 1,
+		version: 2,
 		judge: async () => {
 			throw new Error("not implemented");
 		},

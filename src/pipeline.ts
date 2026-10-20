@@ -1,29 +1,49 @@
 /**
- * Overflow recognition and question/evidence batch splitting (task 4.3),
- * working on `ClassifierResult` instead of HTTP responses. Only an explicit
- * input-context overflow indication from the backend permits subdivision;
- * rate limits, billing and authentication errors never do.
+ * Overflow recognition on `ClassifierResult`. Only an explicit input-context
+ * overflow indication from the backend marks `contextOverflow`; rate limits,
+ * billing and authentication errors never do. Version two performs no
+ * service-side subdivision: consumers own packing and reduction.
  */
 
 import { Buffer } from "node:buffer";
-import type {
-	EvidenceRecord,
-	JsonObject,
-	JsonValue,
-} from "../client/judgment-client.ts";
+import type { JsonObject } from "../client/judgment-client.ts";
 
 /**
- * Recognize an explicit context-overflow `ClassifierResult`. Pi classifier
- * backends surface provider rejections as `stopReason: "error"` with an
- * `errorMessage`; recognized shapes mirror the verified reference matcher,
- * with credential/quota/rate-limit text explicitly excluded.
+ * Recognize SDK status prefixes: OpenAI/OpenRouter `NNN[: ]<body>` and
+ * native `System One API error (NNN): <body>` (plus other fixed SDK labels).
+ * This is string-format recognition, not independent transport attestation;
+ * parenthesized digits elsewhere in a body are never a status.
  */
+function httpStatus(message: string): number | undefined {
+	// classifyWithModel adds this fixed local prefix when the registry throws.
+	message = message.replace(/^Native classification failed: /, "");
+	const match =
+		/^\s*(\d{3})(?::|\s)/.exec(message) ??
+		/^(?:System One API|Cloudflare Workers AI|llama\.cpp|OpenAI API|Azure OpenAI API) error \((\d{3})\):/.exec(
+			message,
+		);
+	const status = match ? Number(match[1]) : undefined;
+	return status !== undefined && status >= 100 && status < 600
+		? status
+		: undefined;
+}
+
+/**
+ * Statuses on which a context-overflow body text is trustworthy. Request
+ * rejections (400/413) and timeouts (408) may carry a real size verdict;
+ * authentication, quota, validation and server failures never authorize
+ * subdivision even when their body mentions `context_length_exceeded`.
+ */
+const OVERFLOW_STATUSES: ReadonlySet<number> = new Set([400, 408, 413]);
+
 export function isContextOverflow(result: {
 	stopReason: string;
 	errorMessage?: string;
 }): boolean {
 	if (result.stopReason !== "error") return false;
 	const message = result.errorMessage ?? "";
+	const status = httpStatus(message);
+	if (status !== undefined && !OVERFLOW_STATUSES.has(status)) return false;
 	if (
 		/quota|billing|rate.?limit|per[- ](?:minute|second|hour|day)|balance|authentication|unauthorized|api.?key/i.test(
 			message,
@@ -46,6 +66,18 @@ export function isContextOverflow(result: {
 	].some((p) => p.test(message));
 }
 
+/**
+ * Untrusted provider/adapter text never passes through the public boundary.
+ * Only a recognized SDK status prefix contributes to a bounded category;
+ * callers retain known-key redaction and render local validation separately.
+ */
+export function publicErrorMessage(message: string): string {
+	const status = httpStatus(message);
+	return status !== undefined
+		? `provider request failed (HTTP ${status})`
+		: "provider or transport failure";
+}
+
 /** UTF-8 byte sizes of state and question map. */
 export function sizeOf(
 	state: JsonObject,
@@ -65,114 +97,4 @@ export function sizeOf(
 		questionBytes: Buffer.byteLength(JSON.stringify(questions)),
 		longestQuestionBytes: Math.max(0, ...each),
 	};
-}
-
-/** Split a question-id list into two halves (question-dimension reduction). */
-export function splitQuestions(
-	questionIds: string[],
-): [string[], string[]] | undefined {
-	if (questionIds.length < 2) return undefined;
-	const mid = Math.ceil(questionIds.length / 2);
-	return [questionIds.slice(0, mid), questionIds.slice(mid)];
-}
-
-/** A text record is fragmented only while each half stays at least this long. */
-export const FRAGMENT_MIN_CHARS = 1000;
-
-/**
- * Internal recovery bounds for one fragment, held in the FRAMED record
- * (outside arbitrary caller metadata). Caller metadata is arbitrary JSON:
- * no key inside it is reserved, trusted or inferred from. Bounds therefore
- * live in an internal wrapper field that never round-trips through caller
- * metadata, so a caller key named like any internal marker is preserved
- * verbatim and cannot spoof recovery bookkeeping.
- */
-export interface FragmentBounds {
-	/** Original (pre-fragmentation) record id. */
-	of: string;
-	/** Absolute start/end within the original text. */
-	start: number;
-	end: number;
-	/** Total length of the original text. */
-	total: number;
-}
-
-/**
- * Internal working representation of one evidence record inside the
- * recovery pipeline: the ORIGINAL caller record (id/text/metadata never
- * mutated) plus, once fragmented, the genuine bounds of this piece.
- * `frameEvidence` lifts caller records into frames; `toModelEvidence`
- * projects frames to the model-facing JSON with bounds OUTSIDE metadata.
- */
-export interface FramedEvidence {
-	record: EvidenceRecord;
-	/** Genuine recovery bounds; undefined for whole (unfragmented) records. */
-	bounds?: FragmentBounds;
-}
-
-/** Lift caller evidence records into internal frames without copying. */
-export function frameEvidence(
-	evidence: readonly EvidenceRecord[],
-): FramedEvidence[] {
-	return evidence.map((record) => ({ record }));
-}
-
-/** Project frames to the model-facing JSON array (bounds outside metadata). */
-export function toModelEvidence(frames: readonly FramedEvidence[]): JsonValue {
-	return frames.map((frame) => ({
-		id: frame.record.id,
-		text: frame.record.text,
-		...(frame.record.metadata !== undefined
-			? { metadata: frame.record.metadata }
-			: {}),
-		...(frame.bounds !== undefined
-			? { fragmentBounds: { ...frame.bounds } }
-			: {}),
-	})) as unknown as JsonValue;
-}
-
-/** Total text bytes carried by frames (capacity estimation input). */
-export function framedEvidenceBytes(frames: readonly FramedEvidence[]): number {
-	return frames.reduce((sum, f) => sum + Buffer.byteLength(f.record.text), 0);
-}
-
-export function splitPiece(
-	piece: FramedEvidence[],
-): [FramedEvidence[], FramedEvidence[]] | undefined {
-	if (piece.length > 1) {
-		const mid = Math.ceil(piece.length / 2);
-		return [piece.slice(0, mid), piece.slice(mid)];
-	}
-	const frame = piece[0];
-	if (!frame || frame.record.text.length < 2 * FRAGMENT_MIN_CHARS)
-		return undefined;
-	const r = frame.record;
-	// Genuine original bounds: inherited on recursive splits (frames carry
-	// them internally), else the whole original record. NEVER read from
-	// caller metadata — any caller key, same-named or not, is data.
-	const bounds: FragmentBounds = frame.bounds ?? {
-		of: r.id,
-		start: 0,
-		end: r.text.length,
-		total: r.text.length,
-	};
-	let mid = Math.floor(r.text.length / 2);
-	if (/[\uDC00-\uDFFF]/.test(r.text[mid])) mid++; // never split a surrogate pair
-	const part = (start: number, end: number): FramedEvidence => ({
-		// The caller record is spread verbatim: id gets the bounds-derived
-		// fragment suffix, text the slice, metadata UNTOUCHED (no internal
-		// field is written into it).
-		record: {
-			...r,
-			id: `${bounds.of}#${bounds.start + start}-${bounds.start + end}`,
-			text: r.text.slice(start, end),
-		},
-		bounds: {
-			of: bounds.of,
-			start: bounds.start + start,
-			end: bounds.start + end,
-			total: bounds.total,
-		},
-	});
-	return [[part(0, mid)], [part(mid, r.text.length)]];
 }

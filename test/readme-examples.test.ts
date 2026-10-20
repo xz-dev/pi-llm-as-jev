@@ -7,17 +7,16 @@ import test from "node:test";
 
 const root = path.resolve(import.meta.dirname, "..");
 const fixture = `
-import type { JudgmentService, JudgeRequest, EvidenceRecord } from "./judgment-client.ts";
+import type { JudgmentService, JudgeRequest } from "./judgment-client.ts";
 const calls: JudgeRequest[] = [];
 const service: JudgmentService = {
- version: 1,
+ version: 2,
  async judge(request) {
   calls.push(request);
-  return { answers: {}, dropped: [], backend: "classifier", model: "offline/fixture", stopReason: "stop", reuse: { hits: 0, joined: 0, sent: 1 } };
+  return { answers: {}, dropped: [], backend: "classifier", model: "offline/fixture", stopReason: "stop" };
  },
  async availability() { return {}; }
 };
-const evidence: EvidenceRecord[] = [{ id: "one", text: "synthetic finding" }];
 const request: JudgeRequest = { state: {}, questions: { verdict: { type: "choice", instructions: "verdict", criteria: { ship: "ship", hold: "hold", revert: "revert" } } } };
 `;
 
@@ -28,7 +27,7 @@ test("exact README snippets compile and run with explicit external bindings", as
 		const snippets = [...text.matchAll(/```ts\n([\s\S]*?)```/g)].map(
 			(match) => match[1],
 		);
-		assert.equal(snippets.length, 5, "every TypeScript fence must be covered");
+		assert.equal(snippets.length, 3, "every TypeScript fence must be covered");
 		await fs.copyFile(
 			path.join(root, "client/judgment-client.ts"),
 			path.join(dir, "judgment-client.ts"),
@@ -37,8 +36,6 @@ test("exact README snippets compile and run with explicit external bindings", as
 		const prefixes = [
 			"", // Quick start: execute with the service genuinely absent.
 			'import type { JsonObject, ClassifierQuestion, ClassifierAnswer, Usage } from "./judgment-client.ts";\n',
-			fixture,
-			"", // Review discovery: compile the additive API, run without a service.
 			fixture,
 		];
 		for (const [index, snippet] of snippets.entries()) {

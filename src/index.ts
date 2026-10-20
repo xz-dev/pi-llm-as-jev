@@ -25,6 +25,7 @@ import {
 	type JudgmentConfig,
 	type JudgmentMode,
 	type JudgmentThinkingLevel,
+	LEGACY_TIMEOUT_FIELD,
 	loadConfigSync,
 	saveConfig,
 } from "./config.js";
@@ -166,6 +167,18 @@ export default function extension(pi: ExtensionAPI): void {
 		return config;
 	}
 
+	/**
+	 * Inference-blocking settings problem, or undefined when clean. The
+	 * legacy `timeoutMs` field must be migrated explicitly; every
+	 * configuration-dependent inference path refuses until it is removed.
+	 */
+	function settingsBlock(): string | undefined {
+		const loaded = loadConfigSync(dir);
+		if (loaded.migrationRequired)
+			return `llm-as-jev.json: legacy "${LEGACY_TIMEOUT_FIELD}" requires migration before inference; remove it for the 10s/15s idle defaults or replace it with explicit timeouts slots`;
+		return undefined;
+	}
+
 	// One registration; native metadata/auth/dispatch callbacks read on demand.
 	function registerProvider(): void {
 		if (disposed || !registry) return;
@@ -173,6 +186,7 @@ export default function extension(pi: ExtensionAPI): void {
 			createEmulatedClassifierProvider({
 				registry: registry as never,
 				config: getConfig,
+				settingsError: settingsBlock,
 			}),
 		);
 	}
@@ -190,27 +204,7 @@ export default function extension(pi: ExtensionAPI): void {
 		service = createJudgmentService({
 			registry: registry as never,
 			config: getConfig,
-			// LLM default inactivity follows Pi's own HTTP idle setting (0 = disabled).
-			hostIdleTimeoutMs: () => {
-				try {
-					const value = (
-						pi as { getSettings?: () => { httpIdleTimeoutMs?: unknown } }
-					).getSettings?.()?.httpIdleTimeoutMs;
-					return typeof value === "number" &&
-						Number.isFinite(value) &&
-						value >= 0
-						? Math.floor(value)
-						: undefined;
-				} catch {
-					return undefined;
-				}
-			},
-			ledger: {
-				append: (type, data) => {
-					if (type === "llm-as-jev-ledger") pi.appendEntry(type, data);
-				},
-				branch: () => sessionManager?.getBranch(),
-			},
+			settingsBlock,
 		});
 		// Newest activation owns the handle: publish unconditionally. The
 		// identity check lives on SHUTDOWN (below) — an old runtime can never
@@ -220,8 +214,6 @@ export default function extension(pi: ExtensionAPI): void {
 		holder[SERVICE_KEY] = service;
 		registerProvider();
 	}
-
-	let sessionManager: { getBranch(): unknown[] } | undefined;
 
 	// ---- /llm-as-jev command tree: read-only overview (bare + `status`),
 	//      `llm` chat-model → thinking pickers, `classifier` native picker,
@@ -327,10 +319,12 @@ export default function extension(pi: ExtensionAPI): void {
 		}
 		// One shared availability snapshot (service owns native discovery and
 		// LLM catalog/auth checks) — no second native probe here.
+		const loaded = loadConfigSync(dir);
 		const overview = formatStatus({
 			config,
 			availability: await service.availabilityFor(config),
 			configPath: configFilePath(dir),
+			migrationRequired: loaded.migrationRequired,
 		});
 		ctx.ui.notify(overview.text, "info");
 		if (overview.warning) ctx.ui.notify(overview.warning, "warning");
@@ -527,8 +521,9 @@ export default function extension(pi: ExtensionAPI): void {
 		context = ctx;
 		bindRegistry(ctx.modelRegistry);
 		getConfig();
-		sessionManager = ctx.sessionManager as never;
-		if (service) service.refreshBranch(); // branch-only ledger restore
+		// Lifecycle navigation cancels all owned in-flight work; the stateless
+		// service restores nothing and never touches historical entries.
+		if (service) service.abortAll();
 	}
 
 	pi.on("session_start", onSessionNav);

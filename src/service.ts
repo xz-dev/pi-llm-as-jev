@@ -1,13 +1,14 @@
 /**
- * Judgment service assembly (task 5.3, 4.6, 4.7). Owns backend selection
- * (auto|classifier|llm), the exact-match raw cache, capacity-aware question and
- * ordered-evidence subdivision with Unicode-safe fragments, Jev threshold
- * policy, known-key redaction, session-generation/cancellation isolation and
- * ledger persistence. `judge()` NEVER throws: every failure resolves through
+ * Stateless judgment service (version two). Owns backend selection
+ * (auto|classifier|llm), per-attempt progress-idle and optional hard clocks,
+ * Jev threshold policy, known-key redaction and caller/lifecycle
+ * cancellation. NO completed-answer caching, in-flight joins, evidence
+ * subdivision, checkpoints, ledgers, learned capacity or attempt accounting:
+ * identical calls perform independent inference and callers own all durable
+ * business state. `judge()` NEVER throws: every failure resolves through
  * `stopReason`/`errorMessage`.
  */
 
-import { randomUUID } from "node:crypto";
 import type {
 	Api,
 	ClassifierApi,
@@ -20,21 +21,11 @@ import type {
 import type {
 	CapacityDisclosure,
 	ClassifierAnswer,
-	JsonObject,
-	JsonValue,
 	JudgeOptions,
 	JudgeRequest,
 	JudgeResult,
 	JudgmentService,
-	ReviewAttemptObservation,
-	ReviewDiagnostics,
-	ReviewOptions,
-	ReviewResult,
-	ReviewService,
-	ReviewStageProgress,
-	ReviewStageProjection,
 	ThresholdRule,
-	Usage,
 } from "../client/judgment-client.ts";
 import {
 	classifyWithModel,
@@ -48,66 +39,19 @@ import {
 	llmClassify,
 } from "./backend-llm.js";
 import {
-	freshEligible,
-	freshTokenKey,
-	judgmentKey,
-	newCache,
-	noteFresh,
-	type PendingJudgment,
-	pendingKey,
-	type RawJudgmentCache,
-	settlePending,
-	trackPending,
-} from "./cache.js";
-import {
-	type CapacityConstraint,
-	type CapacityLimits,
-	type CapacityProfile,
-	channelKey,
-	digest,
-	LLM_ENVELOPE_OVERHEAD_BYTES,
-	newCapacityProfile,
-	observe as observeCapacity,
-	overflowConstraint,
-	PRIOR_TOKENS_PER_BYTE,
-} from "./capacity.js";
-import type {
-	JudgmentConfig,
-	JudgmentMode,
-	JudgmentThinkingLevel,
+	type EffectiveTimeouts,
+	type JudgmentConfig,
+	type JudgmentMode,
+	type JudgmentThinkingLevel,
+	resolveTimeouts,
 } from "./config.js";
-import {
-	DEFAULT_HOST_IDLE_TIMEOUT_MS,
-	DEFAULT_NATIVE_TIMEOUT_MS,
-} from "./config.js";
-import {
-	type LedgerRecord,
-	type ReviewStageRecord,
-	restoreLedger,
-	writeLedger,
-} from "./ledger.js";
-import { observeLlmRegistry } from "./llm-observations.js";
-import {
-	type FramedEvidence,
-	framedEvidenceBytes,
-	frameEvidence,
-	isContextOverflow,
-	sizeOf,
-	splitPiece,
-	splitQuestions,
-	toModelEvidence,
-} from "./pipeline.js";
+import { isContextOverflow, publicErrorMessage } from "./pipeline.js";
 import { accepted, type ThresholdPolicy, validateAnswer } from "./policy.js";
 import {
 	type AuthResolvingRegistry,
 	redactJson,
 	redactString,
 } from "./redaction.js";
-import {
-	collectAttempts,
-	diagnostics,
-	emptyDiagnostics,
-} from "./review-observations.js";
 
 type AnyModel = Model<Api>;
 type AnyClassifierModel = ClassifierModel<ClassifierApi>;
@@ -125,50 +69,98 @@ export interface ServiceRegistry
 	): Promise<readonly AnyClassifierModel[]>;
 }
 
-export interface LedgerHooks {
-	/** Two-argument pi.appendEntry(customType, data). */
-	append: ((type: string, data: LedgerRecord) => void) | undefined;
-	/** Active-branch entries for restore (lifecycle navigation only). */
-	branch: () => Iterable<unknown> | undefined;
-}
-
 export interface ServiceRuntime {
 	registry: ServiceRegistry;
 	config: () => JudgmentConfig;
-	ledger: LedgerHooks;
 	/** Optional embedding transport, forwarded through Pi's public native fetch option. */
 	nativeFetch?: typeof globalThis.fetch;
-	/** Fresh secrets snapshot; recomputed lazily by the lifecycle hook. */
+	/** Fresh known-secrets snapshot; recomputed lazily by the lifecycle hook. */
 	secrets?: () => readonly string[];
-	/** Pi's `httpIdleTimeoutMs` (0 = disabled); used as the LLM default inactivity window. */
-	hostIdleTimeoutMs?: () => number | undefined;
+	/**
+	 * Inference-blocking settings problem (e.g. legacy `timeoutMs` migration
+	 * required). When set, `judge()` returns an actionable error and dispatches
+	 * nothing; read-only status paths report it without rewriting settings.
+	 */
+	settingsBlock?: () => string | undefined;
 }
 
+/** Abort reason marking a generation-progress idle expiry. */
+const IDLE_EXPIRED = Symbol("generation progress idle timeout");
+/** Abort reason marking the whole-model-attempt hard expiry. */
+const HARD_EXPIRED = Symbol("model attempt hard timeout");
+/** Abort reason marking attempt retirement after failover. */
+const ATTEMPT_RETIRED = Symbol("backend attempt retired after failover");
+
 /**
- * Effective duration for one call. The caller's explicit number or the
- * configured override wins for every backend. Otherwise the default depends
- * on the backend: native 60 s absolute; LLM Pi's HTTP idle timeout (0 means
- * disabled, mapped to the timer maximum).
+ * One admitted model attempt's clocks (shared by the service and the direct
+ * emulated-provider entry so both obey the same waiting semantics). The idle
+ * clock is armed at construction and re-armed ONLY by `progress()` — a
+ * nonempty text/thinking/tool-argument delta or a validated completed
+ * question answer. The optional hard clock is armed once and never renews.
+ * Both abort `controller`, so every wait in the attempt observes the same
+ * combined signal; nested adapters receive that signal and must not start a
+ * second competing hard budget.
  */
-export function resolveTimeoutMs(
-	config: Pick<JudgmentConfig, "timeoutMs">,
-	requested: number | undefined,
-	backend: "classifier" | "llm" | undefined,
-	hostIdle: number | undefined,
-): number {
-	const explicit = requested ?? config.timeoutMs;
-	if (explicit !== undefined) return explicit;
-	if (backend === "llm") {
-		const idle = hostIdle ?? DEFAULT_HOST_IDLE_TIMEOUT_MS;
-		return idle === 0 ? 2_147_483_647 : idle;
+export interface AttemptClocks {
+	/** Combined caller/idle/hard signal for the whole attempt. */
+	readonly signal: AbortSignal;
+	/** True once idle expired (and hard/caller did not fire first). */
+	idleExpired(): boolean;
+	/** True once the hard cap expired. */
+	hardExpired(): boolean;
+	/** Record genuine generation progress; renews the idle clock only. */
+	progress(): void;
+	/** Stop both timers; the attempt settled. */
+	dispose(): void;
+}
+
+export function newAttemptClocks(
+	effective: EffectiveTimeouts,
+	callerSignal: AbortSignal | undefined,
+): AttemptClocks {
+	const controller = new AbortController();
+	let idleHit = false;
+	let hardHit = false;
+	let settled = false;
+	let idleTimer: ReturnType<typeof setTimeout> | undefined;
+	const onCallerAbort = () => controller.abort(callerSignal?.reason);
+	if (callerSignal) {
+		if (callerSignal.aborted) onCallerAbort();
+		else callerSignal.addEventListener("abort", onCallerAbort, { once: true });
 	}
-	return DEFAULT_NATIVE_TIMEOUT_MS;
+	const armIdle = () => {
+		if (settled) return;
+		if (idleTimer !== undefined) clearTimeout(idleTimer);
+		idleTimer = setTimeout(() => {
+			idleHit = true;
+			controller.abort(IDLE_EXPIRED);
+		}, effective.idleTimeoutMs);
+	};
+	const hardTimer =
+		effective.modelTimeoutMs !== undefined
+			? setTimeout(() => {
+					hardHit = true;
+					controller.abort(HARD_EXPIRED);
+				}, effective.modelTimeoutMs)
+			: undefined;
+	armIdle();
+	return {
+		signal: controller.signal,
+		idleExpired: () => idleHit,
+		hardExpired: () => hardHit,
+		progress: armIdle,
+		dispose: () => {
+			settled = true;
+			if (idleTimer !== undefined) clearTimeout(idleTimer);
+			if (hardTimer !== undefined) clearTimeout(hardTimer);
+			if (callerSignal)
+				callerSignal.removeEventListener("abort", onCallerAbort);
+		},
+	};
 }
 
 /** Error thrown internally for invalid requests; converted to a result, never surfaced. */
 class InvalidRequestError extends Error {}
-const DEADLINE_EXPIRED = Symbol("judgment deadline expired");
-const ATTEMPT_RETIRED = Symbol("backend attempt retired after failover");
 
 type Candidate =
 	| { backend: "classifier"; model: AnyClassifierModel }
@@ -208,38 +200,22 @@ const resultShell = (
 	backend,
 	model,
 	stopReason: "stop",
-	reuse: { hits: 0, joined: 0, sent: 0 },
 });
 
-const emptyUsage = (): Usage => ({
-	input: 0,
-	output: 0,
-	cacheRead: 0,
-	cacheWrite: 0,
-	totalTokens: 0,
-	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-});
+/** Option keys removed in version two: presence is an explicit error. */
+const REMOVED_OPTION_FIELDS: readonly (keyof JudgeOptions)[] = [
+	"timeoutMs",
+	"fresh",
+	"cache",
+	"planStages",
+	"projectStage",
+	"projectionRevision",
+	"checkpoint",
+	"onProgress",
+];
 
-function sumUsage(usages: Usage[]): Usage {
-	const total = emptyUsage();
-	for (const usage of usages) {
-		total.input += usage.input;
-		total.output += usage.output;
-		total.cacheRead += usage.cacheRead;
-		total.cacheWrite += usage.cacheWrite;
-		total.totalTokens += usage.totalTokens;
-		total.cost.input += usage.cost.input;
-		total.cost.output += usage.cost.output;
-		total.cost.cacheRead += usage.cost.cacheRead;
-		total.cost.cacheWrite += usage.cost.cacheWrite;
-		total.cost.total += usage.cost.total;
-		if (usage.cacheWrite1h !== undefined)
-			total.cacheWrite1h = (total.cacheWrite1h ?? 0) + usage.cacheWrite1h;
-		if (usage.reasoning !== undefined)
-			total.reasoning = (total.reasoning ?? 0) + usage.reasoning;
-	}
-	return total;
-}
+const validTimerField = (v: unknown): v is number =>
+	typeof v === "number" && Number.isInteger(v) && v > 0 && v <= 2_147_483_647;
 
 /** Validate question definitions; returns a rejection message or undefined. */
 function validateQuestion(id: string, q: unknown): string | undefined {
@@ -305,7 +281,6 @@ function assertJsonValue(value: unknown, path: string, depth = 0): void {
 		return;
 	}
 	if (typeof value === "object") {
-		// hasOwn object identity set detects cycles without risking stack overflow.
 		const seen = seenObjects.get(value);
 		if (seen) throw new InvalidRequestError(`${path} contains a cyclic value`);
 		seenObjects.set(value, true);
@@ -321,13 +296,16 @@ function assertJsonValue(value: unknown, path: string, depth = 0): void {
 }
 const seenObjects = new WeakMap<object, true>();
 
-function validateRequest(
-	req: unknown,
-	allowEmptyQuestions = false,
-): JudgeRequest {
+function validateRequest(req: unknown): JudgeRequest {
 	if (req === null || typeof req !== "object" || Array.isArray(req))
 		throw new InvalidRequestError("request is not an object");
 	const request = req as Record<string, unknown>;
+	// Removed fields are rejected explicitly, never silently ignored: callers
+	// must pack facts into `state`.
+	if (Object.hasOwn(request, "evidence"))
+		throw new InvalidRequestError(
+			'"evidence" was removed in service version two; pack evidence records into state',
+		);
 	const state = request.state;
 	if (state === null || typeof state !== "object" || Array.isArray(state))
 		throw new InvalidRequestError("state is not a JSON object");
@@ -339,52 +317,24 @@ function validateRequest(
 		Array.isArray(questions)
 	)
 		throw new InvalidRequestError("questions is not an object");
+	assertJsonValue(questions, "questions");
 	const questionIds = Object.keys(questions);
-	if (questionIds.length === 0 && !allowEmptyQuestions)
+	if (questionIds.length === 0)
 		throw new InvalidRequestError("questions is empty");
 	for (const id of questionIds) {
 		const problem = validateQuestion(id, questions[id]);
 		if (problem) throw new InvalidRequestError(problem);
 	}
-	const evidence = request.evidence;
-	if (evidence !== undefined) {
-		if (!Array.isArray(evidence))
-			throw new InvalidRequestError("evidence is not an array");
-		const seen = new Set<string>();
-		for (const record of evidence) {
-			if (record === null || typeof record !== "object")
-				throw new InvalidRequestError("evidence record is not an object");
-			const r = record as Record<string, unknown>;
-			if (typeof r.id !== "string" || r.id.length === 0)
-				throw new InvalidRequestError(
-					"evidence record lacks a non-empty string id",
-				);
-			if (seen.has(r.id))
-				throw new InvalidRequestError(`duplicate evidence id "${r.id}"`);
-			seen.add(r.id);
-			if (typeof r.text !== "string")
-				throw new InvalidRequestError(
-					`evidence record "${r.id}" lacks string text`,
-				);
-			if (
-				r.metadata !== undefined &&
-				(r.metadata === null ||
-					typeof r.metadata !== "object" ||
-					Array.isArray(r.metadata))
-			)
-				throw new InvalidRequestError(
-					`evidence record "${r.id}" metadata is not an object`,
-				);
-			// F5: cyclic / non-JSON metadata is a structured invalid request,
-			// never a downstream crash.
-			if (r.metadata !== undefined)
-				assertJsonValue(r.metadata, `evidence[${r.id}].metadata`);
-		}
-	}
 	return request as unknown as JudgeRequest;
 }
 
-function validatePolicy(opts: JudgeOptions): void {
+function validatePolicy(opts: Record<string, unknown>): void {
+	for (const field of REMOVED_OPTION_FIELDS) {
+		if (Object.hasOwn(opts, field))
+			throw new InvalidRequestError(
+				`option "${field}" was removed in service version two`,
+			);
+	}
 	if (opts.minConfidence !== undefined) {
 		const value = opts.minConfidence;
 		if (
@@ -400,7 +350,10 @@ function validatePolicy(opts: JudgeOptions): void {
 	if (opts.thresholds !== undefined) {
 		if (opts.thresholds === null || typeof opts.thresholds !== "object")
 			throw new InvalidRequestError("thresholds is not an object");
-		for (const [id, rule] of Object.entries(opts.thresholds)) {
+		assertJsonValue(opts.thresholds, "thresholds");
+		for (const [id, rule] of Object.entries(
+			opts.thresholds as Record<string, unknown>,
+		)) {
 			if (rule === null || typeof rule !== "object")
 				throw new InvalidRequestError(
 					`threshold rule for "${id}" is not an object`,
@@ -428,15 +381,11 @@ function validatePolicy(opts: JudgeOptions): void {
 			}
 		}
 	}
-	if (opts.timeoutMs !== undefined) {
-		if (
-			typeof opts.timeoutMs !== "number" ||
-			!Number.isFinite(opts.timeoutMs) ||
-			opts.timeoutMs <= 0 ||
-			!Number.isInteger(opts.timeoutMs)
-		)
+	for (const field of ["idleTimeoutMs", "modelTimeoutMs"] as const) {
+		const v = opts[field];
+		if (v !== undefined && !validTimerField(v))
 			throw new InvalidRequestError(
-				"timeoutMs must be a positive finite integer (milliseconds)",
+				`${field} must be a positive finite integer (milliseconds) within the timer range`,
 			);
 	}
 }
@@ -463,179 +412,36 @@ function crossValidateThresholds(
 }
 
 /**
- * Race backend selection (lookup + discovery) against the caller deadline
- * and abort signal so discovery can never hang the public boundary. A late
- * registry resolution after timeout/abort is dropped. Caller abort wins over
- * deadline only when the deadline has not already fired.
- */
-async function guardSelection<T>(
-	promise: Promise<T>,
-	deadline: number | null,
-	signal: AbortSignal | undefined,
-): Promise<{ value: T } | { timeout: true } | { aborted: true }> {
-	// The caller already started this work while evaluating the argument.
-	// Keep rejection handling even when the wall-clock fast path wins.
-	void promise.catch(() => {});
-	const deadlineHit = () =>
-		(deadline !== null && Date.now() >= deadline) ||
-		signal?.reason === DEADLINE_EXPIRED;
-	if (deadlineHit()) return { timeout: true };
-	if (signal?.aborted) return { aborted: true };
-	if (deadline === null && !signal) return { value: await promise };
-	let timer: ReturnType<typeof setTimeout> | undefined;
-	let onAbort: (() => void) | undefined;
-	try {
-		return (await Promise.race([
-			promise.then((value) =>
-				deadlineHit()
-					? ({ timeout: true } as const)
-					: signal?.aborted
-						? ({ aborted: true } as const)
-						: ({ value } as const),
-			),
-			new Promise<{ timeout: true } | { aborted: true }>((resolve) => {
-				if (deadline !== null) {
-					timer = setTimeout(
-						() => resolve({ timeout: true }),
-						Math.max(0, deadline - Date.now()),
-					);
-				}
-				if (signal) {
-					if (signal.aborted) {
-						resolve(deadlineHit() ? { timeout: true } : { aborted: true });
-					} else {
-						onAbort = () =>
-							resolve(deadlineHit() ? { timeout: true } : { aborted: true });
-						signal.addEventListener("abort", onAbort, { once: true });
-					}
-				}
-			}),
-		])) as { value: T } | { timeout: true } | { aborted: true };
-	} finally {
-		if (timer !== undefined) clearTimeout(timer);
-		if (onAbort !== undefined && signal) {
-			signal.removeEventListener("abort", onAbort);
-		}
-	}
-}
-
-/**
- * Bound one wait by an optional ABSOLUTE deadline and abort signal without
+ * Race a promise against an attempt's combined clock signal without
  * canceling the underlying work: a hung registry/auth/discovery promise can
- * never hold the public boundary (F5). Resolves `undefined` on timeout or
- * abort; rejections propagate to the caller's catch boundary.
+ * never hold the public boundary. `undefined` means the attempt ended
+ * (idle/hard/caller); rejections propagate to the caller's catch boundary.
  */
 async function bounded<T>(
 	promise: Promise<T>,
-	deadline: number | null | undefined,
 	signal: AbortSignal | undefined,
 ): Promise<T | undefined> {
 	void promise.catch(() => {});
-	if (
-		signal?.aborted ||
-		(typeof deadline === "number" && Date.now() >= deadline)
-	)
-		return undefined;
-	const ms =
-		typeof deadline === "number" ? Math.ceil(deadline - Date.now()) : null;
-	if (ms === null && !signal) return await promise;
-	let timer: ReturnType<typeof setTimeout> | undefined;
+	if (!signal) return await promise;
+	if (signal.aborted) return undefined;
 	let onAbort: (() => void) | undefined;
 	try {
 		const raced = (await Promise.race([
 			promise.then((value) => ({ value }) as const),
 			new Promise<{ dropped: true }>((resolve) => {
-				if (ms !== null)
-					timer = setTimeout(() => resolve({ dropped: true }), ms);
-				if (signal) {
-					if (signal.aborted) resolve({ dropped: true });
-					else {
-						onAbort = () => resolve({ dropped: true });
-						signal.addEventListener("abort", onAbort, { once: true });
-					}
-				}
+				onAbort = () => resolve({ dropped: true });
+				signal.addEventListener("abort", onAbort, { once: true });
 			}),
 		])) as { value: T } | { dropped: true };
 		return "value" in raced ? raced.value : undefined;
 	} finally {
-		if (timer !== undefined) clearTimeout(timer);
-		if (onAbort !== undefined && signal)
-			signal.removeEventListener("abort", onAbort);
+		if (onAbort !== undefined) signal.removeEventListener("abort", onAbort);
 	}
 }
 
 // ---------------------------------------------------------------------------
 // Service instance
 // ---------------------------------------------------------------------------
-
-/**
- * Request-owned review state (reviewVersion 1). The attempt collector is
- * owned by this captured generation: a late adapter event after the request
- * settled, or after a branch switch, is dropped and never written onto a
- * newer branch. Observer callbacks are isolated - they cannot throw into,
- * hang or mutate the review's result.
- */
-interface ReviewFlight {
-	options: ReviewOptions;
-	unresolved: Set<string>;
-	/** Observed transport attempts, in observation order. */
-	attempts: ReviewAttemptObservation[];
-	/** Operation id for attempt identities. */
-	operationId: string;
-	/** Closed at settlement: late adapter events cannot mutate returned diagnostics. */
-	settled: boolean;
-	/** False once any dispatch returned without the observation contract. */
-	observationSupported: boolean;
-	/** Durable completed-stage progress views for the result. */
-	progress: ReviewStageProgress[];
-	presplits: number;
-	rejectedReuses: number;
-	channel?: string;
-}
-
-interface InFlight {
-	generation: number;
-	/** Projected input dimensions for each logical backend dispatch, not SDK HTTP attempts. */
-	inputDimensions?: NonNullable<JudgeResult["inputDimensions"]>;
-	timeoutMs?: number;
-	/** Live deadline/signal guard, including cancellation inside synchronous callbacks. */
-	canPublish?: () => boolean;
-	/**
-	 * Review-mode extensions (reviewVersion 1). Undefined for legacy judge:
-	 * no observation collection, no early durable stage commits.
-	 */
-	review?: ReviewFlight;
-	/** Cache instance captured at request start (F4): all writes go through
-	 * this reference and are additionally generation-checked, so a stale
-	 * completion can never touch a newer branch's live cache. */
-	cacheRef: RawJudgmentCache;
-	/** Set once failover moves on: fences late publication from this attempt. */
-	retired?: boolean;
-	retire?: () => void;
-	/** A local orchestration fault ended the attempt: never failover permission. */
-	localFault?: boolean;
-	/** A joined owner's work ended aborted while this caller stayed live. */
-	sharedAbort?: boolean;
-	/**
-	 * Request-owned judgment commits (F4): buffered per stage and flushed to
-	 * the ledger only when the request's overall outcome is known — never on
-	 * abort, and only while the request still owns the current generation.
-	 */
-	bufferedJudgments: {
-		key: string;
-		answer: ClassifierAnswer;
-		backend: "classifier" | "llm";
-		model: string;
-		thinkingLevel: string;
-		fresh?: string;
-	}[];
-}
-
-/** Operation-level validated input, shared by every backend attempt. */
-interface Admitted {
-	request: JudgeRequest;
-	policy: ThresholdPolicy;
-}
 
 /** One backend attempt's result and whether it permits the one switch. */
 interface AttemptOutcome {
@@ -646,136 +452,51 @@ interface AttemptOutcome {
 	unavailable?: boolean;
 }
 
-export interface CreatedService extends ReviewService {
+export interface CreatedService extends JudgmentService {
 	/** Internal status view: reuse its already-admitted settings snapshot. */
 	availabilityFor(
 		config: JudgmentConfig,
 	): Promise<{ classifier?: string; llm?: string }>;
-	/** Lifecycle/config hook for src/index.ts (documented internal API). */
-	refreshBranch(): void;
-	/** Swap runtime config (7.2 re-registration path) without version bump. */
-	updateConfig(config: JudgmentConfig): void;
+	/** Lifecycle hook: cancel all owned in-flight work (navigation/shutdown). */
+	abortAll(): void;
 }
 
 export function createJudgmentService(runtime: ServiceRuntime): CreatedService {
-	let generation = 0;
-	let cache: RawJudgmentCache = newCache(generation);
-	/** Durable review-stage checkpoints restored from the active branch. */
-	let reviewCheckpoints: ReviewStageRecord[] = [];
-	const durableAnswers = new Map<string, string>();
-	/** Instance nonce prevents attempt-id collisions across reloads or clock rollback. */
-	const reviewInstance = randomUUID();
-	let reviewSerial = 0;
-	const capacity = new Map<string, CapacityProfile>();
 	const active = new Set<AbortController>();
-	let secrets: readonly string[] = [];
+	let secrets: readonly string[] = runtime.secrets?.() ?? [];
 
 	/**
-	 * Operation-scoped known-key resolution through Pi only. The SELECTED
-	 * native and chat providers are always included (F1): a chat-only
-	 * inventory like `getAll()`/`getProviders()` can omit classifier-only
-	 * built-ins, so selection-derived ids are resolved explicitly. Each
-	 * provider is looked up once per operation and every wait is bounded by
-	 * the waiting attempt's deadline/abort (F5). A lookup that already
-	 * exhausted an earlier attempt's window is not awaited again, so one hung
-	 * provider cannot also consume the alternate's fresh window; a key it
-	 * yields later is still added to the redaction set.
+	 * Resolve the SELECTED provider's credential through Pi only, bounded by
+	 * the attempt's own clocks. Readiness never waits on unrelated providers;
+	 * a late-resolving key still joins the redaction set.
 	 */
-	function secretLookups() {
-		const lookups = new Map<string, Promise<void>>();
-		const settled = new Set<string>();
-		const exhausted = new Set<string>();
-		return async (
-			selected: readonly string[],
-			deadline: number | null,
-			signal: AbortSignal | undefined,
-			required: readonly string[],
-		): Promise<void> => {
-			const ids = new Set<string>();
-			for (const provider of runtime.registry.getProviders?.() ?? [])
-				ids.add(provider.id);
-			for (const id of selected) ids.add(id);
-			const waiting = [...ids].filter(
-				(id) => required.includes(id) || !exhausted.has(id),
-			);
-			for (const id of waiting) {
-				if (lookups.has(id)) continue;
-				lookups.set(
-					id,
-					(async () => {
-						try {
-							const key = (await runtime.registry.getAuth(id))?.auth?.apiKey;
-							if (typeof key === "string" && key.length > 0)
-								secrets = [...new Set([...secrets, key])];
-						} catch {
-							// Auth resolution failure never breaks judgment; skip provider.
-						} finally {
-							settled.add(id);
-						}
-					})(),
-				);
-			}
-			await bounded(
-				Promise.all(waiting.map((id) => lookups.get(id))),
-				deadline,
+	async function resolveSelectedSecret(
+		providerId: string,
+		signal: AbortSignal,
+	): Promise<boolean> {
+		try {
+			const auth = await bounded(
+				runtime.registry.getAuth(providerId).then((resolved) => {
+					// Retain even late keys for redaction, never for late dispatch.
+					const key = resolved?.auth?.apiKey;
+					if (typeof key === "string" && key.length > 0)
+						secrets = [...new Set([...secrets, key])];
+					return resolved;
+				}),
 				signal,
 			);
-			for (const id of waiting) if (!settled.has(id)) exhausted.add(id);
-		};
+			// Pi resolves undefined for unknown/unconfigured providers. A
+			// resolved auth object without an apiKey is valid (e.g. local/AWS).
+			return auth?.auth !== undefined;
+		} catch {
+			return false;
+		}
 	}
 
-	/** Lifecycle navigation: new cache from the active branch only. */
-	function refreshBranch(): void {
+	/** Lifecycle navigation: cancel owned work; no state to restore. */
+	function abortAll(): void {
 		for (const controller of active) controller.abort();
-		generation += 1;
-		cache = newCache(generation);
-		capacity.clear();
-		reviewCheckpoints = [];
-		durableAnswers.clear();
-		const branch = runtime.ledger.branch();
-		if (branch) {
-			const restored = restoreLedger(branch);
-			for (const [key, answer] of restored.answers) {
-				cache.answers.set(key, answer);
-				durableAnswers.set(key, digest(answer));
-			}
-			for (const [token, keys] of restored.fresh) cache.fresh.set(token, keys);
-			for (const envelope of restored.rejected) cache.rejected.add(envelope);
-			for (const [channel, attempts] of restored.capacity) {
-				const profile = capacity.get(channel) ?? newCapacityProfile();
-				for (const attempt of attempts)
-					observeCapacity(profile, {
-						outcome: attempt.outcome,
-						inputTokens: attempt.inputTokens,
-						stateBytes: attempt.stateBytes,
-						questionBytes: attempt.questionBytes,
-						longestQuestionBytes: attempt.longestQuestionBytes,
-					});
-				capacity.set(channel, profile);
-			}
-			reviewCheckpoints = restored.reviewStages;
-		}
-	}
-
-	function updateConfig(config: JudgmentConfig): void {
-		// Model/level changes alter identity keys; stale identity cannot be
-		// re-discovered under the first model's name, so the cache just misses.
-		void config;
-	}
-
-	function channelProfile(
-		backend: "classifier" | "llm",
-		model: string,
-		transport?: string,
-		create = true,
-	): CapacityProfile {
-		const key = channelKey(backend, transport ?? model);
-		let profile = capacity.get(key);
-		if (!profile) {
-			profile = newCapacityProfile();
-			if (create) capacity.set(key, profile);
-		}
-		return profile;
+		secrets = runtime.secrets?.() ?? secrets;
 	}
 
 	/**
@@ -806,20 +527,58 @@ export function createJudgmentService(runtime: ServiceRuntime): CreatedService {
 			: { error: native.error };
 	}
 
-	/** Read-only view: the first usable candidate in the configured order. */
+	/** Read-only candidate setup uses its own clocks and selected-provider readiness. */
+	async function probeCandidate(
+		config: JudgmentConfig,
+		backend: "classifier" | "llm",
+		signal?: AbortSignal,
+	): Promise<Candidate> {
+		if (signal?.aborted) return { error: "aborted" };
+		const clocks = newAttemptClocks(
+			resolveTimeouts(config, backend, undefined),
+			signal,
+		);
+		try {
+			const candidate = await bounded(
+				(async () => {
+					const resolved = await resolveCandidate(
+						config,
+						backend,
+						clocks.signal,
+					);
+					if (clocks.signal.aborted || "error" in resolved) return resolved;
+					return (await resolveSelectedSecret(
+						resolved.model.provider,
+						clocks.signal,
+					))
+						? resolved
+						: { error: "selected provider authentication is unavailable" };
+				})(),
+				clocks.signal,
+			);
+			if (signal?.aborted) return { error: "aborted" };
+			return candidate ?? { error: "backend selection timed out" };
+		} catch (error) {
+			return {
+				error: publicErrorMessage(
+					error instanceof Error ? error.message : String(error),
+				),
+			};
+		} finally {
+			clocks.dispose();
+		}
+	}
+
+	/** Read-only view: the first ready candidate in the configured order. */
 	async function resolveBackend(
 		config: JudgmentConfig,
 		signal: AbortSignal | undefined,
 	): Promise<Candidate> {
 		const route = backendRoute(config.mode);
-		if (route.length === 1) return resolveCandidate(config, route[0], signal);
 		for (const backend of route) {
-			try {
-				const candidate = await resolveCandidate(config, backend, signal);
-				if (!("error" in candidate)) return candidate;
-			} catch {
-				// An unusable preferred candidate leaves the alternate to report.
-			}
+			const candidate = await probeCandidate(config, backend, signal);
+			if (signal?.aborted) return { error: "aborted" };
+			if (!("error" in candidate) || route.length === 1) return candidate;
 		}
 		return { error: unavailableSummary(config.mode) };
 	}
@@ -839,246 +598,93 @@ export function createJudgmentService(runtime: ServiceRuntime): CreatedService {
 	}
 
 	function modelIdentity(
-		backend: "classifier" | "llm",
+		_backend: "classifier" | "llm",
 		model: AnyClassifierModel | AnyModel,
 	): string {
-		return backend === "classifier"
-			? `${(model as AnyClassifierModel).provider}/${(model as AnyClassifierModel).id}`
-			: `${(model as AnyModel).provider}/${(model as AnyModel).id}`;
+		return `${model.provider}/${model.id}`;
 	}
 
 	/**
-	 * Declared limits with their source. Channel constants are built-in
-	 * declarations, not verified provider facts: OpenRouter's Jev 1.13 page
-	 * states a 32,000-token context window; the TypeSafe direct figures are
-	 * carried from earlier configuration and remain unverified in docs.
+	 * Declared limits with their source (capacity v2). An exact configured
+	 * override wins; otherwise model metadata (`contextWindow`); otherwise
+	 * nothing. No built-in channel constants or learned values.
 	 */
 	function contextLimitsWithSource(
 		model: AnyClassifierModel | AnyModel,
 		config: JudgmentConfig,
-		review = false,
-	): { limits?: CapacityLimits; source: CapacityDisclosure["limitSource"] } {
+	): {
+		limits?: CapacityDisclosure["limits"];
+		source: CapacityDisclosure["limitSource"];
+	} {
 		const ref = `${model.provider}/${model.id}`;
 		if (config.contextLimits && Object.hasOwn(config.contextLimits, ref))
 			return { limits: { ...config.contextLimits[ref] }, source: "override" };
-		if (review && /^jev(?:-|$)/.test(model.id.replace(/^typesafe\//, ""))) {
-			const base = model.baseUrl.replace(/\/+$/, "");
-			if (
-				model.api === "typesafe-system-one" &&
-				[
-					"https://api.typesafe.ai/v1",
-					"https://api.typesafe.ai/v1/systemone",
-				].includes(base)
-			)
-				return {
-					limits: { request: 64000, stateAndLongestQuestion: 32000 },
-					source: "channel",
-				};
-			if (
-				(model.api === "typesafe-system-one" ||
-					model.api === "openrouter-system-one") &&
-				[
-					"https://openrouter.ai/api/v1",
-					"https://openrouter.ai/api/v1/systemone",
-				].includes(base)
-			)
-				return {
-					limits: { request: 32000, stateAndLongestQuestion: 32000 },
-					source: "channel",
-				};
-		}
 		const window = model.contextWindow;
 		return typeof window === "number" && window > 0
 			? { limits: { contextWindow: window }, source: "model" }
 			: { source: "none" };
 	}
 
-	function contextLimits(
-		model: AnyClassifierModel | AnyModel,
-		config: JudgmentConfig,
-		review = false,
-	): CapacityLimits | undefined {
-		return contextLimitsWithSource(model, config, review).limits;
-	}
-
-	/** Capacity block for disclosure: declared limits + current calibration. */
+	/** Capacity block for disclosure: declared limits only (version two). */
 	function capacityDisclosure(
 		backend: "classifier" | "llm",
 		model: AnyClassifierModel | AnyModel,
 		modelId: string,
 		config: JudgmentConfig,
-		profile: CapacityProfile,
-		review: boolean,
 	): CapacityDisclosure {
-		const { limits, source } = contextLimitsWithSource(model, config, review);
+		const { limits, source } = contextLimitsWithSource(model, config);
 		return {
 			backend,
 			model: modelId,
 			limits: { ...limits },
 			limitSource: source,
-			tokensPerByte: profile.tokensPerByte ?? PRIOR_TOKENS_PER_BYTE,
-			prior: profile.tokensPerByte === undefined,
-			envelopeOverheadBytes:
-				backend === "llm" ? LLM_ENVELOPE_OVERHEAD_BYTES : 0,
 		};
 	}
 
 	const service: CreatedService = {
-		version: 1,
-		reviewVersion: 1,
-		reviewCacheVersion: 1,
-		reviewStagesVersion: 1,
-		capacityVersion: 1,
-		refreshBranch,
-		updateConfig,
+		version: 2,
+		capacityVersion: 2,
+		abortAll,
 
 		async describeSelection(opts) {
 			if (opts?.signal?.aborted) return { error: "aborted" };
-			// Read-only: current snapshot, bounded by the configured timeout, no
-			// inference, no cache or ledger writes. Limits are DECLARED values.
-			const config = structuredClone(runtime.config());
-			// Setup/discovery is always bounded: explicit override or the native default.
-			const budget = resolveTimeoutMs(config, undefined, undefined, undefined);
-			const deadline = budget !== undefined ? Date.now() + budget : null;
+			// Read-only current snapshot; every candidate owns fresh setup clocks.
 			try {
-				const raced = await guardSelection(
-					resolveBackend(config, opts?.signal),
-					deadline,
-					opts?.signal,
-				);
-				if ("timeout" in raced) return { error: "backend selection timed out" };
-				if ("aborted" in raced) return { error: "aborted" };
-				if ("error" in raced.value) return { error: raced.value.error };
-				const { backend, model } = raced.value;
+				const config = structuredClone(runtime.config());
+				const resolved = await resolveBackend(config, opts?.signal);
+				if ("error" in resolved)
+					return { error: redactString(resolved.error, secrets) };
+				const { backend, model } = resolved;
 				const modelId = modelIdentity(backend, model);
-				// judge() and review() calibrate different channels and only the
-				// review path applies built-in channel constants: disclose the one asked for.
-				const review = opts?.path === "review";
-				const profile = channelProfile(
-					backend,
-					modelId,
-					review ? digest({ model }) : undefined,
-					false,
-				);
-				return capacityDisclosure(
-					backend,
-					model,
-					modelId,
-					config,
-					profile,
-					review,
-				);
+				return capacityDisclosure(backend, model, modelId, config);
 			} catch (error) {
 				return {
 					error: redactString(
-						error instanceof Error ? error.message : String(error),
+						publicErrorMessage(
+							error instanceof Error ? error.message : String(error),
+						),
 						secrets,
 					),
 				};
 			}
 		},
 
-		async review(rawReq, rawOpts): Promise<ReviewResult> {
-			const controller = new AbortController();
-			active.add(controller);
+		async availability() {
 			try {
-				const signal = rawOpts?.signal
-					? AbortSignal.any([rawOpts.signal, controller.signal])
-					: controller.signal;
-				// Transport observations span the operation (shared ordinals);
-				// semantic progress/unresolved/channel belong to each attempt.
-				const attempts: ReviewAttemptObservation[] = [];
-				const operationId = `review-${reviewInstance}-${++reviewSerial}`;
-				const { result, flights } = await judgeInner(
-					rawReq,
-					{ ...rawOpts, signal },
-					() => ({
-						options: rawOpts ?? {},
-						unresolved: new Set(),
-						attempts,
-						operationId,
-						settled: false,
-						observationSupported: true,
-						progress: [],
-						presplits: 0,
-						rejectedReuses: 0,
-					}),
-				);
-				const reviews = flights.flatMap((f) => (f.review ? [f.review] : []));
-				const review = reviews.at(-1);
-				for (const each of reviews) each.settled = true;
-				return {
-					...result,
-					progress: { stages: [...(review?.progress ?? [])] },
-					diagnostics: {
-						...diagnostics(
-							attempts,
-							reviews.every((each) => each.observationSupported),
-						),
-						presplits: reviews.reduce((n, each) => n + each.presplits, 0),
-						rejectedReuses: reviews.reduce(
-							(n, each) => n + each.rejectedReuses,
-							0,
-						),
-						...(review?.channel ? { channel: review.channel } : {}),
-					},
-					unresolved: [...(review?.unresolved ?? [])],
-				};
-			} catch (error) {
-				return {
-					...resultShell("llm", ""),
-					stopReason: "error",
-					errorMessage: redactString(
-						error instanceof Error ? error.message : String(error),
-						secrets,
-					),
-					progress: { stages: [] },
-					diagnostics: emptyDiagnostics(),
-					unresolved: [],
-				};
-			} finally {
-				active.delete(controller);
+				return await service.availabilityFor(structuredClone(runtime.config()));
+			} catch {
+				return {}; // read-only readiness is best-effort
 			}
 		},
-
-		availability: () =>
-			service.availabilityFor(structuredClone(runtime.config())),
 
 		async availabilityFor(
 			config,
 		): Promise<{ classifier?: string; llm?: string }> {
 			const out: { classifier?: string; llm?: string } = {};
-			// Bounded budget so a hanging auth/discovery cannot hang the caller.
-			// Setup/discovery is always bounded: explicit override or the native default.
-			const budget = resolveTimeoutMs(config, undefined, undefined, undefined);
-			const deadline = budget !== undefined ? Date.now() + budget : null;
-			try {
-				const native = await bounded(
-					resolveNativeClassifier(runtime.registry, nativeSelection(config)),
-					deadline,
-					undefined,
-				);
-				if (native && "model" in native)
-					out.classifier = `${native.model.provider}/${native.model.id}`;
-			} catch {
-				/* availability is best-effort */
-			}
-			// F10: `llm` reports a USABLE configured chat candidate — catalog
-			// existence alone is not usability. Credentials are confirmed via
-			// Pi auth resolution (bounded); unknown/uncredentialed models are
-			// unavailable and the main-session model is never a fallback.
-			const llm = llmChatModel(config);
-			if (llm && config.provider) {
-				try {
-					const auth = await bounded(
-						runtime.registry.getAuth(config.provider),
-						deadline,
-						undefined,
-					);
-					if (auth?.auth?.apiKey) out.llm = `${llm.provider}/${llm.id}`;
-				} catch {
-					/* unresolvable auth means unavailable */
-				}
+			for (const backend of ["classifier", "llm"] as const) {
+				const candidate = await probeCandidate(config, backend);
+				if (!("error" in candidate))
+					out[backend] = modelIdentity(backend, candidate.model);
 			}
 			return out;
 		},
@@ -1090,13 +696,22 @@ export function createJudgmentService(runtime: ServiceRuntime): CreatedService {
 				const signal = rawOpts?.signal
 					? AbortSignal.any([rawOpts.signal, controller.signal])
 					: controller.signal;
-				return (await judgeInner(rawReq, { ...rawOpts, signal })).result;
+				const blocked = runtime.settingsBlock?.();
+				if (blocked !== undefined)
+					return {
+						...resultShell("llm", ""),
+						stopReason: "error",
+						errorMessage: redactString(blocked, secrets),
+					};
+				return await judgeInner(rawReq, { ...rawOpts, signal });
 			} catch (error) {
 				return {
 					...resultShell("llm", ""),
 					stopReason: "error",
 					errorMessage: redactString(
-						error instanceof Error ? error.message : String(error),
+						publicErrorMessage(
+							error instanceof Error ? error.message : String(error),
+						),
 						secrets,
 					),
 				};
@@ -1106,231 +721,142 @@ export function createJudgmentService(runtime: ServiceRuntime): CreatedService {
 		},
 	};
 
-	function ledger(record: LedgerRecord): void {
-		writeLedger(runtime.ledger.append, record);
-	}
-
-	/** Record only an admitted or explicitly overflowing active-branch attempt. */
-	function recordCapacity(
-		flight: InFlight,
-		profile: CapacityProfile,
-		channel: string,
-		attempt: Extract<LedgerRecord, { kind: "capacity" }>["attempt"],
-	): void {
-		if (!ownsLiveCache(flight)) return;
-		const { inputTokens, ...sizes } = attempt;
-		const validated = {
-			...sizes,
-			...(typeof inputTokens === "number" &&
-			Number.isFinite(inputTokens) &&
-			inputTokens >= 0
-				? { inputTokens }
-				: {}),
-		};
-		observeCapacity(profile, validated);
-		ledger({ kind: "capacity", channel, attempt: validated });
-	}
-
-	/**
-	 * Buffer a request-owned judgment commit (F4). Ledger rows are flushed
-	 * only when the overall outcome is known and the request still owns the
-	 * current generation/cache — an aborted request persists nothing, while
-	 * a non-abort later failure may retain completed validated stages.
-	 */
-	function persistJudgment(
-		flight: InFlight,
-		key: string,
-		answer: ClassifierAnswer,
-		backend: "classifier" | "llm",
-		model: string,
-		thinkingLevel: string,
-		fresh?: string,
-	): void {
-		flight.bufferedJudgments.push({
-			key,
-			answer,
-			backend,
-			model,
-			thinkingLevel,
-			fresh,
-		});
-	}
-
-	/** Whether this request still owns the current live cache (F4); a retired attempt never does. */
-	function ownsLiveCache(flight: InFlight): boolean {
-		return (
-			!flight.retired &&
-			flight.generation === generation &&
-			cache === flight.cacheRef
-		);
-	}
-
-	/**
-	 * Service-authored category for a failed attempt, never a provider body.
-	 * Review paths already reduce provider failures to observed categories.
-	 */
-	function failureSummary(result: JudgeResult, flight: InFlight): string {
-		const message = result.errorMessage ?? "";
-		if (result.contextOverflow || /context overflow/i.test(message))
-			return "context overflow";
-		if (/timed out/i.test(message))
-			return `timed out after ${flight.timeoutMs}ms`;
-		if (flight.review && /^(native|LLM) review \w+ failure/.test(message))
-			return message;
-		if (
-			/did not return a valid|incompatible answer|returned no answer|lacks/i.test(
-				message,
-			)
-		)
-			return "invalid or incompatible output";
-		return "provider or transport failure";
-	}
-
-	/** Flush buffered judgment commits for a finished request (F4). */
-	function flushJudgments(flight: InFlight): void {
-		if (!ownsLiveCache(flight) || flight.canPublish?.() === false) return;
-		for (const entry of flight.bufferedJudgments) {
-			if (!ownsLiveCache(flight) || flight.canPublish?.() === false) break;
-			// Publish cache and ledger together only after a non-aborted outcome.
-			flight.cacheRef.answers.set(entry.key, entry.answer);
-			if (entry.fresh !== undefined) {
-				flight.cacheRef.answers.set(
-					pendingKey(flight.cacheRef, entry.fresh, entry.key),
-					entry.answer,
-				);
-				noteFresh(flight.cacheRef, entry.fresh, entry.key);
-			}
-			const durable = writeLedger(runtime.ledger.append, {
-				kind: "judgment",
-				key: entry.key,
-				answer: entry.answer,
-				backend: entry.backend,
-				model: entry.model,
-				thinkingLevel: entry.thinkingLevel,
-				...(entry.fresh !== undefined
-					? { freshToken: freshTokenKey(entry.fresh) }
-					: {}),
-			});
-			if (durable && ownsLiveCache(flight) && flight.canPublish?.() !== false) {
-				durableAnswers.set(entry.key, digest(entry.answer));
-				durableAnswers.set(
-					pendingKey(flight.cacheRef, entry.fresh, entry.key),
-					digest(entry.answer),
-				);
-			}
-		}
-		flight.bufferedJudgments.length = 0;
-	}
-
-	/** One absolute deadline, distinguished from caller or branch cancellation. */
-	function requestInterruption(
-		flight: InFlight,
-		deadline: number | null,
-		signal: AbortSignal | undefined,
-	): { stopReason: "error" | "aborted"; errorMessage: string } | undefined {
-		if (!ownsLiveCache(flight))
+	/** Interrupted attempt: idle/hard expiry is a backend failure, caller abort is terminal. */
+	function interruptedResult(
+		flight: Flight,
+		config: JudgmentConfig,
+	): JudgeResult | undefined {
+		const clocks = flight.clocks;
+		if (flight.retired || clocks.signal.reason === ATTEMPT_RETIRED)
 			return {
+				...resultShell(
+					flight.selected?.backend ?? "llm",
+					flight.selected?.model ?? config.model ?? "",
+				),
 				stopReason: "aborted",
-				errorMessage: "request aborted by session navigation",
+				errorMessage: "attempt retired after failover",
 			};
-		if (
-			(deadline !== null && Date.now() >= deadline) ||
-			signal?.reason === DEADLINE_EXPIRED
-		)
+		if (clocks.hardExpired() || clocks.signal.reason === HARD_EXPIRED)
 			return {
+				...resultShell(
+					flight.selected?.backend ?? "llm",
+					flight.selected?.model ?? config.model ?? "",
+				),
 				stopReason: "error",
-				errorMessage: `request timed out after ${flight.timeoutMs}ms`,
+				errorMessage: `model attempt timed out after ${flight.effective.modelTimeoutMs}ms`,
 			};
-		if (signal?.aborted)
+		if (clocks.idleExpired() || clocks.signal.reason === IDLE_EXPIRED)
 			return {
+				...resultShell(
+					flight.selected?.backend ?? "llm",
+					flight.selected?.model ?? config.model ?? "",
+				),
+				stopReason: "error",
+				errorMessage: `no generation progress for ${flight.effective.idleTimeoutMs}ms`,
+			};
+		if (clocks.signal.aborted)
+			return {
+				...resultShell(
+					flight.selected?.backend ?? "llm",
+					flight.selected?.model ?? config.model ?? "",
+				),
 				stopReason: "aborted",
 				errorMessage: "request aborted by caller signal",
 			};
 		return undefined;
 	}
 
+	/** One admitted attempt's owned clocks and selected identity. */
+	interface Flight {
+		clocks: AttemptClocks;
+		effective: EffectiveTimeouts;
+		selected?: { backend: "classifier" | "llm"; model: string };
+		/** Set once failover moves on: fences late publication. */
+		retired?: boolean;
+		/** A local orchestration fault ended the attempt: never failover permission. */
+		localFault?: boolean;
+	}
+
 	/**
 	 * One logical operation: admit ONE configuration snapshot, then run the
 	 * mode's fixed backend route. Automatic modes switch at most once, only
-	 * after an eligible backend failure; each attempt gets a fresh flight,
-	 * timeout window and stage state, while caller abort, navigation,
-	 * invalid input and local faults stay terminal. A retired attempt's
-	 * flight is fenced (its signal is aborted, its review collector closed).
+	 * after an eligible backend failure; each attempt gets fresh independent
+	 * clocks, while caller abort, navigation, invalid input and local faults
+	 * stay terminal. A retired attempt is fenced: its late results cannot
+	 * publish, and its partial answers never reach the final view.
 	 */
 	async function judgeInner(
 		rawReq: unknown,
 		rawOpts: JudgeOptions | undefined,
-		review?: () => ReviewFlight,
-	): Promise<{ result: JudgeResult; flights: InFlight[] }> {
+	): Promise<JudgeResult> {
 		const config = structuredClone(runtime.config());
+		// Admit synchronously before setup: caller-owned JSON/policy can change
+		// during an await, but every attempt must evaluate this same snapshot.
+		let request: JudgeRequest;
+		let opts: JudgeOptions;
+		try {
+			const validated = validateRequest(rawReq);
+			validatePolicy((rawOpts ?? {}) as Record<string, unknown>);
+			crossValidateThresholds(validated.questions, rawOpts?.thresholds);
+			request = structuredClone({
+				state: validated.state,
+				questions: validated.questions,
+			});
+			opts = {
+				...structuredClone({
+					minConfidence: rawOpts?.minConfidence,
+					thresholds: rawOpts?.thresholds,
+					idleTimeoutMs: rawOpts?.idleTimeoutMs,
+					modelTimeoutMs: rawOpts?.modelTimeoutMs,
+				}),
+				signal: rawOpts?.signal,
+			};
+		} catch (error) {
+			const message =
+				error instanceof InvalidRequestError
+					? error.message
+					: publicErrorMessage(
+							error instanceof Error ? error.message : String(error),
+						);
+			return {
+				...resultShell("llm", config.model ?? ""),
+				stopReason: "error",
+				errorMessage: redactString(`invalid request: ${message}`, secrets),
+			};
+		}
+		const policy: ThresholdPolicy = {
+			default: opts.minConfidence,
+			perQuestion: opts.thresholds ?? {},
+		};
 		const route = backendRoute(config.mode);
-		const refresh = secretLookups();
-		const admission: { admitted?: Admitted } = {};
-		// Navigation is terminal for the whole operation: the alternate stays
-		// bound to the admitted generation and cannot run on a newer branch.
-		const owner = { generation, cacheRef: cache };
-		const flights: InFlight[] = [];
 		const failures: string[] = [];
 		let unavailableOnly = true;
 		let outcome: AttemptOutcome | undefined;
 		let resolvedFailure: JudgeResult | undefined;
 		for (const backend of route) {
 			if (outcome) {
-				const previous = flights[flights.length - 1];
 				const shell = resultShell(outcome.result.backend, outcome.result.model);
-				if (owner.generation !== generation || owner.cacheRef !== cache)
+				if (opts.signal?.aborted)
 					return {
-						result: {
-							...shell,
-							stopReason: "aborted",
-							errorMessage: "request aborted by session navigation",
-						},
-						flights,
-					};
-				if (rawOpts?.signal?.aborted)
-					return {
-						result: {
-							...shell,
-							stopReason: "aborted",
-							errorMessage: "request aborted by caller signal",
-						},
-						flights,
-					};
-				// A deprecated seed holds answer references, not the original input:
-				// the alternate could neither replay it nor reuse it across identities.
-				if (previous.review?.options.checkpoint !== undefined)
-					return {
-						result: {
-							...shell,
-							stopReason: "error",
-							errorMessage: redactString(
-								`${outcome.summary}; a checkpoint-seeded review cannot fail over: resubmit the complete input without checkpoint`,
-								secrets,
-							),
-						},
-						flights,
+						...shell,
+						stopReason: "aborted",
+						errorMessage: "request aborted by caller signal",
 					};
 			}
-			const flight: InFlight = {
-				...owner,
-				bufferedJudgments: [],
-				...(review ? { review: review() } : {}),
+			const flight: Flight = {
+				clocks: newAttemptClocks(
+					resolveTimeouts(config, backend, opts),
+					opts.signal,
+				),
+				effective: resolveTimeouts(config, backend, opts),
 			};
-			flights.push(flight);
-			outcome = await judgeAttempt(
-				rawReq,
-				rawOpts,
-				flight,
-				config,
-				backend,
-				admission,
-				refresh,
-			);
-			// Late adapter observations from a finished attempt are dropped.
-			if (flight.review) flight.review.settled = true;
-			if (!outcome.failover || route.length === 1)
-				return { result: outcome.result, flights };
-			flight.retire?.();
+			try {
+				outcome = await judgeAttempt(request, policy, flight, config, backend);
+			} finally {
+				flight.clocks.dispose();
+			}
+			if (!outcome.failover || route.length === 1) return outcome.result;
+			flight.retired = true;
 			failures.push(
 				`${backend}${outcome.result.model ? ` ${outcome.result.model}` : ""}: ${boundedOutcome(outcome.summary)}`,
 			);
@@ -1338,37 +864,36 @@ export function createJudgmentService(runtime: ServiceRuntime): CreatedService {
 			if (!outcome.unavailable) resolvedFailure = outcome.result;
 		}
 		// Identify the terminal attempt that resolved a model, when any did.
-		const terminal = outcome!.unavailable
-			? (resolvedFailure ?? outcome!.result)
-			: outcome!.result;
+		const terminal =
+			(outcome?.unavailable
+				? (resolvedFailure ?? outcome?.result)
+				: outcome?.result) ?? resultShell("llm", config.model ?? "");
 		const head = unavailableOnly
 			? unavailableSummary(config.mode)
 			: "both automatic backend attempts failed";
 		return {
-			result: {
-				...terminal,
-				answers: {},
-				dropped: [],
-				stopReason: "error",
-				errorMessage: redactString(`${head} (${failures.join("; ")})`, secrets),
-			},
-			flights,
+			...terminal,
+			answers: {},
+			dropped: [],
+			stopReason: "error",
+			contextOverflow: outcome?.result.contextOverflow,
+			errorMessage: redactString(`${head} (${failures.join("; ")})`, secrets),
 		};
 	}
 
 	/**
-	 * One backend attempt of an admitted operation. `failover` marks an
-	 * eligible backend failure; `summary` is service-authored text (never a
-	 * raw provider body) used for a both-failed operation message.
+	 * One backend attempt of an admitted operation: redaction readiness and
+	 * selection settle inside this attempt's own clocks, then one dispatch
+	 * over the complete immutable request. `failover` marks an eligible
+	 * backend failure; `summary` is service-authored text (never a raw
+	 * provider body) used for a both-failed operation message.
 	 */
 	async function judgeAttempt(
-		rawReq: unknown,
-		rawOpts: JudgeOptions | undefined,
-		flight: InFlight,
+		request: JudgeRequest,
+		policy: ThresholdPolicy,
+		flight: Flight,
 		config: JudgmentConfig,
 		family: "classifier" | "llm",
-		admission: { admitted?: Admitted },
-		refreshSecrets: ReturnType<typeof secretLookups>,
 	): Promise<AttemptOutcome> {
 		const terminal = (result: JudgeResult): AttemptOutcome => ({
 			result,
@@ -1385,179 +910,64 @@ export function createJudgmentService(runtime: ServiceRuntime): CreatedService {
 			summary,
 			...(unavailable ? { unavailable } : {}),
 		});
-		/** Interruption: deadline expiry is a backend failure, aborts are terminal. */
+		/** Interruption: idle/hard expiry is a backend failure, aborts are terminal. */
 		const stoppedOutcome = (result: JudgeResult): AttemptOutcome =>
 			result.stopReason === "error"
-				? eligible(result, `timed out after ${flight.timeoutMs}ms`)
+				? eligible(result, result.errorMessage ?? "attempt timed out")
 				: terminal(result);
-		// Setup (readiness, selection, auth) is bounded by the explicit number or,
-		// when omitted, the native default; the LLM inactivity default is applied
-		// once the backend is known (see resolveTimeoutMs).
-		const explicitTimeout = rawOpts?.timeoutMs ?? config.timeoutMs;
-		const requestedTimeout = explicitTimeout ?? DEFAULT_NATIVE_TIMEOUT_MS;
-		let deadline =
-			typeof requestedTimeout === "number" &&
-			Number.isFinite(requestedTimeout) &&
-			requestedTimeout > 0
-				? Date.now() + requestedTimeout
-				: null;
-		let signal = rawOpts?.signal;
-		const deadlineController = new AbortController();
-		let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
-		let selected: { backend: "classifier" | "llm"; model: string } | undefined;
-		let phase: "setup" | "stages" = "setup";
-		flight.canPublish = () => !requestInterruption(flight, deadline, signal);
-		// Retirement after failover fences publication and cancels cooperative work.
-		flight.retire = () => {
-			flight.retired = true;
-			deadlineController.abort(ATTEMPT_RETIRED);
-		};
-		const interrupted = (): JudgeResult | undefined => {
-			const stopped = requestInterruption(flight, deadline, signal);
-			return stopped
-				? {
-						...resultShell(
-							selected?.backend ?? "llm",
-							selected?.model ?? config.model ?? "",
-						),
-						...stopped,
-					}
-				: undefined;
-		};
 
-		// Whole-call boundary: validation, redaction readiness, selection,
-		// recovery and joins all settle under the caller's deadline/abort or a
-		// structured error — never a rejected promise.
 		try {
-			if (
-				!Number.isInteger(requestedTimeout) ||
-				requestedTimeout <= 0 ||
-				requestedTimeout > 2_147_483_647
-			) {
-				throw new InvalidRequestError(
-					"timeoutMs must be a positive finite integer (milliseconds) within the timer range",
-				);
-			}
-			flight.timeoutMs = requestedTimeout;
-			// Bounded setup: readiness + selection stay under the caller's
-			// absolute budget even when the registry ignores its signal. The
-			// timer is cleared for the LLM backend once execution starts —
-			// there `timeoutMs` becomes per-request transport inactivity —
-			// while the native classifier keeps it as the one absolute
-			// logical-call deadline across internal stages.
-			deadlineTimer = setTimeout(
-				() => deadlineController.abort(DEADLINE_EXPIRED),
-				requestedTimeout,
-			);
-			signal = signal
-				? AbortSignal.any([signal, deadlineController.signal])
-				: deadlineController.signal;
-			const beforeReadiness = interrupted();
-			if (beforeReadiness) return stoppedOutcome(beforeReadiness);
-			// Redaction readiness is bounded by THIS attempt's deadline/abort (F5);
-			// selected providers are always included (F1). This family's own
-			// provider is always awaited; another provider whose lookup already
-			// exhausted an earlier attempt's window is not awaited again.
-			const selectedProviders = [
-				...(config.provider ? [config.provider] : []),
-				...(config.classifierProvider ? [config.classifierProvider] : []),
-			];
-			const ownProvider =
-				family === "llm" ? config.provider : config.classifierProvider;
-			await refreshSecrets(
-				selectedProviders,
-				deadline,
-				signal,
-				ownProvider ? [ownProvider] : [],
-			);
-			const afterReadiness = interrupted();
-			if (afterReadiness) return stoppedOutcome(afterReadiness);
-
-			// One admitted duration, including the configured default. Dispatch interprets
-			// it as native remaining wall time or LLM per-attempt inactivity.
-			const opts: JudgeOptions = {
-				...rawOpts,
-				signal,
-				timeoutMs: requestedTimeout,
-			};
-
-			// Input and caller policy are validated once per operation; an
-			// invalid request is terminal and never selects an alternate.
-			let admitted = admission.admitted;
-			if (!admitted) {
-				try {
-					const request = validateRequest(rawReq);
-					validatePolicy(opts);
-					crossValidateThresholds(request.questions, opts.thresholds);
-					admitted = admission.admitted = {
-						request,
-						policy: {
-							default: opts.minConfidence,
-							perQuestion: opts.thresholds ?? {},
-						},
-					};
-				} catch (error) {
-					// Never throws at the public boundary.
-					const message =
-						error instanceof Error ? error.message : String(error);
-					return terminal({
-						...resultShell("llm", config.model ?? ""),
-						stopReason: "error",
-						errorMessage: redactString(`invalid request: ${message}`, secrets),
-					});
-				}
-			}
-			const { request, policy } = admitted;
-
-			const beforeSelection = interrupted();
+			const beforeSelection = interruptedResult(flight, config);
 			if (beforeSelection) return stoppedOutcome(beforeSelection);
 
-			// Selection lives inside the whole-request catch/deadline boundary so
-			// a discovery throw, rejection or hang can never violate
-			// never-throws or the caller deadline. Only THIS family is resolved.
+			// Selection lives inside the attempt clocks: discovery hangs settle
+			// through idle expiry, never through rejection or a late dispatch.
 			let resolved: Candidate;
 			try {
-				const raced = await guardSelection(
-					resolveCandidate(config, family, signal),
-					deadline,
-					signal,
+				const raced = await bounded(
+					resolveCandidate(config, family, flight.clocks.signal),
+					flight.clocks.signal,
 				);
-				if ("timeout" in raced) {
-					deadlineController.abort(DEADLINE_EXPIRED);
-					return eligible(
-						{
-							...resultShell(family, config.model ?? ""),
-							stopReason: "error",
-							errorMessage: redactString(
-								`${family === "classifier" ? "native classifier" : "LLM"} selection timed out after ${requestedTimeout}ms`,
-								secrets,
-							),
-						},
-						`selection timed out after ${requestedTimeout}ms`,
-					);
+				if (raced === undefined) {
+					const stopped = interruptedResult(flight, config) ?? {
+						...resultShell(family, config.model ?? ""),
+						stopReason: "error" as const,
+						errorMessage: "selection did not settle within the attempt clocks",
+					};
+					return stoppedOutcome(stopped);
 				}
-				if ("aborted" in raced) return terminal(abortedResult(config));
-				resolved = raced.value;
+				resolved = raced;
 			} catch (error) {
-				if (signal?.aborted) return terminal(abortedResult(config));
+				const stopped = interruptedResult(flight, config);
+				if (stopped) return stoppedOutcome(stopped);
 				return eligible(
 					{
-						...resultShell(family, config.model ?? ""),
+						...resultShell(
+							family,
+							(family === "classifier"
+								? config.classifierModel
+								: config.model) ?? "",
+						),
 						stopReason: "error",
 						errorMessage: redactString(
-							`native classifier discovery failed: ${
-								error instanceof Error ? error.message : String(error)
-							}`,
+							publicErrorMessage(
+								error instanceof Error ? error.message : String(error),
+							),
 							secrets,
 						),
 					},
-					"native classifier discovery failed",
+					`${family} selection failed`,
 				);
 			}
 			if ("error" in resolved) {
 				return eligible(
 					{
-						...resultShell(family, config.model ?? ""),
+						...resultShell(
+							family,
+							(family === "classifier"
+								? config.classifierModel
+								: config.model) ?? "",
+						),
 						stopReason: "error",
 						errorMessage: redactString(resolved.error, secrets),
 					},
@@ -1566,1250 +976,177 @@ export function createJudgmentService(runtime: ServiceRuntime): CreatedService {
 				);
 			}
 
-			// Freeze the actual backend, model and effective thinking for EVERY
-			// dispatch, cache identity and ledger entry of this request. LLM
-			// thinking is computed once from the model + configured level; later
-			// config mutation mid-flight cannot change a dispatch.
+			// Freeze the actual backend, model and effective thinking for the
+			// whole attempt: a registry/config change mid-flight can never
+			// substitute another model or level.
 			const { backend, model } = resolved;
 			const modelId = modelIdentity(backend, model);
-			selected = { backend, model: modelId };
+			flight.selected = { backend, model: modelId };
 			const thinkingLevel =
 				backend === "llm"
 					? effectiveThinkingLevel(model as AnyModel, config.thinkingLevel)
 					: "none";
-			const limits = contextLimits(model, config, !!flight.review);
-			const profile = channelProfile(
-				backend,
-				modelId,
-				flight.review ? digest({ model }) : undefined,
-			);
-			const overhead = backend === "llm" ? LLM_ENVELOPE_OVERHEAD_BYTES : 0;
+			const capacity = capacityDisclosure(backend, model, modelId, config);
 
-			// F1: the SELECTED backend's provider is always part of known keys —
-			// including a native provider discovered by default (a chat-only
-			// inventory like getAll()/getProviders() can omit classifier-only
-			// built-ins). Bounded by the remaining request budget; never an
-			// env/endpoint fallback.
-			const selectedBackendProvider = model.provider;
-			await refreshSecrets(
-				[...selectedProviders, selectedBackendProvider],
-				deadline,
-				signal,
-				[selectedBackendProvider],
+			// The model's OWN provider credential joins the redaction set before
+			// dispatch (a discovered native provider may differ from config).
+			const ready = await resolveSelectedSecret(
+				model.provider,
+				flight.clocks.signal,
 			);
-			const beforeStages = interrupted();
-			if (beforeStages) return stoppedOutcome(beforeStages);
-			// Auth/redaction setup must settle under the setup deadline too.
-			// Only actual LLM execution switches to per-request inactivity.
-			if (backend === "llm") {
-				if (deadlineTimer !== undefined) clearTimeout(deadlineTimer);
-				deadlineTimer = undefined;
-				deadline = null;
-				// Omitted duration: follow Pi's own HTTP idle timeout per request.
-				opts.timeoutMs = resolveTimeoutMs(
-					config,
-					rawOpts?.timeoutMs,
-					"llm",
-					runtime.hostIdleTimeoutMs?.(),
-				);
-				flight.timeoutMs = opts.timeoutMs;
-			}
-
-			const redacted = redactJson(request, secrets) as JudgeRequest;
-			// Freeze the prediction inputs before inference updates calibration.
-			// describeSelection() on the next call exposes that learned ratio.
-			const capacity = capacityDisclosure(
-				backend,
-				model,
-				modelId,
-				config,
-				profile,
-				!!flight.review,
-			);
-			phase = "stages";
-			const result = await runStages(
-				redacted,
-				opts,
-				policy,
-				backend,
-				model,
-				modelId,
-				thinkingLevel,
-				limits,
-				profile,
-				overhead,
-				flight,
-				deadline,
-			);
-
-			if (flight.generation !== generation) {
-				// Whole work aborted by a lifecycle switch: no late result.
-				return terminal({
-					...result,
-					answers: {},
-					dropped: [],
-					stopReason: "aborted",
-					capacity,
-				});
-			}
-			const final: JudgeResult = {
-				...result,
-				capacity,
-				inputDimensions: flight.inputDimensions ?? [],
-			};
-			// Success (including valid negative or all-dropped views), aborts and
-			// local orchestration faults never switch backend.
-			if (
-				final.stopReason === "aborted" &&
-				flight.sharedAbort &&
-				!interrupted()
-			)
+			const beforeDispatch = interruptedResult(flight, config);
+			if (beforeDispatch) return stoppedOutcome(beforeDispatch);
+			if (!ready)
 				return eligible(
-					final,
-					"joined backend work was cancelled by its owner",
-				);
-			if (final.stopReason !== "error" || flight.localFault)
-				return terminal(final);
-			return eligible(final, failureSummary(final, flight));
-		} catch (error) {
-			// Absolute backstop: any residual throw resolves structurally.
-			const message = error instanceof Error ? error.message : String(error);
-
-			const stopped = interrupted();
-			if (stopped) return stoppedOutcome(stopped);
-			const result: JudgeResult = {
-				...resultShell(
-					selected?.backend ?? "llm",
-					selected?.model ?? config.model ?? "",
-				),
-				stopReason: "error",
-				errorMessage: redactString(message, secrets),
-			};
-			// Invalid input/callback contracts and faults while executing stages
-			// are local; only a backend setup (readiness/auth) failure may switch.
-			return error instanceof InvalidRequestError || phase === "stages"
-				? terminal(result)
-				: eligible(result, "backend setup failed");
-		} finally {
-			// A synchronous registry phase may exhaust the deadline before its
-			// timer gets an event-loop turn. Cancel before clearing that timer.
-			if (deadline !== null && Date.now() >= deadline)
-				deadlineController.abort(DEADLINE_EXPIRED);
-			if (deadlineTimer !== undefined) clearTimeout(deadlineTimer);
-		}
-	}
-
-	/** Aborted shell with a safe diagnostic message (F5). */
-	function abortedResult(config: JudgmentConfig): JudgeResult {
-		return {
-			...resultShell("llm", config.model ?? ""),
-			stopReason: "aborted",
-			errorMessage: "request aborted by caller signal",
-		};
-	}
-
-	/**
-	 * One backend dispatch over a question batch at one stage. The native
-	 * path uses PINNED dispatch (`classifyWithModel`) with the frozen model
-	 * resolved at selection time — a registry/catalog change mid-request can
-	 * never substitute a different model. The LLM path receives the frozen
-	 * effective thinking level, not a reread of runtime config.
-	 */
-	async function dispatch(
-		backend: "classifier" | "llm",
-		model: AnyClassifierModel | AnyModel,
-		context: ClassifierContext,
-		opts: JudgeOptions,
-		deadline: number | null,
-		thinkingLevel: string,
-		flight: InFlight,
-		onAnswer?: (id: string, answer: ClassifierAnswer) => void,
-	): Promise<
-		ClassifierResult & {
-			observation?: {
-				version: number;
-				attempts: number;
-				partialAnswers?: Record<string, unknown>;
-			};
-		}
-	> {
-		const remaining =
-			deadline !== null ? deadline - Date.now() : Number.POSITIVE_INFINITY;
-		if (remaining <= 0 || opts.signal?.aborted)
-			return {
-				api: (backend === "classifier"
-					? model.api
-					: "llm-as-jev") as ClassifierApi,
-				provider: model.provider,
-				model: model.id,
-				answers: {},
-				timestamp: Date.now(),
-				stopReason: remaining <= 0 ? "error" : "aborted",
-				errorMessage:
-					remaining <= 0
-						? "request timed out before dispatch"
-						: "request aborted before dispatch",
-			};
-		const dimensions = sizeOf(context.state, context.questions, model.id);
-		flight.inputDimensions ??= [];
-		flight.inputDimensions.push({
-			stateBytes: dimensions.stateBytes,
-			questionBytes: dimensions.questionBytes,
-			longestQuestionBytes: dimensions.longestQuestionBytes,
-		});
-		// Native keeps the one absolute logical-call deadline (remaining
-		// wall clock); LLM gets the caller's inactivity window verbatim —
-		// per-request and transport-activity-reset, never a shared total.
-		const timeoutMs =
-			backend === "llm"
-				? opts.timeoutMs
-				: Number.isFinite(remaining)
-					? remaining
-					: undefined;
-		if (backend === "classifier" && flight.review) {
-			const review = flight.review;
-			const startIndex = review.attempts.length;
-			let open = true;
-			const onAttempt = collectAttempts(
-				review.operationId,
-				review.attempts,
-				() => open && !review.settled,
-				(attempt) => {
-					if (ownsLiveCache(flight))
-						ledger({ kind: "review-attempt", version: 1, attempt });
-				},
-				(text) => redactString(text, secrets),
-				sizeOf(context.state, context.questions, model.id),
-			);
-			try {
-				const result = (await classifyWithModel(
-					runtime.registry,
-					model as AnyClassifierModel,
-					context,
 					{
-						signal: opts.signal,
-						timeoutMs,
-						observe: true,
-						onAttempt,
-						fetch: runtime.nativeFetch,
-					},
-				)) as ClassifierResult & {
-					observation?: {
-						version: number;
-						attempts: number;
-						partialAnswers?: Record<string, unknown>;
-					};
-				};
-				const observedCount = review.attempts.length - startIndex;
-				if (requestInterruption(flight, deadline, opts.signal)) {
-					if (observedCount === 0 && result.observation?.version !== 1)
-						review.observationSupported = false;
-					return result;
-				}
-				if (
-					result.observation?.version !== 1 ||
-					result.observation.attempts !== observedCount
-				) {
-					review.observationSupported = false;
-					return {
-						...result,
-						answers: {},
+						...resultShell(backend, modelId),
+						capacity,
 						stopReason: "error",
-						errorMessage:
-							"selected classifier adapter lacks observable HTTP attempts through Pi's public fetch option",
-					};
-				}
-				if (result.stopReason === "error") {
-					const terminal = review.attempts.slice(startIndex).at(-1);
-					// Observed categories, never provider bodies, drive recovery and public diagnostics.
-					const category = terminal?.errorCategory ?? "response";
-					return {
-						...result,
-						errorMessage: `${category === "overflow" ? "context overflow" : `native review ${category} failure`}${terminal?.status ? ` (HTTP ${terminal.status})` : ""}`,
-					};
-				}
-				return result;
-			} finally {
-				open = false;
-			}
-		}
-		if (backend === "llm" && flight.review) {
-			const review = flight.review;
-			const start = review.attempts.length;
-			const observed = observeLlmRegistry(runtime.registry, {
-				operation: review.operationId,
-				attempts: review.attempts,
-				isOpen: () => !review.settled,
-				publish: (attempt) => {
-					if (ownsLiveCache(flight))
-						ledger({ kind: "review-attempt", version: 1, attempt });
-				},
-				sanitize: (text) => redactString(text, secrets),
-			});
-			let result: ClassifierResult;
-			try {
-				result = await llmClassify(
-					observed.registry,
-					model as AnyModel,
-					context,
-					{
-						thinkingLevel: thinkingLevel as JudgmentThinkingLevel,
-						signal: opts.signal,
-						timeoutMs,
-						onAnswer: (id, answer) => {
-							if (
-								observed.isSupported() &&
-								!requestInterruption(flight, deadline, opts.signal)
-							)
-								onAnswer?.(id, answer);
-						},
+						errorMessage: "selected provider authentication is unavailable",
 					},
+					"selected provider authentication is unavailable",
 				);
-			} finally {
-				review.observationSupported =
-					observed.close() && review.observationSupported;
-			}
-			if (requestInterruption(flight, deadline, opts.signal)) return result;
-			if (!review.observationSupported)
-				return {
-					...result,
-					answers: {},
+
+			const attemptSecrets = [...secrets];
+			const redacted = redactJson(request, attemptSecrets);
+			// Redaction may rename schema keys. Reject ambiguity rather than
+			// silently merging questions/labels or sending a credential as a key.
+			if (
+				Object.keys(redacted.questions).length !==
+					Object.keys(request.questions).length ||
+				Object.values(redacted.questions).some(
+					(question) => validateQuestion("", question) !== undefined,
+				) ||
+				Object.values(request.questions).some(
+					(question) =>
+						question.type === "choice" &&
+						new Set(
+							Object.keys(question.criteria).map((label) =>
+								redactString(label, attemptSecrets),
+							),
+						).size !== Object.keys(question.criteria).length,
+				)
+			)
+				return terminal({
+					...resultShell(backend, modelId),
+					capacity,
 					stopReason: "error",
 					errorMessage:
-						"selected LLM adapter lacks required HTTP/SSE attempt-observation capability",
-				};
-			if (result.stopReason === "error") {
-				const terminal = review.attempts.slice(start).at(-1);
-				return {
-					...result,
-					errorMessage:
-						terminal?.errorCategory === "overflow"
-							? "context overflow"
-							: `LLM review ${terminal?.errorCategory ?? "response"} failure`,
-				};
-			}
-			return result;
-		}
-		return backend === "classifier"
-			? classifyWithModel(
-					runtime.registry,
-					model as AnyClassifierModel,
-					context,
-					{ signal: opts.signal, timeoutMs },
-				)
-			: llmClassify(runtime.registry, model as AnyModel, context, {
-					thinkingLevel: thinkingLevel as JudgmentThinkingLevel,
-					signal: opts.signal,
-					timeoutMs,
+						"question schema is ambiguous or invalid after credential redaction",
 				});
-	}
-
-	interface StageRun {
-		answers: Record<string, ClassifierAnswer>;
-		dropped: string[];
-		stopReason: JudgeResult["stopReason"];
-		errorMessage?: string;
-		contextOverflow?: boolean;
-		reuse: { hits: number; joined: number; sent: number };
-		usage?: Usage;
-	}
-
-	/**
-	 * Ordered evidence recovery (task 4.6). Stage = fixed state + evidence
-	 * batch + advisory previous answers. Overflow reduces the constrained
-	 * dimension (questions, then evidence). Intermediate-stage RAW opinions
-	 * are ADVISORY ONLY (F3): the caller's policy is applied exactly once,
-	 * to the completed FINAL stage's RAW answers — an earlier stage's
-	 * acceptance or drop never survives into the final view, and a later
-	 * error/abort returns no final answers.
-	 */
-	async function runStages(
-		request: JudgeRequest,
-		opts: JudgeOptions,
-		policy: ThresholdPolicy,
-		backend: "classifier" | "llm",
-		model: AnyClassifierModel | AnyModel,
-		modelId: string,
-		thinkingLevel: string,
-		limits: CapacityLimits | undefined,
-		profile: CapacityProfile,
-		overhead: number,
-		flight: InFlight,
-		deadline: number | null,
-	): Promise<JudgeResult> {
-		const total: StageRun = {
-			answers: {},
-			dropped: [],
-			stopReason: "stop",
-			reuse: { hits: 0, joined: 0, sent: 0 },
-		};
-		const usages: Usage[] = [];
-		const evidence = frameEvidence(request.evidence ?? []);
-		// Join-compatibility tag for in-flight pending entries: LLM callers
-		// join only work owned by the same inactivity window (absent window
-		// = host transport defaults). Native callers share one absolute
-		// deadline; the joiner stays bounded by its own deadline/signal.
-		const myWaitTag =
-			backend === "llm" ? `llm:${opts.timeoutMs ?? ""}` : undefined;
-		// Review keys never borrow legacy records lacking observation/transport provenance.
-		const reviewOptions = flight.review?.options;
-		const consumerCache = reviewOptions?.cache;
-		if (
-			consumerCache &&
-			(typeof consumerCache.lookup !== "function" ||
-				typeof consumerCache.store !== "function")
-		)
-			throw new InvalidRequestError(
-				"cache requires synchronous lookup/store callbacks",
-			);
-		const consumerDurable = new Map<string, string>();
-		const externalKey = (key: string) =>
-			digest({
-				consumerCache: 1,
-				key,
-				fresh: opts.fresh === undefined ? null : freshTokenKey(opts.fresh),
-			});
-		const storeConsumer = (key: string, answer: ClassifierAnswer) => {
-			if (!consumerCache || requestInterruption(flight, deadline, opts.signal))
-				return;
-			const ck = externalKey(key),
-				value = digest(answer);
-			if (consumerDurable.get(ck) === value) return;
-			try {
-				if (
-					consumerCache.store(ck, structuredClone(answer)) === true &&
-					!requestInterruption(flight, deadline, opts.signal)
-				)
-					consumerDurable.set(ck, value);
-			} catch {
-				/* A valid result is not a durability acknowledgement. */
-			}
-		};
-		const lineage = digest({
-			review: 1,
-			transport: model,
-			thinkingLevel,
-			projection: reviewOptions?.projectionRevision,
-		});
-		if (
-			(reviewOptions?.projectStage || reviewOptions?.planStages) &&
-			!reviewOptions.projectionRevision
-		)
-			throw new InvalidRequestError(
-				"projectStage/planStages requires projectionRevision",
-			);
-		// Each judgment key already includes its own complete question definition.
-		// Sibling membership belongs to the checkpoint, not raw-answer identity:
-		// adding C must not repay unchanged A/B in the same factual stage.
-		const scope = flight.review
-			? digest({
-					lineage,
-					state: request.state,
-					checkpoint: reviewOptions?.checkpoint,
-				})
-			: undefined;
-		const scopeIdentity = scope ? { scope } : {};
-		const capacityChannel = channelKey(
-			backend,
-			flight.review ? digest({ model }) : modelId,
-		);
-		if (flight.review) flight.review.channel = capacityChannel;
-		const completed: FramedEvidence[] = [];
-		/** Advisory prior-stage opinions (RAW, unfiltered, never final). */
-		let previousAnswers: Record<string, ClassifierAnswer> = {};
-		if (reviewOptions?.checkpoint !== undefined) {
-			if (opts.fresh !== undefined)
-				throw new InvalidRequestError(
-					"a fresh review cannot use an incremental seed",
-				);
-			const seed = reviewCheckpoints.find(
-				(row) =>
-					row.identity === reviewOptions.checkpoint && row.lineage === lineage,
-			);
-			if (
-				!seed ||
-				!seed.answerKeys.every((key, i) => {
-					const answer = flight.cacheRef.answers.get(key);
-					return (
-						answer !== undefined &&
-						digest(answer) === seed.answerDigests[i] &&
-						durableAnswers.get(key) === seed.answerDigests[i]
-					);
-				})
-			)
-				throw new InvalidRequestError(
-					"checkpoint is absent, incompatible or lacks durable answer references on this branch",
-				);
-			previousAnswers = Object.fromEntries(
-				seed.questionIds.map((id, i) => [
-					id,
-					structuredClone(flight.cacheRef.answers.get(seed.answerKeys[i])!),
-				]),
-			);
-		}
-		/** Raw completed-stage view, separate from each caller's policy. */
-		let stageRawAnswers: Record<string, ClassifierAnswer> = {};
-		// Evidence recovery owns the full question set. Ancestor question batches
-		// must not repeat that traversal or merge answers from its old factual stage.
-		let evidenceRevision = 0;
-
-		const sizeFor = (
-			batch: FramedEvidence[],
-			questions: Record<string, ClassifierQuestion>,
-			fixed = request.state,
-			prior = previousAnswers,
-			final = true,
-		) => {
-			if (flight.review)
-				return sizeOf(
-					stageState(fixed, batch, prior, final),
-					questions,
-					model.id,
-				);
-			const size = sizeOf(request.state, questions);
-			return {
-				...size,
-				stateBytes: size.stateBytes + framedEvidenceBytes(batch) + overhead,
+			const context: ClassifierContext = {
+				state: redacted.state,
+				questions: redacted.questions,
 			};
-		};
 
-		/** Persist only a complete required-question view, with answers durable first. */
-		const checkpoint = (
-			batch: FramedEvidence[],
-			projection: ReviewStageProjection,
-			questions: Record<string, ClassifierQuestion>,
-			prior: Record<string, ClassifierAnswer>,
-			final: boolean,
-			answers: Record<string, ClassifierAnswer>,
-		) => {
-			const review = flight.review;
-			if (!review || requestInterruption(flight, deadline, opts.signal)) return;
-			if (projection.unresolved?.length) return;
-			const ids = Object.keys(projection.questions);
-			if (
-				Object.keys(questions).length !== ids.length ||
-				!ids.every(
-					(id) =>
-						Object.hasOwn(answers, id) &&
-						validateAnswer(questions[id], answers[id]),
-				)
-			)
-				return;
-			const keys = ids.map((id) =>
-				judgmentKey({
-					...scopeIdentity,
-					backend,
-					model: modelId,
-					thinkingLevel,
-					state: projection.state,
-					evidence: batch,
-					previousAnswers: prior,
-					questionId: id,
-					question: questions[id],
-					isFinalStage: final,
-				}),
-			);
-			if (consumerCache)
-				for (let i = 0; i < ids.length; i++)
-					storeConsumer(keys[i], answers[ids[i]]);
-			if (requestInterruption(flight, deadline, opts.signal)) return;
-			flushJudgments(flight);
-			if (requestInterruption(flight, deadline, opts.signal)) return;
-			const identity = digest({
-				scope,
-				keys,
-				fresh: opts.fresh === undefined ? null : freshTokenKey(opts.fresh),
-			});
-			const record = {
-				lineage,
-				questionIds: ids,
-				answerDigests: ids.map((id) => digest(answers[id])),
-				sources: batch.map((f) => ({
-					id: f.bounds?.of ?? f.record.id,
-					...(f.bounds ? { bounds: { ...f.bounds } } : {}),
-				})),
-				identity,
-				evidenceIds: batch.map((f) => f.record.id),
-				answerKeys: keys.map((key) =>
-					pendingKey(flight.cacheRef, opts.fresh, key),
-				),
-				model: modelId,
-				final,
-			};
-			const allDurable = record.answerKeys.every(
-				(key, i) => durableAnswers.get(key) === digest(answers[ids[i]]),
-			);
-			const existing = reviewCheckpoints.some(
-				(row) => row.identity === identity && digest(row) === digest(record),
-			);
-			const durable =
-				allDurable &&
-				(existing ||
-					writeLedger(runtime.ledger.append, {
-						kind: "review-stage",
-						version: 1,
-						...record,
-					}));
-			if (!ownsLiveCache(flight)) return;
-			if (durable && !existing) reviewCheckpoints.push(record);
-			const progress: ReviewStageProgress = {
-				final,
-				checkpoint: identity,
-				...(consumerCache
-					? {
-							cache: {
-								keys: keys.map(externalKey),
-								durable: keys.every(
-									(key, i) =>
-										consumerDurable.get(externalKey(key)) ===
-										digest(answers[ids[i]]),
-								),
-							},
-						}
-					: {}),
-				evidenceIds: record.evidenceIds,
-				durable,
-				sources: batch.map((f) => ({
-					id: f.bounds?.of ?? f.record.id,
-					...(f.bounds ? { bounds: { ...f.bounds } } : {}),
-				})),
-				opinions: structuredClone(answers),
-			};
-			review.progress.push(progress);
-			completed.push(...batch);
-			if (durable && review.options.onProgress) {
-				try {
-					void Promise.resolve(
-						review.options.onProgress(structuredClone(progress)),
-					).catch(() => {});
-				} catch {
-					/* Notification cannot control recovery. */
-				}
-			}
-		};
-
-		/**
-		 * Evaluate one leaf stage (state + evidence batch + questions). On
-		 * predicted or reported overflow reduce: questions first, then the
-		 * evidence batch, then a single record into fragments. Returns false
-		 * when the run must stop (failure/abort/irreducible).
-		 */
-		const stage = async (
-			batch: FramedEvidence[],
-			questions: Record<string, ClassifierQuestion>,
-			isFinalStage: boolean,
-			projection?: ReviewStageProjection,
-		): Promise<boolean> => {
-			const stopped = requestInterruption(flight, deadline, opts.signal);
-			if (stopped) {
-				Object.assign(total, stopped);
-				return false;
-			}
-			if (!projection) {
-				projection = { state: request.state, questions };
-				if (reviewOptions?.projectStage) {
-					const projected = reviewOptions.projectStage(
-						structuredClone({
-							evidence: batch,
-							completed,
-							previousAnswers,
-							final: isFinalStage,
-						}),
-					);
-					if (
-						projected &&
-						typeof (projected as unknown as Promise<unknown>).then ===
-							"function"
-					) {
-						void Promise.resolve(projected).catch(() => {});
-						throw new InvalidRequestError(
-							"projectStage must return synchronous JSON",
-						);
-					}
-					const valid = validateRequest(projected, true);
-					if (
-						projected.unresolved !== undefined &&
-						(!Array.isArray(projected.unresolved) ||
-							!projected.unresolved.every((id) => typeof id === "string"))
-					)
-						throw new InvalidRequestError("invalid projected unresolved ids");
-					const withheld = new Set(projected.unresolved ?? []);
-					if (
-						Object.keys(request.questions).some(
-							(id) => !Object.hasOwn(valid.questions, id) && !withheld.has(id),
-						)
-					)
-						throw new InvalidRequestError(
-							"projectStage omitted required questions without declaring them unresolved",
-						);
-					if ([...withheld].some((id) => Object.hasOwn(valid.questions, id)))
-						throw new InvalidRequestError(
-							"projected unresolved questions must not also be dispatchable",
-						);
-					projection = redactJson(
-						{
-							state: valid.state,
-							questions: valid.questions,
-							...(projected.unresolved
-								? { unresolved: projected.unresolved }
-								: {}),
-						},
-						secrets,
-					) as unknown as ReviewStageProjection;
-					questions = projection.questions;
-					crossValidateThresholds(questions, opts.thresholds);
-				}
-			}
-			const afterProjection = requestInterruption(
+			const result = await dispatch(
+				backend,
+				model,
+				context,
 				flight,
-				deadline,
-				opts.signal,
+				thinkingLevel,
 			);
-			if (afterProjection) {
-				Object.assign(total, afterProjection);
-				return false;
-			}
-			for (const id of projection.unresolved ?? [])
-				flight.review?.unresolved.add(id);
-			const fixed = projection.state;
-			const qIds = Object.keys(questions);
-			const stagePrior = previousAnswers;
-			for (const id of qIds) flight.review?.unresolved.add(id);
-			// Even zero dispatchable questions must pass the unresolved/finality guard below.
 
-			// 1. Cache/join phase per question identity. Identity includes the
-			// dispatched stage coverage/finality (F6) so a partial-stage
-			// judgment can never be reused as full coverage.
-			const answers: Record<string, ClassifierAnswer> = {};
-			const joins: [string, string, Promise<PendingJudgment>][] = [];
-			const misses: [string, string][] = [];
-			for (const id of qIds) {
-				const key = judgmentKey({
-					...scopeIdentity,
-					backend,
-					model: modelId,
-					thinkingLevel,
-					state: fixed,
-					evidence: batch,
-					previousAnswers,
-					questionId: id,
-					question: questions[id],
-					isFinalStage,
+			const stopped = interruptedResult(flight, config);
+			if (stopped)
+				return stopped.stopReason === "error"
+					? eligible(
+							{ ...stopped, capacity },
+							stopped.errorMessage ?? "attempt timed out",
+						)
+					: terminal({ ...stopped, capacity });
+			// A late result from a retired attempt can never publish.
+			if (flight.retired)
+				return terminal({
+					...resultShell(backend, modelId),
+					capacity,
+					stopReason: "aborted",
+					errorMessage: "attempt retired after failover",
 				});
-				// F2: cached/restored answers are revalidated against the
-				// CURRENT question before use; a poisoned or stale record
-				// that no longer matches cannot be accepted.
-				const answerKey = pendingKey(flight.cacheRef, opts.fresh, key);
-				const staged = flight.bufferedJudgments.findLast(
-					(entry) => entry.key === key && entry.fresh === opts.fresh,
-				)?.answer;
-				const cachedRaw =
-					staged ??
-					(freshEligible(flight.cacheRef, opts.fresh, key)
-						? flight.cacheRef.answers.get(answerKey)
-						: undefined);
-				let external: ClassifierAnswer | undefined;
-				if (consumerCache) {
-					try {
-						external = validateAnswer(
-							questions[id],
-							consumerCache.lookup(externalKey(key)),
-						);
-					} catch {
-						/* Bad cache reads miss; they never become answers. */
-					}
-					const interruptedLookup = requestInterruption(
-						flight,
-						deadline,
-						opts.signal,
-					);
-					if (interruptedLookup) {
-						Object.assign(total, interruptedLookup);
-						return false;
-					}
-					if (external) consumerDurable.set(externalKey(key), digest(external));
-				}
-				const cached =
-					external ??
-					(cachedRaw !== undefined
-						? validateAnswer(questions[id], cachedRaw)
-						: undefined);
-				if (cachedRaw !== undefined && cached === undefined) {
-					// Poisoned entry: drop it so future calls redispatch.
-					flight.cacheRef.answers.delete(answerKey);
-				}
-				if (cached) {
-					flight.review?.unresolved.delete(id);
-					total.reuse.hits += 1;
-					Object.defineProperty(answers, id, {
-						value: cached,
-						enumerable: true,
-						writable: true,
-						configurable: true,
-					});
-				} else {
-					// F6: pending lookup is fresh-token scoped — a forced review
-					// never joins ordinary in-flight work; same-token retries do.
-					const pk = pendingKey(flight.cacheRef, opts.fresh, key);
-					const pending = flight.cacheRef.pending.get(pk);
-					// Timeout-slice: an LLM owner runs under ITS inactivity window.
-					// A caller with a different window must dispatch its own work
-					// rather than silently inherit an incompatible owner's clock.
-					const waitTag = flight.cacheRef.pendingWait.get(pk);
-					if (pending && (waitTag === undefined || waitTag === myWaitTag)) {
-						total.reuse.joined += 1;
-						joins.push([id, key, pending]);
-					} else {
-						misses.push([id, key]);
-					}
-				}
-			}
 
-			// 2. Misses: capacity gate, then one dispatch for the batch.
-			if (misses.length > 0) {
-				const missQuestions = Object.fromEntries(
-					misses.map(([id]) => [id, questions[id]]),
-				);
-				const size = sizeFor(
-					batch,
-					missQuestions,
-					fixed,
-					stagePrior,
-					isFinalStage,
-				);
-				const envelope = judgmentKey({
-					...scopeIdentity,
-					backend,
-					model: modelId,
-					thinkingLevel,
-					state: fixed,
-					evidence: batch,
-					previousAnswers,
-					questionId: "*",
-					question: { all: missQuestions } as never,
-					isFinalStage,
-				});
-				const constraint = overflowConstraint(profile, size, limits);
-				const evidenceCanSplit = splitPiece(batch) !== undefined;
-				const fixedSize = sizeFor(
-					// An irreducible source is part of the admission floor too;
-					// shrinking questions cannot correct a false state-size hint.
-					evidenceCanSplit ? [] : batch,
-					missQuestions,
-					fixed,
-					stagePrior,
-					isFinalStage,
-				);
-				const floor =
-					flight.review && overflowConstraint(profile, fixedSize, limits);
-				// A soft fixed-state prediction cannot be repaired by traversing records/questions.
-				// Admit the useful unanswered batch once; exact rejections still take precedence.
-				const admitFixed =
-					floor === "state" ||
-					floor === "rejection" ||
-					(flight.review &&
-						overflowConstraint(
-							profile,
-							{ ...fixedSize, questionBytes: fixedSize.longestQuestionBytes },
-							limits,
-						) === "request");
-				const rejected =
-					flight.cacheRef.rejected.has(envelope) ||
-					misses.some(([id]) =>
-						flight.cacheRef.rejected.has(
-							judgmentKey({
-								...scopeIdentity,
-								backend,
-								model: modelId,
-								thinkingLevel,
-								state: fixed,
-								evidence: batch,
-								previousAnswers,
-								// Rejections store envelopes, not individual answer keys.
-								questionId: "*",
-								question: { all: { [id]: questions[id] } } as never,
-								isFinalStage,
-							}),
-						),
-					);
-				const irreducible = misses.length === 1 && !evidenceCanSplit;
-
-				if (rejected && flight.review) flight.review.rejectedReuses += 1;
-				if (rejected && !irreducible) {
-					// Never resend a rejected envelope unchanged: subdivide first.
-					return await subdivide(
-						batch,
-						questions,
-						isFinalStage,
-						projection,
-						constraint,
-						missQuestions,
-					);
-				}
-				if (rejected && irreducible) {
-					total.stopReason = "error";
-					total.contextOverflow = true;
-					total.errorMessage =
-						"context overflow: this exact envelope was already rejected and cannot be reduced further";
-					return false;
-				}
-				if (
-					constraint &&
-					!admitFixed &&
-					!(irreducible && misses.length === 1)
-				) {
-					// Predicted overflow: split before sending (soft estimate).
-					if (flight.review) flight.review.presplits += 1;
-					return await subdivide(
-						batch,
-						questions,
-						isFinalStage,
-						projection,
-						constraint,
-						missQuestions,
-					);
-				}
-
-				// Dispatch (one request for the whole miss batch). The in-flight
-				// promises are registered BEFORE the await so a concurrent identical
-				// call joins instead of duplicating the request.
-				const context: ClassifierContext = {
-					state: stageState(fixed, batch, previousAnswers, isFinalStage),
-					questions: missQuestions,
-				};
-				let recovering = false;
-				const run = dispatch(
-					backend,
-					model,
-					context,
-					opts,
-					deadline,
-					thinkingLevel,
-					flight,
-					flight.review
-						? (id, raw) => {
-								const key = misses.find(([candidate]) => candidate === id)?.[1];
-								const answer = key && validateAnswer(questions[id], raw);
-								if (
-									!key ||
-									!answer ||
-									requestInterruption(flight, deadline, opts.signal)
-								)
-									return;
-								storeConsumer(key, answer);
-								if (requestInterruption(flight, deadline, opts.signal)) return;
-								flight.review?.unresolved.delete(id);
-								persistJudgment(
-									flight,
-									key,
-									answer,
-									backend,
-									modelId,
-									thinkingLevel,
-									opts.fresh,
-								);
-								flushJudgments(flight);
-							}
-						: undefined,
-				)
-					.then((result) => {
-						total.reuse.sent += misses.length;
-						if (result.usage) usages.push(result.usage);
-						if (
-							flight.review &&
-							result.observation?.version === 1 &&
-							!requestInterruption(flight, deadline, opts.signal) &&
-							result.stopReason !== "aborted"
-						) {
-							// Valid partial members survive failure; they do not advance coverage.
-							for (const [id, key] of misses) {
-								const partial = result.observation.partialAnswers;
-								const raw =
-									partial && Object.hasOwn(partial, id)
-										? partial[id]
-										: result.stopReason === "stop" &&
-												Object.hasOwn(result.answers, id)
-											? result.answers[id]
-											: undefined;
-								const answer = validateAnswer(questions[id], raw);
-								if (answer) {
-									storeConsumer(key, answer);
-									if (requestInterruption(flight, deadline, opts.signal)) break;
-									flight.review.unresolved.delete(id);
-									persistJudgment(
-										flight,
-										key,
-										answer,
-										backend,
-										modelId,
-										thinkingLevel,
-										opts.fresh,
-									);
-								}
-							}
-							flushJudgments(flight);
-						}
-						if (result.stopReason !== "stop") return { ...result, answers: {} };
-						const validated: Record<string, ClassifierAnswer> = {};
-						for (const [id] of misses) {
-							const answer = validateAnswer(
-								questions[id],
-								Object.hasOwn(result.answers, id)
-									? result.answers[id]
-									: undefined,
-							);
-							if (!answer)
-								return {
-									...result,
-									answers: {},
-									stopReason: "error" as const,
-									errorMessage: `incompatible answer for question "${id}"`,
-								};
-							Object.defineProperty(validated, id, {
-								value: answer,
-								enumerable: true,
-								configurable: true,
-								writable: true,
-							});
-						}
-						const stopped = requestInterruption(flight, deadline, opts.signal);
-						if (stopped) return { ...result, ...stopped, answers: {} };
-						for (const [id, key] of misses) {
-							flight.review?.unresolved.delete(id);
-							persistJudgment(
-								flight,
-								key,
-								validated[id],
-								backend,
-								modelId,
-								thinkingLevel,
-								opts.fresh,
-							);
-						}
-						return { ...result, answers: validated };
-					})
-					.then(async (result) => {
-						const stopped = requestInterruption(flight, deadline, opts.signal);
-						if (stopped) return { ...result, ...stopped, answers: {} };
-						if (result.stopReason !== "error" || !isContextOverflow(result))
-							return result;
-						recovering = true;
-						// Existing waiters retain this completion promise; recursive leaves
-						// must not look up their own failed parent's pending entries.
-						settlePending(
-							flight.cacheRef,
-							misses.map(([, key]) =>
-								pendingKey(flight.cacheRef, opts.fresh, key),
-							),
-						);
-						recordCapacity(flight, profile, capacityChannel, {
-							outcome: "overflow",
-							stateBytes: size.stateBytes,
-							questionBytes: size.questionBytes,
-							longestQuestionBytes: size.longestQuestionBytes,
-						});
-						flight.cacheRef.rejected.add(envelope);
-						ledger({ kind: "rejected", envelope });
-						const recovered = await subdivide(
-							batch,
-							questions,
-							isFinalStage,
-							projection,
-							constraint,
-							missQuestions,
-						);
-						const afterRecovery = requestInterruption(
-							flight,
-							deadline,
-							opts.signal,
-						);
-						if (afterRecovery)
-							return { ...result, ...afterRecovery, answers: {} };
-						return {
-							...result,
-							answers: recovered ? stageRawAnswers : {},
-							stopReason: recovered ? ("stop" as const) : total.stopReason,
-							errorMessage: recovered ? undefined : total.errorMessage,
-						};
-					});
-				for (const [id, key] of misses) {
-					const p: Promise<PendingJudgment> = run.then(
-						(r) => ({
-							stopReason: r.stopReason,
-							answer:
-								r.stopReason === "stop" && Object.hasOwn(r.answers, id)
-									? r.answers[id]
-									: undefined,
-							errorMessage: r.errorMessage
-								? redactString(r.errorMessage, secrets)
-								: undefined,
-							contextOverflow: r.stopReason === "error" && isContextOverflow(r),
-						}),
-						(error) => ({
-							stopReason: "error",
-							errorMessage: redactString(String(error), secrets),
-						}),
-					);
-					// F6: register under the fresh-scoped pending key, tagged with
-					// this caller's wait policy so incompatible LLM callers
-					// dispatch their own request instead of joining.
-					trackPending(
-						flight.cacheRef,
-						pendingKey(flight.cacheRef, opts.fresh, key),
-						p,
-						myWaitTag,
-					);
-				}
-				const result = await run;
-				const interruptedDispatch = requestInterruption(
-					flight,
-					deadline,
-					opts.signal,
-				);
-				if (interruptedDispatch || result.stopReason === "aborted") {
-					Object.assign(
-						total,
-						interruptedDispatch ?? {
-							stopReason: "aborted",
-							errorMessage: "backend classification aborted",
-						},
-					);
-					// F7/F4: settle this batch's failed pending ownership so
-					// nothing joins aborted work.
-					settlePending(
-						flight.cacheRef,
-						misses.map(([, key]) =>
-							pendingKey(flight.cacheRef, opts.fresh, key),
-						),
-					);
-					return false;
-				}
-				if (recovering) return result.stopReason === "stop";
-				if (result.stopReason === "error") {
-					settlePending(
-						flight.cacheRef,
-						misses.map(([, key]) =>
-							pendingKey(flight.cacheRef, opts.fresh, key),
-						),
-					);
-					total.stopReason = "error";
-					total.errorMessage = redactString(
-						result.errorMessage ?? "backend classification failed",
+			if (result.stopReason === "aborted")
+				return terminal({
+					...resultShell(backend, modelId),
+					capacity,
+					stopReason: "aborted",
+					errorMessage: redactString(
+						result.errorMessage
+							? publicErrorMessage(result.errorMessage)
+							: "request aborted",
 						secrets,
-					);
-					return false;
-				}
-				// Answered: observe usage for calibration (F4: guarded).
-				recordCapacity(flight, profile, capacityChannel, {
-					outcome: "answered",
-					inputTokens: flight.review
-						? flight.review.attempts.at(-1)?.inputTokens
-						: result.usage?.input,
-					stateBytes: size.stateBytes,
-					questionBytes: size.questionBytes,
-					longestQuestionBytes: size.longestQuestionBytes,
+					),
 				});
-				for (const [id] of misses) {
-					const hasOwn = Object.hasOwn(result.answers, id);
-					const raw = hasOwn
-						? (result.answers as Record<string, unknown>)[id]
-						: undefined;
-					const answer = validateAnswer(questions[id], raw);
-					if (answer)
-						Object.defineProperty(answers, id, {
-							value: answer,
-							enumerable: true,
-							writable: true,
-							configurable: true,
-						});
-				}
+			if (result.stopReason === "error") {
+				// Overflow reads the RAW provider message before sanitization;
+				// the public result carries only a service-authored summary
+				// (status from a recognized SDK prefix), never a raw provider body.
+				const overflow = isContextOverflow(result);
+				const failed: JudgeResult = {
+					...resultShell(backend, modelId),
+					capacity,
+					stopReason: "error",
+					errorMessage: redactString(
+						publicErrorMessage(
+							result.errorMessage ?? "backend classification failed",
+						),
+						secrets,
+					),
+					...(overflow ? { contextOverflow: true as const } : {}),
+				};
+				return eligible(failed, failureSummary(failed, flight));
 			}
-			// 3. Joins (F5: each join is bounded by THIS caller's deadline/
-			// abort; the owner's promise is never canceled). F4: joins resolve
-			// against the promise captured at lookup time — an owner's cache
-			// generation never changes a joiner's already-captured promise.
-			for (const [id, key, promise] of joins) {
-				const joined = await bounded(promise, deadline, opts.signal);
-				const stoppedJoin = requestInterruption(flight, deadline, opts.signal);
-				if (stoppedJoin) {
-					Object.assign(total, stoppedJoin);
-					return false;
-				}
-				if (!joined || joined.stopReason !== "stop") {
-					// Another caller's cancelled work is not this live caller's abort.
-					if (joined?.stopReason === "aborted") flight.sharedAbort = true;
-					total.stopReason = joined?.stopReason ?? "error";
-					total.errorMessage =
-						joined?.errorMessage ?? "shared classification failed";
-					if (joined?.contextOverflow) total.contextOverflow = true;
-					return false;
-				}
-				if (joined.answer !== undefined) {
-					const validated = validateAnswer(questions[id], joined.answer);
-					if (validated) {
-						flight.review?.unresolved.delete(id);
-						persistJudgment(
-							flight,
-							key,
-							validated,
-							backend,
-							modelId,
-							thinkingLevel,
-							opts.fresh,
-						);
-						Object.defineProperty(answers, id, {
-							value: validated,
-							enumerable: true,
-							writable: true,
-							configurable: true,
-						});
-					}
-				}
-			}
-			// 4. (F3) Intermediate-stage answers are ADVISORY ONLY: they update
-			// `previousAnswers` for later stages and nothing else. The caller's
-			// policy is applied exactly once — below, on the completed FINAL
-			// stage's RAW answers.
-			stageRawAnswers = answers;
-			checkpoint(
-				batch,
-				projection,
-				questions,
-				stagePrior,
-				isFinalStage,
-				answers,
-			);
-			// Explicitly withheld scopes are not missing native response members:
-			// no checkpoint advances, but independent final choices remain usable.
-			if (projection.unresolved?.length && !isFinalStage) {
-				flight.localFault = true;
-				total.stopReason = "error";
-				total.errorMessage =
-					"intermediate stage has locally unresolved required questions";
-				return false;
-			}
-			if (!isFinalStage) {
-				previousAnswers = flight.review
-					? answers
-					: { ...previousAnswers, ...answers };
-				return true;
-			}
-			// Final stage: build the caller's accepted view from THESE answers.
-			// Own-key lookup only: an inherited `constructor`/`toString` value
-			// is never treated as an answer (F2).
-			const finalAnswers: Record<string, ClassifierAnswer> = {};
-			const finalDropped: string[] = [];
-			for (const id of qIds) {
-				const answer: ClassifierAnswer | undefined = Object.hasOwn(answers, id)
-					? (answers as Record<string, ClassifierAnswer>)[id]
+
+			// Complete-result validation BEFORE policy filtering: an incomplete
+			// or malformed raw result never publishes partial final answers.
+			const answers: Record<string, ClassifierAnswer> = {};
+			for (const id of Object.keys(request.questions)) {
+				const wireId = redactString(id, attemptSecrets);
+				const raw = Object.hasOwn(result.answers, wireId)
+					? result.answers[wireId]
 					: undefined;
-				if (!answer) {
-					if (total.stopReason === "stop") {
-						total.stopReason = "error";
-						total.errorMessage = `backend returned no answer for question "${id}"`;
-					}
-					continue;
+				let answer = validateAnswer(redacted.questions[wireId], raw);
+				const question = request.questions[id];
+				if (answer?.type === "choice" && question.type === "choice") {
+					const wireAnswer = answer;
+					const labels = Object.keys(question.criteria);
+					answer = validateAnswer(question, {
+						...wireAnswer,
+						choice: labels.find(
+							(label) =>
+								redactString(label, attemptSecrets) === wireAnswer.choice,
+						),
+						probabilities: Object.fromEntries(
+							labels.map((label) => [
+								label,
+								wireAnswer.probabilities[redactString(label, attemptSecrets)],
+							]),
+						),
+					});
 				}
+				if (!answer)
+					return eligible(
+						{
+							...resultShell(backend, modelId),
+							capacity,
+							stopReason: "error",
+							errorMessage: redactString(
+								`incompatible answer for question "${id}"`,
+								secrets,
+							),
+						},
+						"invalid or incompatible output",
+					);
+				Object.defineProperty(answers, id, {
+					value: answer,
+					enumerable: true,
+					writable: true,
+					configurable: true,
+				});
+			}
+			// Apply this caller's policy once to the freshly validated view.
+			const finalAnswers: Record<string, ClassifierAnswer> = {};
+			const dropped: string[] = [];
+			for (const [id, answer] of Object.entries(answers)) {
 				if (accepted(answer, backend, id, policy)) {
 					Object.defineProperty(finalAnswers, id, {
 						value: answer,
@@ -2818,236 +1155,119 @@ export function createJudgmentService(runtime: ServiceRuntime): CreatedService {
 						configurable: true,
 					});
 				} else {
-					finalDropped.push(id);
+					dropped.push(id);
 				}
 			}
-			// Replace, never accumulate: the final view is exactly this stage's.
-			total.answers = finalAnswers;
-			total.dropped = finalDropped;
-			return true;
-		};
-
-		/** Keep question-bound work on one factual stage; otherwise reduce evidence. */
-		async function subdivide(
-			batch: FramedEvidence[],
-			questions: Record<string, ClassifierQuestion>,
-			isFinalStage: boolean,
-			projection: ReviewStageProjection,
-			constraint: CapacityConstraint | undefined,
-			unanswered: Record<string, ClassifierQuestion>,
-		): Promise<boolean> {
-			const qIds = Object.keys(questions);
-			const halvesQ = splitQuestions(qIds);
-			const halvesE = splitPiece(batch);
-			let evidenceFirst = false;
-			if (flight.review && halvesE && halvesQ) {
-				if (constraint === "state") evidenceFirst = true;
-				else if (constraint === "request") {
-					const size = sizeFor(
-						batch,
-						unanswered,
-						projection.state,
-						previousAnswers,
-						isFinalStage,
-					);
-					// If even one longest question cannot fit beside this state,
-					// question batching alone cannot remove the request pressure.
-					const single = overflowConstraint(
-						profile,
-						{ ...size, questionBytes: size.longestQuestionBytes },
-						limits,
-					);
-					evidenceFirst = single === "request" || single === "state";
-				} else {
-					// An unclassified rejection does not identify a token dimension.
-					// Compare actual envelope reductions; do not infer it from record count.
-					const bytes = (
-						frames: FramedEvidence[],
-						qs: Record<string, ClassifierQuestion>,
-					) => {
-						const size = sizeFor(
-							frames,
-							qs,
-							projection.state,
-							previousAnswers,
-							isFinalStage,
-						);
-						return size.stateBytes + size.questionBytes;
-					};
-					const questionSize = Math.max(
-						...halvesQ.map((ids) =>
-							bytes(
-								batch,
-								Object.fromEntries(
-									ids
-										.filter((id) => Object.hasOwn(unanswered, id))
-										.map((id) => [id, unanswered[id]]),
-								),
-							),
-						),
-					);
-					const evidenceSize = Math.max(
-						...halvesE.map((frames) => bytes(frames, unanswered)),
-					);
-					evidenceFirst = evidenceSize < questionSize;
-				}
-			}
-			if (halvesQ && !evidenceFirst) {
-				// Merge ONLY question subtrees over this same state/evidence.
-				// Each evidence subtree still replaces its own final view.
-				const answers: Record<string, ClassifierAnswer> = {};
-				const raw: Record<string, ClassifierAnswer> = {};
-				const dropped = new Set<string>();
-				const prior = previousAnswers;
-				const revision = evidenceRevision;
-				let advisory = prior;
-				for (const half of halvesQ) {
-					previousAnswers = prior;
-					const sub = Object.fromEntries(half.map((id) => [id, questions[id]]));
-					if (!(await stage(batch, sub, isFinalStage, projection)))
-						return false;
-					// A question subtree may discover state pressure. Its evidence
-					// recovery has already evaluated the full stage's questions.
-					if (evidenceRevision !== revision) return true;
-					Object.defineProperties(
-						raw,
-						Object.getOwnPropertyDescriptors(stageRawAnswers),
-					);
-					if (!isFinalStage) advisory = { ...advisory, ...previousAnswers };
-					if (isFinalStage) {
-						Object.defineProperties(
-							answers,
-							Object.getOwnPropertyDescriptors(total.answers),
-						);
-						for (const id of total.dropped) dropped.add(id);
-					}
-				}
-				stageRawAnswers = raw;
-				checkpoint(batch, projection, questions, prior, isFinalStage, raw);
-				previousAnswers = isFinalStage ? prior : advisory;
-				if (isFinalStage) {
-					total.answers = answers;
-					total.dropped = [...dropped];
-				}
-				return true;
-			}
-			if (halvesE) {
-				// Promote an insufficient question split into ONE complete evidence
-				// traversal, not a traversal per sibling question batch.
-				if (flight.review) evidenceRevision++;
-				const wholeQuestions = flight.review ? projection.questions : questions;
-				if (!(await stage(halvesE[0], wholeQuestions, false))) return false;
-				return await stage(halvesE[1], wholeQuestions, isFinalStage);
-			}
-			// Irreducible: fixed state plus one minimum unit cannot fit.
-			total.stopReason = "error";
-			total.contextOverflow = true;
-			total.errorMessage =
-				"context overflow: the required fixed state plus one irreducible unit cannot fit; reduce state or evidence";
-			return false;
-		}
-
-		// The business owns sealed source boundaries, never backend selection or timers.
-		// Snapshot and validate the complete finite plan before cache access or dispatch.
-		let boundaries: number[] = [];
-		if (reviewOptions?.planStages) {
-			const proposed = reviewOptions.planStages(structuredClone(evidence));
-			if (
-				proposed &&
-				typeof (proposed as unknown as Promise<unknown>).then === "function"
-			)
-				void Promise.resolve(proposed).catch(() => {});
-			if (!Array.isArray(proposed))
-				throw new InvalidRequestError(
-					"planStages must return synchronous frame ends",
-				);
-			boundaries = [...proposed];
-			let previous = 0;
-			for (const end of boundaries) {
-				if (!Number.isInteger(end) || end <= previous || end > evidence.length)
-					throw new InvalidRequestError(
-						"planStages must make strict ordered source progress",
-					);
-				previous = end;
-			}
-		}
-		let start = 0;
-		for (const end of boundaries) {
-			if (!(await stage(evidence.slice(start, end), request.questions, false)))
-				return finish(total, usages, backend, modelId, flight);
-			start = end;
-		}
-		// Only this tail can produce the final business view, including when empty.
-		await stage(evidence.slice(start), request.questions, true);
-
-		return finish(total, usages, backend, modelId, flight);
-	}
-
-	function finish(
-		total: StageRun,
-		usages: Usage[],
-		backend: "classifier" | "llm",
-		modelId: string,
-		flight: InFlight,
-	): JudgeResult {
-		const result: JudgeResult = {
-			answers: total.stopReason === "stop" ? total.answers : {},
-			dropped: total.stopReason === "stop" ? total.dropped : [],
-			backend,
-			model: modelId,
-			stopReason: total.stopReason,
-			reuse: total.reuse,
-		};
-		if (total.errorMessage) result.errorMessage = total.errorMessage;
-		if (total.contextOverflow) result.contextOverflow = true;
-		if (usages.length > 0) result.usage = sumUsage(usages);
-		// F4: judgment commits flush ONLY for a completed non-aborted request
-		// that still owns the live cache. An aborted request persists no new
-		// judgments; a stale request (branch switched) writes nothing to the
-		// new branch.
-		if (total.stopReason !== "aborted") flushJudgments(flight);
-		// One compact accounting record per request (counts only, never
-		// bodies) — only when this request still owns the live cache.
-		if (ownsLiveCache(flight)) {
-			ledger({
-				kind: "diag",
+			return terminal({
+				answers: finalAnswers,
+				dropped,
 				backend,
 				model: modelId,
-				hits: total.reuse.hits,
-				joined: total.reuse.joined,
-				sent: total.reuse.sent,
-				inputTokens: result.usage?.input ?? 0,
-				outputTokens: result.usage?.output ?? 0,
-				outcome: total.stopReason,
+				stopReason: "stop",
+				capacity,
+				...(result.usage ? { usage: result.usage } : {}),
+			});
+		} catch (error) {
+			// Absolute backstop: any residual throw resolves structurally.
+			const stopped = interruptedResult(flight, config);
+			if (stopped) return stoppedOutcome(stopped);
+			const message = error instanceof Error ? error.message : String(error);
+			return terminal({
+				...resultShell(
+					flight.selected?.backend ?? "llm",
+					flight.selected?.model ?? config.model ?? "",
+				),
+				stopReason: "error",
+				errorMessage: redactString(publicErrorMessage(message), secrets),
 			});
 		}
-		return result;
+	}
+
+	/**
+	 * One backend dispatch over the complete immutable question set. The
+	 * native path uses PINNED dispatch (`classifyWithModel`) with the frozen
+	 * model; the LLM path receives the frozen effective thinking level. Both
+	 * run entirely inside the attempt's combined clock signal; generation
+	 * progress renews only the idle clock.
+	 */
+	async function dispatch(
+		backend: "classifier" | "llm",
+		model: AnyClassifierModel | AnyModel,
+		context: ClassifierContext,
+		flight: Flight,
+		thinkingLevel: string,
+	): Promise<ClassifierResult> {
+		if (flight.clocks.signal.aborted) {
+			return {
+				api: (backend === "classifier"
+					? model.api
+					: "llm-as-jev") as ClassifierApi,
+				provider: model.provider,
+				model: model.id,
+				answers: {},
+				timestamp: Date.now(),
+				stopReason: "aborted",
+				errorMessage: "request aborted before dispatch",
+			};
+		}
+		const options = {
+			signal: flight.clocks.signal,
+			progress: () => flight.clocks.progress(),
+			fetch: runtime.nativeFetch,
+		};
+		// A settled-but-late result can never outlive the caller: race the
+		// backend promise against the combined signal so a non-cooperative
+		// adapter still settles the attempt.
+		const run =
+			backend === "classifier"
+				? classifyWithModel(
+						runtime.registry,
+						model as AnyClassifierModel,
+						context,
+						options,
+					)
+				: llmClassify(runtime.registry, model as AnyModel, context, {
+						thinkingLevel: thinkingLevel as JudgmentThinkingLevel,
+						...options,
+						onAnswer: () => flight.clocks.progress(),
+					});
+		const settled = await bounded(run, flight.clocks.signal);
+		if (settled === undefined) {
+			return {
+				api: (backend === "classifier"
+					? model.api
+					: "llm-as-jev") as ClassifierApi,
+				provider: model.provider,
+				model: model.id,
+				answers: {},
+				timestamp: Date.now(),
+				stopReason: "error",
+				errorMessage: "attempt did not settle within its clocks",
+			};
+		}
+		return settled;
+	}
+
+	/**
+	 * Service-authored category for a failed attempt, never a provider body.
+	 */
+	function failureSummary(result: JudgeResult, flight: Flight): string {
+		const message = result.errorMessage ?? "";
+		if (result.contextOverflow || /context overflow/i.test(message))
+			return "context overflow";
+		if (
+			flight.clocks.hardExpired() ||
+			/timed out|no generation progress/i.test(message)
+		)
+			return `timed out after ${flight.effective.idleTimeoutMs}ms`;
+		if (
+			/did not return a valid|incompatible answer|returned no answer|lacks/i.test(
+				message,
+			)
+		)
+			return "invalid or incompatible output";
+		return "provider or transport failure";
 	}
 
 	return service;
-}
-
-/**
- * Wrapper state for one stage: fixed state, current evidence batch and
- * advisory previous answers, plus final-stage marker. Fixed state is never
- * mutated by subdivision.
- */
-function stageState(
-	state: JsonObject,
-	batch: FramedEvidence[],
-	previousAnswers: Record<string, ClassifierAnswer>,
-	isFinalStage: boolean,
-): JsonObject {
-	const out: JsonObject = {
-		fixed: state,
-		// Model-facing evidence: caller records with bounds projected OUTSIDE
-		// metadata (`fragmentBounds`), never a mutation of caller JSON.
-		evidence: toModelEvidence(batch),
-		previousAnswers: previousAnswers as unknown as JsonValue,
-		progress: {
-			processedBytes: batch.reduce((s, f) => s + f.record.text.length, 0),
-			final: isFinalStage,
-		},
-	};
-	return out;
 }

@@ -16,13 +16,31 @@
 
 import { readFileSync } from "node:fs";
 import * as fs from "node:fs/promises";
-import type { CapacityLimits } from "./capacity.js";
+
+/** Declared context limits for one exact `provider/modelid` reference. */
+export interface ContextLimitProfile {
+	request?: number;
+	stateAndLongestQuestion?: number;
+}
 
 /** Exact provider/model references; an override replaces the default profile. */
-export type ContextLimitOverrides = Record<
-	string,
-	Pick<CapacityLimits, "request" | "stateAndLongestQuestion">
->;
+export type ContextLimitOverrides = Record<string, ContextLimitProfile>;
+
+/** Per-backend-slot waiting configuration (version two). */
+export interface BackendTimeouts {
+	/**
+	 * Generation-progress idle duration (ms). Renewed only by nonempty
+	 * generated text/reasoning/tool-argument deltas or a validated completed
+	 * question answer; heartbeats, headers, empty events and request starts
+	 * never renew it.
+	 */
+	idleTimeoutMs?: number;
+	/**
+	 * Optional whole-model-attempt hard limit (ms) over setup, every question
+	 * and the single permitted output repair. Absent means NO hard limit.
+	 */
+	modelTimeoutMs?: number;
+}
 
 export type JudgmentMode = "auto" | "auto-llm" | "classifier" | "llm";
 export type JudgmentThinkingLevel =
@@ -35,14 +53,15 @@ export type JudgmentThinkingLevel =
 	| "max";
 
 export const DEFAULT_MODE: JudgmentMode = "auto";
-/** Native classifier default: one absolute logical-call deadline. A slower
- * class model is a performance problem, not a reason for a longer wait. */
-export const DEFAULT_NATIVE_TIMEOUT_MS = 60_000;
-/** LLM default: Pi's own HTTP idle timeout (`httpIdleTimeoutMs`), read from the
- * host settings when available; this constant is Pi's documented default. */
-export const DEFAULT_HOST_IDLE_TIMEOUT_MS = 300_000;
-/** @deprecated Single-value default retired; kept for compatibility reads. */
-export const DEFAULT_TIMEOUT_MS = DEFAULT_NATIVE_TIMEOUT_MS;
+/** Native classifier default generation-progress idle window (ms). */
+export const DEFAULT_CLASSIFIER_IDLE_TIMEOUT_MS = 10_000;
+/** LLM default generation-progress idle window (ms). */
+export const DEFAULT_LLM_IDLE_TIMEOUT_MS = 15_000;
+/** Largest accepted timer duration (platform setTimeout range). */
+export const MAX_TIMEOUT_MS = 2_147_483_647;
+
+/** Legacy field surface for the explicit migration diagnostic. */
+export const LEGACY_TIMEOUT_FIELD = "timeoutMs";
 
 export interface JudgmentConfig {
 	mode: JudgmentMode;
@@ -62,10 +81,45 @@ export interface JudgmentConfig {
 	/** Provider portion of `model`, before the first slash. */
 	provider?: string;
 	thinkingLevel: JudgmentThinkingLevel;
-	/** Explicit default for calls that omit `timeoutMs`. Unset means backend
-	 * defaults: native 60 s absolute, LLM Pi's `httpIdleTimeoutMs` inactivity. */
-	timeoutMs?: number;
+	/** Backend-slot waiting policies; each key is optional per slot. */
+	timeouts?: {
+		classifier?: BackendTimeouts;
+		llm?: BackendTimeouts;
+	};
 	contextLimits?: ContextLimitOverrides;
+}
+
+/**
+ * Effective waiting policy for one backend family. `modelTimeoutMs`
+ * undefined means NO hard limit — never derived from idle or host settings.
+ */
+export interface EffectiveTimeouts {
+	idleTimeoutMs: number;
+	modelTimeoutMs?: number;
+}
+
+/**
+ * Resolve the effective per-attempt waiting policy. Precedence: caller
+ * option > configured backend slot > idle default / no hard limit. Each
+ * attempted family resolves independently; fallback never inherits spent
+ * time or another family's policy fields unless the same caller override
+ * applies to both.
+ */
+export function resolveTimeouts(
+	config: JudgmentConfig,
+	backend: "classifier" | "llm",
+	caller: { idleTimeoutMs?: number; modelTimeoutMs?: number } | undefined,
+): EffectiveTimeouts {
+	const slot = config.timeouts?.[backend];
+	return {
+		idleTimeoutMs:
+			caller?.idleTimeoutMs ??
+			slot?.idleTimeoutMs ??
+			(backend === "classifier"
+				? DEFAULT_CLASSIFIER_IDLE_TIMEOUT_MS
+				: DEFAULT_LLM_IDLE_TIMEOUT_MS),
+		modelTimeoutMs: caller?.modelTimeoutMs ?? slot?.modelTimeoutMs,
+	};
 }
 
 export interface ConfigDiagnostic {
@@ -78,6 +132,12 @@ export interface LoadedConfig {
 	diagnostics: ConfigDiagnostic[];
 	/** True when no file exists and defaults were applied. */
 	defaults: boolean;
+	/**
+	 * True while the legacy top-level `timeoutMs` field is present. Other
+	 * settings still apply, but inference must refuse until the field is
+	 * removed or replaced with explicit `timeouts` members.
+	 */
+	migrationRequired?: boolean;
 }
 
 const MODES: readonly JudgmentMode[] = [
@@ -101,6 +161,7 @@ const KNOWN_KEYS = [
 	"model",
 	"thinkingLevel",
 	"timeoutMs",
+	"timeouts",
 	"contextLimits",
 ] as const;
 let saveSeq = 0;
@@ -205,9 +266,10 @@ export function validateConfig(raw: unknown): LoadedConfig {
 		classifierModel?: { provider: string; modelId: string };
 		model?: { provider: string; modelId: string };
 		thinkingLevel?: JudgmentThinkingLevel;
-		timeoutMs?: number;
+		timeouts?: JudgmentConfig["timeouts"];
 		contextLimits?: ContextLimitOverrides;
 	} = {};
+	let migrationRequired = false;
 	let invalid = false;
 
 	if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
@@ -263,19 +325,27 @@ export function validateConfig(raw: unknown): LoadedConfig {
 		}
 	}
 
-	if (obj.timeoutMs !== undefined) {
-		if (
-			typeof obj.timeoutMs === "number" &&
-			Number.isFinite(obj.timeoutMs) &&
-			Number.isInteger(obj.timeoutMs) &&
-			obj.timeoutMs > 0
-		) {
-			fields.timeoutMs = obj.timeoutMs;
-		} else {
+	// Legacy top-level `timeoutMs` had two incompatible meanings (native
+	// whole-call deadline vs LLM inactivity). It is never silently mapped or
+	// dropped: presence requires explicit migration. Other valid known fields
+	// still apply; inference callers must refuse until it is removed.
+	if (Object.hasOwn(obj, LEGACY_TIMEOUT_FIELD)) {
+		migrationRequired = true;
+		diagnostics.push({
+			message: `llm-as-jev.json: legacy "${LEGACY_TIMEOUT_FIELD}" requires migration: remove it for the 10s classifier / 15s LLM idle defaults, or replace it with timeouts.classifier and/or timeouts.llm {idleTimeoutMs, modelTimeoutMs}; inference is disabled until then`,
+		});
+	}
+
+	if (obj.timeouts !== undefined) {
+		const timeouts = readTimeouts(obj.timeouts);
+		if (timeouts === undefined) {
 			invalid = true;
 			diagnostics.push({
-				message: `llm-as-jev.json: timeoutMs ${JSON.stringify(obj.timeoutMs)} is not a positive finite integer; using default settings`,
+				message:
+					"llm-as-jev.json: timeouts requires classifier/llm objects with positive integer idleTimeoutMs and/or modelTimeoutMs within the timer range; using default settings",
 			});
+		} else {
+			fields.timeouts = timeouts;
 		}
 	}
 
@@ -290,7 +360,15 @@ export function validateConfig(raw: unknown): LoadedConfig {
 		}
 	}
 
-	if (invalid) return { config: defaultConfig(), diagnostics, defaults: false };
+	if (invalid)
+		return {
+			config: defaultConfig(),
+			diagnostics,
+			defaults: false,
+			// Migration still applies: legacy timeoutMs in the file is
+			// reported even though invalid fields fell back to defaults.
+			...(migrationRequired ? { migrationRequired } : {}),
+		};
 
 	if (fields.mode !== undefined) config.mode = fields.mode;
 	if (fields.classifierModel !== undefined) {
@@ -307,10 +385,38 @@ export function validateConfig(raw: unknown): LoadedConfig {
 	}
 	if (fields.thinkingLevel !== undefined)
 		config.thinkingLevel = fields.thinkingLevel;
-	if (fields.timeoutMs !== undefined) config.timeoutMs = fields.timeoutMs;
+	if (fields.timeouts !== undefined) config.timeouts = fields.timeouts;
 	if (fields.contextLimits !== undefined)
 		config.contextLimits = fields.contextLimits;
-	return { config, diagnostics, defaults: false };
+	return { config, diagnostics, defaults: false, migrationRequired };
+}
+
+/** Validate the `timeouts` member: optional slot objects, positive integral ms. */
+function readTimeouts(value: unknown): JudgmentConfig["timeouts"] | undefined {
+	if (value === null || typeof value !== "object" || Array.isArray(value))
+		return undefined;
+	const out: NonNullable<JudgmentConfig["timeouts"]> = {};
+	for (const slot of ["classifier", "llm"] as const) {
+		const raw = (value as Record<string, unknown>)[slot];
+		if (raw === undefined) continue;
+		if (raw === null || typeof raw !== "object" || Array.isArray(raw))
+			return undefined;
+		const slotTimeouts: BackendTimeouts = {};
+		for (const field of ["idleTimeoutMs", "modelTimeoutMs"] as const) {
+			const v = (raw as Record<string, unknown>)[field];
+			if (v === undefined) continue;
+			if (
+				typeof v !== "number" ||
+				!Number.isInteger(v) ||
+				v <= 0 ||
+				v > MAX_TIMEOUT_MS
+			)
+				return undefined;
+			slotTimeouts[field] = v;
+		}
+		out[slot] = slotTimeouts;
+	}
+	return out;
 }
 
 /** Shared decoding for asynchronous operations and synchronous metadata. */
@@ -375,7 +481,9 @@ export function loadConfigSync(dir = agentDir()): LoadedConfig {
  * invalid update throws before writing: the confirmed save can never
  * silently resurrect invalid persisted fields or drop the new choice. The
  * written file contains exactly the validated known fields plus preserved
- * extras, and the returned config equals what a reload would produce.
+ * extras and any legacy timeout migration marker; ordinary saves cannot
+ * resolve its ambiguous semantics. The returned config and migration state
+ * equal what a reload would produce.
  *
  * The two model slots are independent: updating one leaves the other
  * untouched. Pass `null` for `classifierModel` or `model` to remove that
@@ -387,7 +495,7 @@ export async function saveConfig(
 		classifierModel?: string | null;
 		model?: string | null;
 		thinkingLevel?: JudgmentThinkingLevel;
-		timeoutMs?: number;
+		timeouts?: JudgmentConfig["timeouts"] | null;
 		contextLimits?: ContextLimitOverrides | null;
 	},
 	dir = agentDir(),
@@ -424,12 +532,15 @@ export async function saveConfig(
 	//    write (no resurrected "jev" modes or malformed references).
 	const base = validateConfig(existing).config;
 
-	// 2. Unknown own extras survive verbatim — including `__proto__` — via
-	//    defineProperty on a null-prototype record, so special keys are never
-	//    routed through Object.prototype mutation.
+	// 2. Unknown own extras and the legacy migration marker survive verbatim,
+	//    including `__proto__`, via defineProperty on a null-prototype record.
+	//    Only an explicit file edit can remove legacy timeout ambiguity.
 	const next: Record<string, unknown> = Object.create(null);
 	for (const key of Object.keys(existing)) {
-		if (!(KNOWN_KEYS as readonly string[]).includes(key)) {
+		if (
+			key === LEGACY_TIMEOUT_FIELD ||
+			!(KNOWN_KEYS as readonly string[]).includes(key)
+		) {
 			Object.defineProperty(next, key, {
 				value: existing[key],
 				enumerable: true,
@@ -461,8 +572,19 @@ export async function saveConfig(
 		update.thinkingLevel !== undefined
 			? update.thinkingLevel
 			: base.thinkingLevel;
-	candidate.timeoutMs =
-		update.timeoutMs !== undefined ? update.timeoutMs : base.timeoutMs;
+	if (update.timeouts === null) {
+		// removed — all timing slots reset to defaults
+	} else if (update.timeouts !== undefined) {
+		// Slot-wise merge: an update naming one backend preserves the other.
+		const merged: JudgmentConfig["timeouts"] = {};
+		for (const slot of ["classifier", "llm"] as const) {
+			const next = update.timeouts[slot] ?? base.timeouts?.[slot];
+			if (next !== undefined) merged[slot] = next;
+		}
+		candidate.timeouts = merged;
+	} else if (base.timeouts !== undefined) {
+		candidate.timeouts = base.timeouts;
+	}
 	const contextLimits =
 		update.contextLimits === undefined
 			? base.contextLimits
@@ -476,12 +598,11 @@ export async function saveConfig(
 		throw new Error(merged.diagnostics.map((d) => d.message).join("; "));
 	}
 
-	// 5. Exactly the validated known fields plus preserved extras.
+	// 5. Validated known fields plus preserved extras and migration marker.
 	next.mode = merged.config.mode;
 	next.thinkingLevel = merged.config.thinkingLevel;
-	if (merged.config.timeoutMs !== undefined)
-		next.timeoutMs = merged.config.timeoutMs;
-	else delete next.timeoutMs;
+	if (merged.config.timeouts !== undefined)
+		next.timeouts = merged.config.timeouts;
 	if (merged.config.model !== undefined) {
 		next.model = merged.config.model;
 	}
@@ -510,9 +631,9 @@ export async function saveConfig(
 		throw error;
 	}
 
+	const saved = validateConfig(next);
 	return {
-		config: merged.config,
-		diagnostics,
-		defaults: false,
+		...saved,
+		diagnostics: [...diagnostics, ...saved.diagnostics],
 	};
 }

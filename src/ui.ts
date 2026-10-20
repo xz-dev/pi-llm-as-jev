@@ -9,6 +9,10 @@
 import { getSupportedThinkingLevels } from "@earendil-works/pi-ai";
 import { fuzzyMatch } from "@earendil-works/pi-tui";
 import type { JudgmentConfig, JudgmentThinkingLevel } from "./config.js";
+import {
+	DEFAULT_CLASSIFIER_IDLE_TIMEOUT_MS,
+	DEFAULT_LLM_IDLE_TIMEOUT_MS,
+} from "./config.js";
 
 /** Pi's own model default level (coding-agent `DEFAULT_THINKING_LEVEL`). */
 export const DEFAULT_THINKING_LEVEL: JudgmentThinkingLevel = "medium";
@@ -129,6 +133,8 @@ export interface StatusInput {
 	/** Service availability snapshot; undefined when the service isn't bound. */
 	availability?: Availability;
 	configPath: string;
+	/** True while the legacy `timeoutMs` field requires explicit migration. */
+	migrationRequired?: boolean;
 }
 
 export interface StatusOverview {
@@ -155,6 +161,7 @@ export function formatStatus({
 	config,
 	availability,
 	configPath,
+	migrationRequired,
 }: StatusInput): StatusOverview {
 	const mode = config.mode;
 	const usableClassifier = availability?.classifier;
@@ -196,11 +203,25 @@ export function formatStatus({
 		llmRow = usableLlm ? config.model : `${config.model} (unavailable)`;
 	}
 
+	const idle = (slot: "classifier" | "llm") =>
+		config.timeouts?.[slot]?.idleTimeoutMs ??
+		(slot === "classifier"
+			? DEFAULT_CLASSIFIER_IDLE_TIMEOUT_MS
+			: DEFAULT_LLM_IDLE_TIMEOUT_MS);
+	const hard = (slot: "classifier" | "llm") => {
+		const value = config.timeouts?.[slot]?.modelTimeoutMs;
+		return value === undefined ? "disabled" : `${value}ms`;
+	};
 	const rows: [string, string][] = [
 		["Mode", modeLabel],
 		["Classifier", classifierRow],
 		["LLM", llmRow],
 		["Thinking", config.thinkingLevel],
+		[
+			"Classifier wait",
+			`${idle("classifier")}ms idle, hard cap ${hard("classifier")}`,
+		],
+		["LLM wait", `${idle("llm")}ms idle, hard cap ${hard("llm")}`],
 		["Config", configPath],
 	];
 	const width = Math.max(...rows.map(([label]) => label.length));
@@ -211,7 +232,10 @@ export function formatStatus({
 	].join("\n");
 
 	let warning: string | undefined;
-	if (availability !== undefined) {
+	if (migrationRequired) {
+		warning =
+			'llm-as-jev.json: legacy "timeoutMs" requires migration: remove it for the 10s/15s idle defaults or replace it with explicit timeouts slots; inference is disabled until then';
+	} else if (availability !== undefined) {
 		if (
 			(mode === "auto" || mode === "auto-llm") &&
 			!usableClassifier &&

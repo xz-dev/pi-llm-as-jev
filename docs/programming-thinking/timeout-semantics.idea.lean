@@ -1,141 +1,244 @@
 /-
-Authoritative process model: backend-specific timeout/cancellation
-semantics for the judgment service timeout slice. LLM work waits on
-transport inactivity (including a bounded first-response wait and the
-bounded setup phase that precedes it); native classifier work waits on one
-absolute whole-call deadline that is never reset across internal stages.
-An automatic-mode OPERATION owns caller cancellation across at most two
-backend attempts: each ATTEMPT gets a fresh window under its own policy,
-the unused alternate may run after the preferred attempt's window expires,
-and no bounded total wall clock is claimed over an LLM attempt. This file
-models ONLY that slice; it does not claim the managed-review lifecycle
-proved. Self-contained: lean --run executes the witness.
+Authoritative process model: backend-attempt timeout/cancellation
+semantics for the stateless judgment service. EVERY backend attempt gets
+one generation-progress idle clock (native classifier default 10,000 ms,
+LLM default 15,000 ms) plus an optional absent-by-default hard clock
+(`modelTimeoutMs`). Both clocks start at attempt admission, span setup,
+credential readiness, EVERY question and the single permitted repair per
+question. Only nonempty generated text, reasoning or tool-argument
+deltas — or a completed validated question answer — renew the idle
+clock; heartbeats, headers, empty/lifecycle events, request starts and
+setup completion never do. The hard clock never renews; an omitted hard
+limit means no hard limit, and no combined primary-plus-alternate budget
+exists. An automatic-mode OPERATION owns caller cancellation across at
+most two sequential backend attempts; the unused alternate may run after
+the preferred attempt ends and gets fresh independent clocks of its own.
+This file models ONLY that slice. Self-contained: `lean --run` executes
+the witness.
 -/
 set_option autoImplicit false
 
 namespace TimeoutSemantics
 
-/-- The two real backend families with different waiting contracts. -/
+/-- The two real backend families, each with its own idle default. -/
 inductive BackendKind where
   | llm
   | nativeClassifier
   deriving DecidableEq, Repr
 
-/-- What the caller's `timeoutMs` means, chosen by the selected backend. -/
-inductive WaitPolicy where
-  /-- LLM: inactivity timeout — abort only after `ms` with no observed
-      transport activity. Continuous raw activity (prose, reasoning,
-      tool-argument and protocol/SSE-keepalive bytes) outlasts any total
-      wall clock. Covers the bounded wait for the first byte too. -/
-  | inactivity (ms : Nat)
-  /-- Native classifier: absolute deadline — abort once total elapsed
-      time since logical-call start exceeds `ms`, regardless of activity.
-      Not reset across internal stages or subdivisions. -/
-  | absolute (ms : Nat)
+/-- Default idle window in milliseconds per backend family. -/
+def defaultIdleMs : BackendKind → Nat
+  | .llm => 15_000
+  | .nativeClassifier => 10_000
+
+/-- Whether an observed event renews the idle clock. -/
+inductive ProgressEvent where
+  /-- Nonempty normalized generated text delta. -/
+  | textDelta
+  /-- Nonempty normalized reasoning/thinking delta. -/
+  | thinkingDelta
+  /-- Nonempty normalized tool-argument delta. -/
+  | toolcallDelta
+  /-- A complete question answer passed validation. -/
+  | completedAnswer
+  /-- Protocol heartbeat/keepalive byte. -/
+  | heartbeat
+  /-- Header, empty or lifecycle event with no payload. -/
+  | emptyEvent
+  /-- New request dispatch, retry start or setup completion. -/
+  | requestStart
   deriving DecidableEq, Repr
 
-/-- The policy is a function of the selected backend, not of the option
-    name: both interpretations read the same `timeoutMs` value. -/
-def policyFor (backend : BackendKind) (timeoutMs : Nat) : WaitPolicy :=
-  match backend with
-  | .llm => .inactivity timeoutMs
-  | .nativeClassifier => .absolute timeoutMs
+/-- Only genuine generation progress renews idle: nonempty deltas or a
+    validated completed answer. Heartbeats, empty events and request
+    starts never renew it. -/
+def renewsIdle : ProgressEvent → Bool
+  | .textDelta => true
+  | .thinkingDelta => true
+  | .toolcallDelta => true
+  | .completedAnswer => true
+  | _ => false
 
-/-- One timed provider request inside a logical call. -/
+/-- One timed backend attempt of an operation. The idle window is always
+    present; the hard window is optional (`none` = no hard limit). -/
 structure TimedAttempt where
   backend : BackendKind
-  timeoutMs : Nat
+  idleMs : Nat
+  /-- Optional absolute cap counted from attempt admission. -/
+  hardMs : Option Nat
 
-/-- What can make an attempt settle before its natural outcome. -/
+/-- Wall-clock facts about one in-flight attempt. Both counters measure
+    from the same admission instant. -/
+structure AttemptClock where
+  /-- Milliseconds since attempt admission (covers setup/auth/all
+      questions/repair — never reset). -/
+  elapsed : Nat
+  /-- Milliseconds since the last genuine generation progress event. -/
+  sinceProgress : Nat
+
+/-- Attempt must stop now: the hard cap fires on total elapsed since
+    admission when configured; the idle cap fires when genuine progress
+    went silent for the full window. Whichever expires first wins. -/
+def mustStop (a : TimedAttempt) (clock : AttemptClock) : Bool :=
+  clock.sinceProgress >= a.idleMs ||
+    (match a.hardMs with
+     | some ms => clock.elapsed >= ms
+     | none => false)
+
+/-- Any renewing event resets the idle counter to zero; elapsed (and
+    therefore the hard clock) keeps counting from admission. -/
+def onEvent (clock : AttemptClock) (event : ProgressEvent) : AttemptClock :=
+  if renewsIdle event then { clock with sinceProgress := 0 } else clock
+
+/-! ## Idle-clock facts -/
+
+/-- Heartbeats never renew idle: a stream that only emits keepalives
+    still expires at the idle window. -/
+theorem heartbeat_no_renew (clock : AttemptClock) :
+    onEvent clock .heartbeat = clock := by
+  simp [onEvent, renewsIdle]
+
+/-- Empty/lifecycle events never renew idle. -/
+theorem empty_event_no_renew (clock : AttemptClock) :
+    onEvent clock .emptyEvent = clock := by
+  simp [onEvent, renewsIdle]
+
+/-- Request dispatches, retries and setup completion never renew idle. -/
+theorem request_start_no_renew (clock : AttemptClock) :
+    onEvent clock .requestStart = clock := by
+  simp [onEvent, renewsIdle]
+
+/-- Every genuine progress event resets the idle counter. -/
+theorem progress_renews (clock : AttemptClock) (event : ProgressEvent)
+    (h : renewsIdle event = true) :
+    (onEvent clock event).sinceProgress = 0 := by
+  simp [onEvent, h]
+
+/-- Generation that stays within each idle window outlasts any fixed
+    total when no hard limit is configured: a stream still progressing
+    at `n` elapsed need not stop. -/
+theorem no_hard_cap_no_total (idle n : Nat) (h : idle > 0) :
+    mustStop ⟨.llm, idle, none⟩ ⟨n, idle - 1⟩ = false := by
+  simp [mustStop]
+  omega
+
+/-- Silence for the full idle window stops the attempt even when total
+    elapsed is still short — heartbeats cannot rescue it. -/
+theorem silent_gap_stops (idle elapsed : Nat) :
+    mustStop ⟨.llm, idle, none⟩ ⟨elapsed, idle⟩ = true := by
+  simp [mustStop]
+
+/-- A non-streaming native adapter producing no progress for its idle
+    window expires while waiting for its complete answer. -/
+theorem native_silence_stops (idle elapsed : Nat) :
+    mustStop ⟨.nativeClassifier, idle, none⟩ ⟨elapsed, idle⟩ = true := by
+  simp [mustStop]
+
+/-! ## Hard-clock facts -/
+
+/-- The hard cap is an absolute deadline from admission: it fires on
+    total elapsed even while genuine progress continues, and never
+    renews. -/
+theorem hard_cap_absolute (idle hard : Nat) :
+    mustStop ⟨.llm, idle, some hard⟩ ⟨hard, 0⟩ = true := by
+  simp [mustStop]
+
+/-- Genuine progress cannot extend the hard deadline: recent activity
+    with elapsed past the cap still stops. -/
+theorem hard_cap_ignores_progress (idle hard : Nat) :
+    mustStop ⟨.llm, idle, some hard⟩ ⟨hard, 1⟩ = true := by
+  simp [mustStop]
+
+/-- An idle expiry wins before the hard cap when the hard cap is longer:
+    whichever expires first ends the attempt. -/
+theorem idle_expires_first (idle hard : Nat) (_h : hard > idle) :
+    mustStop ⟨.llm, idle, some hard⟩ ⟨idle, idle⟩ = true := by
+  simp [mustStop]
+
+/-! ## Failover slice
+
+One OPERATION admits at most one backend switch. Operation-level caller
+cancellation is terminal for both attempts; an eligible failure only
+ends THAT attempt and may admit the unused alternate, which receives
+fresh independent clocks from its own admission — never the primary's
+exhausted deadline or a shared leftover budget. -/
+
+/-- What happened to one backend attempt of an operation. -/
+inductive AttemptOutcome where
+  /-- Completed with a business result (including valid negative or
+      all-dropped views: success, never failover permission). -/
+  | completed
+  /-- An eligible backend failure (idle/hard expiry, unavailable or
+      context overflow): admits the unused alternate. -/
+  | eligibleFailure
+  /-- The operation caller cancelled: terminal for the whole operation. -/
+  | operationCancelled
+  deriving DecidableEq, Repr
+
+/-- An operation's routing decision after one attempt, given whether an
+    unused alternate backend family remains: `true` = start the
+    alternate (the one permitted switch). -/
+def switchesBackend (outcome : AttemptOutcome) (alternateRemains : Bool) :
+    Bool :=
+  match outcome with
+  | .completed => false           -- stop on success
+  | .operationCancelled => false  -- terminal abort, no alternate
+  | .eligibleFailure => alternateRemains
+
+/-- The alternate's clocks start at zero from its own admission. -/
+def freshClock (_primary : AttemptClock) : AttemptClock :=
+  { elapsed := 0, sinceProgress := 0 }
+
+/-- A fresh alternate attempt is not immediately timed out, even when
+    the primary attempt expired with the same timing parameters. -/
+theorem fresh_alternate_not_stopped (a : TimedAttempt)
+    (hidle : a.idleMs > 0) (hhard : ∀ ms, a.hardMs = some ms → ms > 0)
+    (primary : AttemptClock)
+    (_h : mustStop a primary = true) :
+    mustStop a (freshClock primary) = false := by
+  simp [mustStop, freshClock]
+  refine ⟨by omega, ?_⟩
+  cases hh : a.hardMs with
+  | none => simp
+  | some ms => simp; have := hhard ms hh; omega
+
+/-- Eligible failure permits at most one alternate; completion and
+    operation cancellation never start one, and when no alternate
+    remains nothing starts. -/
+theorem bounded_switching :
+    (∀ alt, switchesBackend .completed alt = false) ∧
+    (∀ alt, switchesBackend .operationCancelled alt = false) ∧
+    switchesBackend .eligibleFailure true = true ∧
+    switchesBackend .eligibleFailure false = false := by
+  refine ⟨fun _ => rfl, fun _ => rfl, rfl, rfl⟩
+
+/-- Caller cancellation observed between attempts ends the operation
+    without dispatching the alternate, even though an eligible failure
+    would have started it. -/
+theorem cancel_between_attempts_wins :
+    switchesBackend .operationCancelled true = false ∧
+      switchesBackend .eligibleFailure true = true := by
+  exact ⟨rfl, rfl⟩
+
+/-- The alternate keeps its whole budget: its hard cap counts from its
+    own admission, so an exhausted primary cap never subtracts from it. -/
+theorem alternate_whole_budget (idle hard elapsed : Nat)
+    (_h : elapsed >= hard) (hidle : idle > 0) (hhard : hard > 0) :
+    mustStop ⟨.llm, idle, some hard⟩
+      (freshClock ⟨elapsed, elapsed⟩) = false := by
+  simp [mustStop, freshClock]
+  omega
+
+/-! ## Caller cancellation -/
+
+/-- What settled an attempt: cancellation is orthogonal to both clocks
+    and always wins. -/
 inductive TimeoutVerdict where
   | settled
   | callerCancelled
   | timedOut
   deriving DecidableEq, Repr
 
-/-- Wall-clock facts about one in-flight attempt. -/
-structure AttemptClock where
-  /-- Milliseconds since the attempt began. -/
-  elapsed : Nat
-  /-- Milliseconds since the last observed transport activity byte/event.
-      For an attempt that has not yet produced its first byte this equals
-      `elapsed` — the bounded first-response wait is the same clock. -/
-  sinceActivity : Nat
-
-/-- Attempt must stop now: inactivity fires only when the stream went
-    silent for the full window; absolute fires on total elapsed time. -/
-def mustStop (a : TimedAttempt) (clock : AttemptClock) : Bool :=
-  match policyFor a.backend a.timeoutMs with
-  | .inactivity ms => clock.sinceActivity >= ms
-  | .absolute ms => clock.elapsed >= ms
-
-/-- Transport activity resets the LLM clock only. -/
-def onActivity (a : TimedAttempt) (clock : AttemptClock) : AttemptClock :=
-  match policyFor a.backend a.timeoutMs with
-  | .inactivity _ => { clock with sinceActivity := 0 }
-  | .absolute _ => clock
-
-/-- LLM continuous activity can outlast any fixed total duration: pick a
-    total of `2 * ms` with the last byte arriving just inside the window. -/
-theorem llm_activity_outlasts_total (ms : Nat) (hms : ms > 0) :
-    mustStop ⟨.llm, ms⟩ ⟨2 * ms, ms - 1⟩ = false := by
-  simp [mustStop, policyFor]
-  omega
-
-/-- The same clock under a native absolute deadline must stop: the total
-    elapsed time alone decides, regardless of recent activity. -/
-theorem native_absolute_ignores_activity (ms : Nat) (hms : ms > 0) :
-    mustStop ⟨.nativeClassifier, ms⟩ ⟨2 * ms, ms - 1⟩ = true := by
-  simp [mustStop, policyFor]
-  omega
-
-/-- Activity observed inside the window resets the LLM inactivity clock. -/
-theorem llm_activity_resets (ms : Nat) (clock : AttemptClock) :
-    (onActivity ⟨.llm, ms⟩ clock).sinceActivity = 0 := by
-  simp [onActivity, policyFor]
-
-/-- Activity does not extend a native absolute deadline. -/
-theorem native_activity_no_reset (ms : Nat) (clock : AttemptClock) :
-    onActivity ⟨.nativeClassifier, ms⟩ clock = clock := by
-  simp [onActivity, policyFor]
-
-/-- An LLM stream silent for the full window must stop even when its total
-    duration is still short — no first-byte or mid-stream gap may hang. -/
-theorem llm_silent_gap_stops (ms elapsed : Nat) (_h : elapsed < ms) :
-    mustStop ⟨.llm, ms⟩ ⟨elapsed, ms⟩ = true := by
-  simp [mustStop, policyFor]
-
-/-- Two successive questions are separate attempts: a fresh attempt's
-    inactivity clock starts at zero, so a second question is not billed
-    for the first question's elapsed time. -/
-theorem llm_question_fresh_clock (ms : Nat) (hms : ms > 0) :
-    mustStop ⟨.llm, ms⟩ ⟨0, 0⟩ = false := by
-  simp [mustStop, policyFor]
-  omega
-
-/-- In-flight join safety: a caller joining shared pending work waits on
-    its own signal; a joiner whose required inactivity window differs from
-    the owner's may not silently inherit the owner's wait. Modeled by
-    making the joinable flag a function of policy equality. -/
-def joinable (owner waiter : TimedAttempt) : Bool :=
-  policyFor owner.backend owner.timeoutMs ==
-    policyFor waiter.backend waiter.timeoutMs
-
-/-- A silent gap stops the LLM attempt even when total elapsed is below
-    the window: inactivity, not duration, is the trigger. `elapsed` only
-    witnesses that the silent clock is the operative one. -/
-theorem join_compatible_when_policies_match (ms : Nat) :
-    joinable ⟨.llm, ms⟩ ⟨.llm, ms⟩ = true := by
-  simp [joinable, policyFor]
-
-theorem join_incompatible_when_policies_differ (ms ms' : Nat)
-    (h : ms ≠ ms') :
-    joinable ⟨.llm, ms⟩ ⟨.llm, ms'⟩ = false := by
-  simp [joinable, policyFor]
-  omega
-
-/-- Caller cancellation is orthogonal to both policies: an aborted attempt
-    settles as cancelled regardless of which clock would fire later. -/
 def attemptOutcome (cancelled : Bool) (a : TimedAttempt)
     (clock : AttemptClock) : TimeoutVerdict :=
   if cancelled then .callerCancelled
@@ -146,131 +249,64 @@ theorem caller_cancel_wins (a : TimedAttempt) (clock : AttemptClock) :
     attemptOutcome true a clock = .callerCancelled := by
   simp [attemptOutcome]
 
-/-- Top-level correctness claim for this slice: the same `timeoutMs`
-    selects inactivity waiting for LLM and absolute waiting for the native
-    backend; LLM activity defeats a total clock and silence defeats
-    activity; native waits never reset; joins require equal policies; and
-    caller cancellation always settles first. -/
+/-- Top-level correctness claim for this slice: heartbeats and empty
+    events never renew idle; only genuine progress does; idle silence
+    stops at the window; a configured hard cap is absolute from admission
+    and ignores progress; no hard cap means no total bound; the alternate
+    gets fresh independent clocks; and caller cancellation always
+    settles first. -/
 theorem timeout_slice_is_correct :
-    (∀ ms : Nat, ms > 0 →
-      mustStop ⟨.llm, ms⟩ ⟨2 * ms, ms - 1⟩ = false ∧
-      mustStop ⟨.nativeClassifier, ms⟩ ⟨2 * ms, ms - 1⟩ = true ∧
-      mustStop ⟨.llm, ms⟩ ⟨0, ms⟩ = true ∧
-      mustStop ⟨.nativeClassifier, ms⟩ ⟨ms, 0⟩ = true ∧
-      (onActivity ⟨.llm, ms⟩ ⟨ms, ms⟩).sinceActivity = 0 ∧
-      onActivity ⟨.nativeClassifier, ms⟩ ⟨ms, ms⟩ = ⟨ms, ms⟩) ∧
-    (∀ ms ms' : Nat, ms ≠ ms' →
-      joinable ⟨.llm, ms⟩ ⟨.llm, ms'⟩ = false) ∧
+    (∀ clock : AttemptClock,
+      onEvent clock .heartbeat = clock ∧
+      onEvent clock .emptyEvent = clock ∧
+      onEvent clock .requestStart = clock) ∧
+    (∀ idle n : Nat, idle > 0 →
+      mustStop ⟨.llm, idle, none⟩ ⟨n, idle - 1⟩ = false ∧
+      mustStop ⟨.llm, idle, none⟩ ⟨0, idle⟩ = true ∧
+      mustStop ⟨.nativeClassifier, idle, none⟩ ⟨0, idle⟩ = true) ∧
+    (∀ idle hard : Nat,
+      mustStop ⟨.llm, idle, some hard⟩ ⟨hard, 0⟩ = true) ∧
     (∀ a : TimedAttempt, ∀ clock : AttemptClock,
       attemptOutcome true a clock = .callerCancelled) := by
-  refine ⟨?_, ?_, ?_⟩
-  · intro ms hms
-    refine ⟨?_, ?_, ?_, ?_, ?_, ?_⟩
-    · exact llm_activity_outlasts_total ms hms
-    · exact native_absolute_ignores_activity ms hms
-    · simp [mustStop, policyFor]
-    · simp [mustStop, policyFor]
-    · exact llm_activity_resets ms ⟨ms, ms⟩
-    · exact native_activity_no_reset ms ⟨ms, ms⟩
-  · intro ms ms' h
-    exact join_incompatible_when_policies_differ ms ms' h
+  refine ⟨?_, ?_, ?_, ?_⟩
+  · intro clock
+    exact ⟨heartbeat_no_renew clock, empty_event_no_renew clock,
+      request_start_no_renew clock⟩
+  · intro idle n h
+    refine ⟨?_, ?_, ?_⟩
+    · exact no_hard_cap_no_total idle n h
+    · exact silent_gap_stops idle 0
+    · exact native_silence_stops idle 0
+  · intro idle hard
+    exact hard_cap_absolute idle hard
   · intro a clock
     exact caller_cancel_wins a clock
 
-/-! ## Automatic failover slice (add-auto-llm-fallback)
-
-One OPERATION admits at most one backend switch. Operation-level caller
-cancellation is terminal for both attempts; a per-attempt window expiry
-only ends THAT attempt and may admit the alternate with a fresh window
-under the alternate's own policy. No total wall clock bounds an LLM
-attempt. -/
-
-/-- What happened to one backend attempt of an operation. -/
-inductive AttemptOutcome where
-  /-- Completed with a business result (including valid negative or
-      all-dropped views: success, never failover permission). -/
-  | completed
-  /-- The attempt's own window expired (setup or execution timeout). -/
-  | windowExpired
-  /-- The operation caller cancelled: terminal for the whole operation. -/
-  | operationCancelled
-  deriving DecidableEq, Repr
-
-/-- An operation's routing decision after one attempt, given whether an
-    unused alternate backend family remains: `true` = start the alternate
-    (the one permitted switch). -/
-def switchesBackend (outcome : AttemptOutcome) (alternateRemains : Bool) :
-    Bool :=
-  match outcome with
-  | .completed => false           -- stop on success
-  | .operationCancelled => false  -- terminal abort, no alternate
-  | .windowExpired => alternateRemains
-
-/-- The alternate's clock starts at zero: its window is fresh, regardless
-    of how much of the preferred attempt's window was consumed. -/
-def freshClock (_preferred : AttemptClock) : AttemptClock :=
-  { elapsed := 0, sinceActivity := 0 }
-
-/-- A fresh alternate attempt is not immediately timed out, even when the
-    preferred attempt expired at the same `ms`. -/
-theorem fresh_alternate_not_stopped (b : BackendKind) (ms : Nat)
-    (hms : ms > 0) (preferred : AttemptClock)
-    (h : mustStop ⟨b, ms⟩ preferred = true) :
-    mustStop ⟨b, ms⟩ (freshClock preferred) = false := by
-  simp [freshClock, mustStop]
-  cases b <;> simp [policyFor] at h ⊢ <;> omega
-
-/-- Window expiry of the preferred attempt permits at most one alternate;
-    completion and operation cancellation never start one, and a second
-    expiry never cycles back (no alternate remains then). -/
-theorem bounded_switching :
-    (∀ alt, switchesBackend .completed alt = false) ∧
-    (∀ alt, switchesBackend .operationCancelled alt = false) ∧
-    switchesBackend .windowExpired true = true ∧
-    switchesBackend .windowExpired false = false := by
-  refine ⟨fun _ => rfl, fun _ => rfl, rfl, rfl⟩
-
-/-- No bounded total wall clock over an LLM attempt: a stream with
-    continuous activity and total elapsed arbitrarily far beyond any
-    candidate bound `n` still need not stop. The failover model therefore
-    claims only per-attempt windows, never a bounded LLM wall time. -/
-theorem no_bounded_llm_wall_clock (ms n : Nat) (hms : ms > 0)
-    (hn : n >= 2 * ms) :
-    ∃ clock : AttemptClock, clock.elapsed >= n ∧
-      mustStop ⟨.llm, ms⟩ clock = false := by
-  refine ⟨⟨n, ms - 1⟩, Nat.le_refl n, ?_⟩
-  simp [mustStop, policyFor]
-  omega
-
-/-- Operation-level caller cancellation is observed between attempts too:
-    it ends the operation without starting the alternate, even when the
-    preferred attempt's window also expired. -/
-theorem cancel_between_attempts_wins :
-    switchesBackend .operationCancelled true = false ∧
-      switchesBackend .windowExpired true = true := by
-  exact ⟨rfl, rfl⟩
-
+/-- Executable witness: the named scenarios run deterministically and
+    print the modeled outcomes. -/
 def main : IO Unit := do
-  let clock : AttemptClock := { elapsed := 60_000, sinceActivity := 29_999 }
-  IO.println s!"llm(30s idle) at 60s elapsed, 30s-1ms idle -> mustStop={mustStop ⟨.llm, 30_000⟩ clock}"
-  IO.println s!"native(30s) at 60s elapsed, 30s-1ms idle -> mustStop={mustStop ⟨.nativeClassifier, 30_000⟩ clock}"
-  IO.println s!"llm silent 30s gap at 5s elapsed -> mustStop={mustStop ⟨.llm, 30_000⟩ ⟨5_000, 30_000⟩}"
-  IO.println s!"join llm(30s)/llm(10s) -> joinable={joinable ⟨.llm, 30_000⟩ ⟨.llm, 10_000⟩}"
-  IO.println s!"cancelled llm -> {repr (attemptOutcome true ⟨.llm, 30_000⟩ clock)}"
-  let expired : AttemptClock := { elapsed := 30_000, sinceActivity := 0 }
-  IO.println s!"preferred llm(30s) expired -> switches(alternate remains)={switchesBackend .windowExpired true}"
-  IO.println s!"preferred completed -> switches={switchesBackend .completed true}"
+  let idle := defaultIdleMs .llm
+  IO.println s!"llm default idle={idle}ms, native default idle={defaultIdleMs .nativeClassifier}ms"
+  IO.println s!"llm(15s idle, no hard) active at 60s -> mustStop={mustStop ⟨.llm, 15_000, none⟩ ⟨60_000, 14_999⟩}"
+  IO.println s!"llm silent 15s gap (heartbeats only) at 60s -> mustStop={mustStop ⟨.llm, 15_000, none⟩ ⟨60_000, 15_000⟩}"
+  IO.println s!"native(10s idle) silent at 10s -> mustStop={mustStop ⟨.nativeClassifier, 10_000, none⟩ ⟨10_000, 10_000⟩}"
+  IO.println s!"llm hard=20s with progress at 20s -> mustStop={mustStop ⟨.llm, 15_000, some 20_000⟩ ⟨20_000, 1_000⟩}"
+  let event : ProgressEvent := .heartbeat
+  IO.println s!"heartbeat renews idle -> {renewsIdle event}, textDelta renews -> {renewsIdle .textDelta}"
+  let expired : AttemptClock := { elapsed := 30_000, sinceProgress := 0 }
+  IO.println s!"primary eligible failure -> switches(alternate remains)={switchesBackend .eligibleFailure true}"
+  IO.println s!"primary completed -> switches={switchesBackend .completed true}"
   IO.println s!"operation cancelled between attempts -> switches={switchesBackend .operationCancelled true}"
-  IO.println s!"fresh alternate clock at preferred expiry -> mustStop(native,30s)={mustStop ⟨.nativeClassifier, 30_000⟩ (freshClock expired)}"
+  IO.println s!"fresh alternate (hard=30s) at primary expiry -> mustStop={mustStop ⟨.nativeClassifier, 10_000, some 30_000⟩ (freshClock expired)}"
+  IO.println s!"cancelled llm attempt -> {repr (attemptOutcome true ⟨.llm, 15_000, none⟩ expired)}"
 
 end TimeoutSemantics
 
-/-- Executable witness: the named scenario runs deterministically and
-    prints the modeled outcomes. -/
+/-- Executable witness entry point. -/
 def main : IO Unit := TimeoutSemantics.main
 
 #print axioms TimeoutSemantics.timeout_slice_is_correct
 #print axioms TimeoutSemantics.fresh_alternate_not_stopped
 #print axioms TimeoutSemantics.bounded_switching
-#print axioms TimeoutSemantics.no_bounded_llm_wall_clock
+#print axioms TimeoutSemantics.alternate_whole_budget
 #print axioms TimeoutSemantics.cancel_between_attempts_wins

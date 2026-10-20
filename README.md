@@ -4,17 +4,20 @@ A Pi extension that exposes one in-process **judgment service** to other
 extensions: it answers typed `choice` / `bool` / `score` questions about JSON
 state, choosing between an independently selected **native Pi classifier**
 (Jev by default) and a **discrete LLM backend** built on any tool-calling
-chat model. Consumers compose questions and consume answers; the service
-owns selection, caching, capacity splitting, ordered-evidence recovery,
-threshold policy and a branch-scoped session ledger.
+chat model. Consumers compose questions, pack every necessary fact into
+`state` and consume answers. The service is **stateless**: no result cache,
+no in-flight joins, no evidence subdivision, no checkpoints, no session
+ledger, no learned capacity and no transport-attempt accounting. Identical
+calls perform independent inference.
 
-> **BREAKING (prototype rename).** The prototype interface tagged the native
-> path as `jev`. It is now `classifier`: `mode` is `auto | auto-llm | classifier | llm`,
-> `JudgeResult.backend` is `"classifier" | "llm"`, and `availability().jev`
-> is `availability().classifier`. The old `jev` values are rejected (not
-> aliased). Old `jev`-tagged cache/ledger entries are stale under the new
-> backend identity and are ignored, never relabeled. Update prototype
-> configs, clients and examples during migration.
+> **BREAKING (version two).** `version: 1`, `review()`, `reviewVersion`,
+> `reviewCacheVersion`, `reviewStagesVersion`, `evidence`, `timeoutMs`,
+> `fresh`, `cache`, `planStages`, `projectStage`, `projectionRevision`,
+> `checkpoint`, `onProgress`, `reuse`, `progress`, `diagnostics`,
+> `unresolved` and `inputDimensions` are removed. Removed request/option
+> fields are rejected explicitly, never silently ignored. Historical
+> `llm-as-jev-ledger` session entries are left intact and never restored or
+> rewritten. Check `version === 2` before calling `judge()`.
 
 ## Install
 
@@ -38,7 +41,7 @@ service up at call time — no load-order dependency:
 import { getJudgmentService } from "./judgment-client.ts";
 
 const service = getJudgmentService();
-if (service) {
+if (service?.version === 2) {
 	const result = await service.judge(
 		{
 			state: { repo: "acme/api", ci: "green" },
@@ -60,18 +63,18 @@ if (service) {
 		const verdict = result.answers.verdict.choice; // "ship" | "hold" | "revert"
 	}
 }
-// Extension absent: leave the judgment feature unavailable, never a crash.
+// Missing or version-one handle: leave the judgment feature unavailable.
 ```
 
 ### Full client API
 
 ```ts
 interface JudgmentService {
-	version: 1;
+	version: 2;
 	judge(req: JudgeRequest, opts?: JudgeOptions): Promise<JudgeResult>;
 	availability(): Promise<{ classifier?: string; llm?: string }>;
-	capacityVersion?: 1;                              // advertises the two members below
-	describeSelection?(opts?: { signal?: AbortSignal; path?: "judge" | "review" }):
+	capacityVersion?: 2;                              // advertises describeSelection + result.capacity
+	describeSelection?(opts?: { signal?: AbortSignal }):
 		Promise<CapacityDisclosure | { error: string }>;
 }
 
@@ -79,30 +82,20 @@ interface CapacityDisclosure {
 	backend: "classifier" | "llm";
 	model: string;                                    // provider/modelid
 	limits: { request?: number; stateAndLongestQuestion?: number; contextWindow?: number }; // tokens
-	limitSource: "override" | "channel" | "model" | "none"; // declared, not proven
-	tokensPerByte: number;                            // learned from usage, else prior
-	prior: boolean;                                   // true until usage calibrates
-	envelopeOverheadBytes: number;                    // LLM request scaffolding; 0 native
+	limitSource: "override" | "model" | "none";       // declared, not proven
 }
 
 interface JudgeRequest {
-	state: JsonObject;                              // fixed, never subdivided
+	state: JsonObject;                              // every needed fact; never subdivided
 	questions: Record<string, ClassifierQuestion>; // choice | bool | score
-	evidence?: EvidenceRecord[];                    // ordered, stable unique ids
-}
-
-interface EvidenceRecord {
-	id: string;
-	text: string;
-	metadata?: JsonObject; // preserved verbatim (incl. own `fragment` keys)
 }
 
 interface JudgeOptions {
 	minConfidence?: number;                  // native default gate
 	thresholds?: Record<string, ThresholdRule>; // per-question override
 	signal?: AbortSignal;
-	timeoutMs?: number;
-	fresh?: string;                          // force review; reuse within token
+	idleTimeoutMs?: number;                  // per-attempt generation-progress idle
+	modelTimeoutMs?: number;                 // optional whole-attempt hard cap
 }
 
 type ThresholdRule =
@@ -110,217 +103,71 @@ type ThresholdRule =
 	| { metric: "choiceProbability"; choice: string; minimum: number };
 
 interface JudgeResult {
-	answers: Record<string, ClassifierAnswer>; // final accepted view only
+	answers: Record<string, ClassifierAnswer>; // terminal attempt's accepted view
 	dropped: string[];                         // native-gate failures
 	backend: "classifier" | "llm";
 	model: string;            // provider/modelid actually used
 	stopReason: "stop" | "error" | "aborted";
 	errorMessage?: string;    // set when stopReason !== "stop"
-	contextOverflow?: boolean;
-	reuse: { hits: number; joined: number; sent: number };
+	contextOverflow?: boolean; // terminal model rejected input for size
 	usage?: Usage;            // provider-reported only, never invented
-	capacity?: CapacityDisclosure; // initial prediction limits/calibration for this call
-	inputDimensions?: { stateBytes: number; questionBytes: number; longestQuestionBytes: number }[];
+	capacity?: CapacityDisclosure; // terminal attempt's declared metadata
 }
 ```
 
 `judge()` **never throws** — every failure resolves through `stopReason` and
-`errorMessage` with an empty `answers` map.
+`errorMessage` with an empty `answers` map. Removed fields (`timeoutMs`,
+`fresh`, `cache`, `checkpoint`, `planStages`, `projectStage`,
+`projectionRevision`, `onProgress`, `evidence`) are explicit invalid-request
+errors.
 
-### Timeout: one number, interpreted per backend
+### Waiting: progress idle plus an optional hard cap
 
-The caller passes one `timeoutMs`, or omits it. An omitted value uses the
-configured `timeoutMs` override when present, otherwise a backend default:
-**native classifier 60 000 ms** (a slower class model is a performance problem,
-not a reason to wait longer) and **LLM = Pi's own `httpIdleTimeoutMs`**
-(Pi default 300 000 ms; `0` disables, mapped to the timer maximum). The service
-decides what the number means:
+Each backend attempt owns **two clocks**, started at attempt admission and
+covering readiness, discovery, authentication, every question and the single
+permitted LLM output repair:
 
-| Phase / backend | Interpretation |
-|---|---|
-| Setup (readiness, discovery, auth) | bounded by the explicit number or the native default, **per backend attempt**; a hung registry promise settles as a timeout error that permits the one alternate |
-| Native classifier (Jev) | one absolute logical-call deadline across every internal batch/stage, using remaining wall time, never reset per stage |
-| LLM emulation | per-request transport-inactivity window: restarts for each provider request (each question batch and the single output repair); reset by any response bytes (text, reasoning, tool-argument deltas, keepalives) and provider events; **not** forwarded to the provider SDK as a whole-request timeout |
+- **`idleTimeoutMs`** — generation-progress idle. Renewed only by nonempty
+  normalized text, reasoning or tool-argument deltas on the provider stream,
+  or a validated completed question answer. Headers, heartbeats, empty
+  events, request starts and retries never renew it. A non-streaming native
+  adapter is subject to idle expiry while waiting for its complete answer.
+  Defaults: **classifier 10 000 ms**, **LLM 15 000 ms**.
+- **`modelTimeoutMs`** — optional whole-model-attempt hard limit. Never
+  renews; absent means **no hard limit**. It is never derived from an idle
+  value or Pi's HTTP idle setting.
 
-Caller abort stays `aborted`; deadline/inactivity expiry is `error`; late
-backend results are never published after either. In automatic modes the
-timed-out backend is not restarted: its **unused alternate** gets a fresh
-window under its own interpretation (an explicit `timeoutMs` applies to both
-attempts independently; it is never a combined wall clock). Consumers should
-not run an outer timer of their own. (`pi-jev-todo-audit` passes no value unless the
-user configures one, so these defaults apply.)
+Caller options override the configured backend-slot values **independently
+per attempted family**. Automatic failover gives the alternate fresh
+independent clocks — there is **no combined primary-plus-alternate
+deadline**. Timeout cancels cooperative work and settles even when an
+adapter ignores cancellation; a retired attempt's late result can never
+publish. Caller abort, session navigation and shutdown are terminal.
 
-### Capacity disclosure
+The **direct emulated-provider entry** is different: the standard Pi
+classifier `timeoutMs` option is a finite whole-invocation hard deadline
+there (a documented change from this plugin's former idle interpretation)
+and overrides the configured LLM hard limit. Service callers use only the
+named `idleTimeoutMs`/`modelTimeoutMs` fields.
 
-`describeSelection()` resolves the backend/model a call would use now and the
-**declared** input limits (tokens) with their source, plus the bytes→tokens
-ratio the overflow prediction uses. Read-only: no inference, no writes.
-`JudgeResult.capacity` freezes the initial prediction inputs before inference updates calibration. A later `describeSelection()` returns the newly learned ratio. `inputDimensions` records the UTF-8 sizes supplied to each logical backend dispatch, including rejected dispatches; it is not an SDK HTTP-retry count or a raw HTTP-body size. Provider usage stays in `usage` when reported. Absent limits mean missing metadata — the service never infers one.
+### Capacity disclosure (capacityVersion 2)
 
-Built-in channel constants (`limitSource: "channel"`, review path only):
-OpenRouter System One `request = stateAndLongestQuestion = 32 000` (OpenRouter's
-Jev 1.13 page states a 32 000-token context window); TypeSafe direct
-`request = 64 000`, `stateAndLongestQuestion = 32 000` (carried from earlier
-configuration, **not verified** against TypeSafe documentation). Override per
-model with `contextLimits`.
+`describeSelection()` resolves the first usable candidate now and its
+**declared** input limits (tokens) with their source: an exact configured
+`contextLimits` override, the model's own `contextWindow`, or `none`.
+Read-only: no inference, no writes, no learned ratios, no built-in channel
+constants, no service-envelope estimates. `JudgeResult.capacity` reports the
+**terminal attempt's** declared metadata, including a confirmed overflow
+failure; fallback answers carry the alternate's identity and limits.
+Consumers own packing estimates and local subdivision on explicit overflow.
 
-### Ordered evidence
-
-Supply fixed state plus ordered evidence records; the service owns overflow
-recovery over **both** question batches and evidence batches, processes
-evidence in order, carries intermediate judgments forward as advisory data,
-splits oversized records at Unicode-safe boundaries (preserving source id,
-absolute fragment bounds and caller metadata), and returns only the complete
-final stage:
-
-```ts
-const result = await service.judge(
-	{
-		state: { board: "release-42", frozen: true },
-		questions: {
-			blocked: {
-				type: "bool",
-				instructions: "Is the release blocked by unresolved findings?",
-				criteria: { true: "blocked", false: "clear" },
-			},
-			severity: {
-				type: "score",
-				instructions: "Highest severity across all findings",
-				criteria: ["info", "minor", "major", "critical"],
-			},
-		},
-		evidence, // ordered EvidenceRecord[]
-	},
-	{ timeoutMs: 60_000 },
-);
-```
-
-If fixed state plus one irreducible fragment cannot fit, you get an explicit
-`contextOverflow` error — evidence is never silently trimmed.
-
-### Resumable reviews (additive capability) — deprecated protocol
-
-> **Deprecated.** The consumer-owned cache callbacks (`cache.lookup/store`,
-> `reviewCacheVersion`), business-stage callbacks (`planStages`,
-> `projectStage`, `onProgress`, `reviewStagesVersion`), `checkpoint` /
-> resume receipts and `projectionRevision` remain callable for existing
-> `reviewVersion: 1` clients and behave as before, but new consumers should
-> persist their own judgment state and pack input using `describeSelection()`.
-> These members will be removed once no caller passes them.
-
-`judge()` remains final-only. Consumers that need durable partial progress must
-check the separate `reviewVersion` capability at **each eligible call**, not
-just at extension load:
-
-```ts
-import { getJudgmentService, type ReviewService } from "./judgment-client.ts";
-
-const candidate = getJudgmentService() as Partial<ReviewService> | undefined;
-if (candidate?.version === 1 && candidate.reviewVersion === 1 &&
-    typeof candidate.review === "function") {
-  const review = await candidate.review({
-    state: { scope: "release-42" },
-    questions: {
-      readiness: {
-        type: "choice",
-        instructions: "Is the supplied release evidence sufficient?",
-        criteria: { ready: "Sufficient", unresolved: "Missing or conflicting evidence" },
-      },
-    },
-    evidence: [{ id: "ci-report", text: "CI checks are reported passed; rollout awaits approval." }],
-  }, { minConfidence: 0.8, timeoutMs: 60_000 });
-  // Only accepted final answers are advice candidates. Source/authority checks
-  // remain the consumer's job. Progress/opinions never authorize an action.
-  if (review.stopReason === "stop" && review.unresolved.length === 0) {
-    const choice = review.answers.readiness;
-  }
-}
-// Missing capability: skip this feature, report the dependency, try discovery
-// on the next normal trigger. Do not send a probe or use a fallback HTTP client.
-```
-
-`ReviewResult` adds `progress.stages`, `unresolved`, and `diagnostics` to
-`JudgeResult`. Failed or aborted reviews still have **empty final answers**.
-Individually validated native members can be persisted for retry, but only a
-complete required raw-answer set advances a stage. Native policy-dropped raw
-answers are reusable without becoming accepted advice.
-
-For incremental business projection, additional options and projection outputs are:
-
-- `projectStage({ evidence, completed, previousAnswers, final })`: a synchronous
-  callback returning `{ state, questions, unresolved? }`. Set a stable
-  `projectionRevision`. Descriptors are isolated copies; the service always sends
-  its original selected evidence separately. A callback cannot replace source
-  bodies, forge fragment bounds, choose dispatches or advance progress.
-- `unresolved`: explicitly withhold required questions rather than silently omit
-  them. A withheld id cannot also be dispatched. An empty projected question map
-  with all required ids withheld sends nothing and advances no coverage; it is
-  distinct from an invalid empty initial request. Valid independent final answers
-  can remain available in an incomplete locally withheld scope. Missing provider
-  answers instead fail the review with empty finals.
-- `onProgress(stage)`: notification after acknowledged durable persistence only.
-  `stage` includes an opaque `checkpoint`, source ids/genuine bounds, advisory
-  `opinions`, `final`, and `durable`. Notification errors are isolated. Failed
-  persistence may appear as `durable: false` in returned stages; never advance a
-  consumer receipt from those stages.
-- `checkpoint`: an opaque active-branch checkpoint id used as an advisory seed
-  for a new incremental review. The service validates lineage and durable answer
-  references. Keep still-required original facts in the next request; a seed is
-  **not** their factual replacement. `fresh` and `checkpoint` cannot be combined.
-
-For interrupted identical work, reconstruct the same inputs; valid completed
-stages/members are reused after branch restoration. To force reassessment, supply
-`fresh` and no seed: the same token resumes that review, a new token starts new
-work. Only a token digest is persisted. Do not change a token and call the result
-resumption of the old review. Mid-record progress preserves UTF-16 bounds without
-splitting surrogate pairs; visiting every fragment does not prove that a final
-factual view contains every required constraint.
-
-Identity includes selected backend/model/effective thinking/transport, exact
-fixed state and each individual question, ordered evidence/metadata/genuine
-bounds, prior advisory opinions and finality. Adding independent C need not repay
-unchanged A/B. Checkpoint membership is separate from raw-question identity.
-Changing only threshold policy rechecks raw judgments without new inference.
-
-### Attempt accounting and review transport
-
-`reuse.sent` counts questions, **not HTTP requests**. Read `diagnostics.attempts`
-and `attemptCount` for newly owned observed attempts (including native retries),
-`presplits` for predictions, and `rejectedReuses` for avoided known rejections.
-Attempt ids survive accounting without colliding across service reloads. A row
-with `phase: "start"` is unfinished at settlement, not a fabricated response.
-Late events cannot mutate a settled result or write onto a newer branch. Joined
-waiters own no new attempt, and cancelling a waiter does not abort its owner.
-
-Check `observationCoverage` first: `"unavailable"` is an accounting/capability
-failure, **not proof of zero attempts or cost**. Otherwise each usage field has
-`{ knownSum, missing }`; a missing value is not a reported zero, and a total with
-missing observations is only a lower bound. `usage.costUsd` is provider-reported
-charge; optional `catalogCostUsd` is a separate estimate. Cache hits/joins add no
-new owner charge. Native adapters need not report a catalog estimate.
-
-Native reviews use the released classifier API's public `fetch` option. This
-plugin records each actual fetch and inspects the response as Pi consumes it;
-validated independent answer members can be retained without changing Pi's
-strict final result. **No private `observe`/`onAttempt` API or Pi core patch is
-required.** Pi still owns request construction, authentication and bounded native
-retries. The classifier API is supplied by the xz-dev fork; this is not a claim
-that stock Pi exposes that API.
-
-LLM reviews use Pi's injected fetch and provider-event seams, `transport: "sse"`,
-and `maxRetries: 0`. A route that ignores the required public hooks or cannot
-correlate events fails accounting rather than switching models/backends or
-inventing a request count. Offline checks cover actual System One and Anthropic
-HTTP/SSE paths, not every provider route. Legacy `judge()` does not require
-review accounting capabilities.
-
-## Threshold policy (native classifiers only)
+### Threshold policy (native classifiers only)
 
 When `backend === "classifier"`, the service applies numeric gates to the
 **adapter-defined** native fields: choice/score `confidence`, bool certainty
 `max(p, 1-p)`, or the probability of a named choice. Per-question rules
-**replace** (never stack with) `minConfidence`. Gates are re-checked on
-every call, including cache hits, in-flight joins and restored results:
+**replace** (never stack with) `minConfidence`. Gates apply to each call's
+own freshly validated inference:
 
 ```ts
 // Default gate for all questions:
@@ -336,7 +183,10 @@ await service.judge(request, {
 ```
 
 A question whose native numbers miss the gate lands in `dropped` and not in
-`answers`. Without any rule, nothing is dropped on either backend.
+`answers`. Without any rule, nothing is dropped on either backend. All valid
+answers are validated against the requested types, labels and numeric
+constraints before filtering — an incomplete or malformed raw result never
+publishes partial final answers.
 
 ### Calibration limits (important)
 
@@ -376,7 +226,10 @@ Global `<agentDir>/llm-as-jev.json` (`PI_CODING_AGENT_DIR` or
 	"classifierModel": "typesafe/jev-1.13", // optional explicit native pick
 	"model": "anthropic/claude-sonnet-4-5", // LLM slot (independent)
 	"thinkingLevel": "low",             // LLM-only thinking level
-	"timeoutMs": 90000,                  // optional override for BOTH backends; omit for backend defaults
+	"timeouts": {
+		"classifier": { "idleTimeoutMs": 10000, "modelTimeoutMs": 30000 },
+		"llm": { "idleTimeoutMs": 15000 }
+	},
 	"contextLimits": {
 		"typesafe/jev-1.13": { "request": 64000, "stateAndLongestQuestion": 32000 }
 	}
@@ -390,15 +243,13 @@ Global `<agentDir>/llm-as-jev.json` (`PI_CODING_AGENT_DIR` or
 - `mode: auto` prefers the selected/default available native classifier;
   `mode: auto-llm` prefers the independently configured LLM. Both automatic
   modes switch **once** to the other backend family when the preferred one is
-  missing, unavailable or fails at runtime (discovery/auth, transport,
-  invalid output after repair, irreducible context overflow, setup or
-  execution timeout). The alternate restarts the complete logical request
-  with its own capacity, policy, stage state and timeout window; at most one
-  switch per operation, no cycling back, and the next operation starts from
-  the configured preference again. Valid negative or all-dropped results are
-  successes, and invalid requests, caller cancellation and local callback
-  faults never trigger failover. `classifier` and `llm` never switch to the
-  other backend.
+  missing, unavailable or fails at runtime. The alternate restarts the
+  complete immutable request with its own fresh clocks; at most one switch
+  per operation, no cycling back, and the next operation starts from the
+  configured preference again. Valid negative or all-dropped results are
+  successes, and invalid requests, caller cancellation and local faults
+  never trigger failover. `classifier` and `llm` never switch to the other
+  backend.
 - **Jev is the default native candidate** (`typesafe`, `openrouter`,
   `cloudflare-workers-ai`, `vercel-ai-gateway`, `opencode` priority).
   Omitting `classifierModel` keeps that discovery. An explicit selection is
@@ -409,50 +260,27 @@ Global `<agentDir>/llm-as-jev.json` (`PI_CODING_AGENT_DIR` or
   touching LLM settings.
 - An unknown chat model means *no LLM backend*, never a main-session
   fallback.
-- Every new `judge()`, `review()`, `availability()`, settings command and
-  provider metadata/auth/classification operation reads the current file.
-  Sessions already running this version and sharing the same agent directory
-  see completed saves on their next operation, without a configuration command,
-  restart or reload in the receiving session. Different agent directories stay
-  isolated; there is no idle watcher or polling timer.
-- An admitted judgment or review keeps one snapshot through discovery, stages,
-  retries and error reporting. A save does not cancel old work or reset its
-  branch ledger. New calls (including resumed reviews) use current settings;
-  reuse still requires the same actual backend/model/effective-thinking identity.
+- **Legacy `timeoutMs` migration.** The removed top-level `timeoutMs` had
+  two incompatible meanings (native whole-call deadline vs LLM inactivity).
+  While it is present, inference returns an actionable migration error and
+  status reports it; nothing is dispatched, rewritten or silently mapped.
+  Remove it for the 10 s/15 s idle defaults, or replace it with explicit
+  `timeouts` members — no hard limit is ever inferred from the old value.
+- Each `timeouts.<slot>` accepts positive-integer `idleTimeoutMs` and/or
+  `modelTimeoutMs` within the platform timer range; a missing hard limit
+  means none. Invalid values follow the existing invalid-known-field
+  behavior (all known settings default).
+- Every new `judge()`, `availability()`, `describeSelection()`, settings
+  command and provider operation reads the current file. Sessions sharing
+  the same agent directory see completed saves on their next operation
+  without restart or reload. Different agent directories stay isolated.
+- An admitted judgment freezes mode, both model slots, thinking, timing and
+  declared capacity overrides through setup, questions, repair and failover.
+  A save does not cancel admitted work or change its settings.
 - An unreadable or invalid file is reported once per session and **all**
-  known settings use defaults, not a partially accepted or last-valid file.
-  A missing file uses defaults without a warning. Reads continue after a warning,
-  so repairing or restoring the file takes effect on the next operation.
-  Unknown extra keys survive valid patch saves. Saves are atomic (temp file +
-  rename); a failed save never publishes a tentative choice.
-- Updating the extension's **code** still requires the normal reload/restart.
-  Subsequent configuration-file edits do not. Simultaneous overlapping writers
-  retain last-write behavior: atomic replacement is not a conflict-free merge.
-
-- `timeoutMs` follows the selected backend. For the native classifier it is
-  one absolute whole-call budget covering discovery/authentication,
-  projection, provider waits and recovery — never reset across internal
-  stages. For the LLM backend it is a per-request transport-INACTIVITY
-  window (including the bounded first-byte wait) reset by every observed
-  byte/event; a continuously active stream may outlive it, while setup and
-  selection stay bounded by the same budget before dispatch.
-- `contextLimits` is optional. Keys are exact `provider/modelid` references;
-  values have positive safe-integer `request` and/or `stateAndLongestQuestion`
-  token limits. A profile replaces the defaults for that model and applies to
-  both `judge` and `review`; it is not combined with an unrelated smaller limit.
-  Invalid profiles reject all known settings without printing profile values.
-- Without overrides, review recognizes TypeSafe-direct Jev's 64k request-wide /
-  32k state-plus-longest profile and OpenRouter System One's 32k / 32k profile at
-  their known endpoints. Other routes use the selected model's context window.
-  Legacy `judge` retains its model-window default. Custom endpoints/auth belong
-  in Pi, not in a consumer's former endpoint fields.
-- Capacity uses the actual serialized envelope and transport-scoped learning.
-  Predictions are not exact token counts. Later usable lower-density successes
-  correct estimates, including after reload. Overestimated fixed facts get one
-  useful unanswered-batch admission; known exact rejections stay protected.
-  Only recognized context overflow permits recovery. Auth/quota/rate/validation/
-  generic payload errors do not justify subdivision. Required facts are never
-  silently cropped to fit.
+  known settings use defaults. A missing file uses defaults without a
+  warning. Unknown extra keys survive valid patch saves; saves are atomic
+  (temp file + rename); a failed save never publishes a tentative choice.
 
 ## Commands
 
@@ -466,51 +294,18 @@ Global `<agentDir>/llm-as-jev.json` (`PI_CODING_AGENT_DIR` or
 
 The bare command and `status` never open a picker, write settings, send an
 inference request or touch the main-session model/thinking — in any mode,
-including non-TUI. The former `/llm-as-jev-classifier` alias is removed; the
-native entry is `/llm-as-jev classifier`. Command-line completion after
-`/llm-as-jev` offers `status`, `llm`, `classifier` and all four `mode`
-forms.
+including non-TUI.
 
-The overview shows labeled `Mode`, `Classifier`, `LLM`, `Thinking` and
-`Config` rows. `Mode` is `Auto(classifier)` when the selected/default
-native candidate is usable, `Auto(llm)` when only the configured LLM is
-usable, `Auto(None)` when neither is; `auto-llm` shows `Auto-LLM(llm)`,
-`Auto-LLM(classifier)` or `Auto-LLM(None)` the same way; forced modes show
-`Classifier` / `LLM`. The suffix describes an **availability snapshot only** —
-not quota, billing or a promise of successful inference — and changes nothing
-about routing: automatic modes still answer through their preferred candidate
-and may switch once at runtime if that candidate fails.
+The overview shows `Mode`, `Classifier`, `LLM`, `Thinking`, each backend's
+effective **idle duration and hard cap (or disabled)** and `Config`, plus a
+migration warning while legacy `timeoutMs` is present. `Mode` shows
+`Auto(classifier)` / `Auto(llm)` / `Auto(None)` (or `Auto-LLM(...)`) over an
+availability snapshot — not a promise of successful inference.
 
-**Compatibility.** Runtime failover changes `auto`'s behavior after a
-backend failure (previously terminal). Callers that require exactly one
-backend should pin `mode: "classifier"` or `mode: "llm"`. Numeric thresholds
-apply only to classifier answers, so a judgment that switches from the
-classifier to the LLM is not confidence-filtered — configure per-model
-thresholds accordingly. `auto-llm` is new: before rolling back to a version
-without it, change the saved mode to a supported value, or the older parser
-falls back to all defaults.
-
-An omitted `classifierModel` displays `Jev` (default discovery) plus the
-resolved `provider/modelid` when available, or `Jev (unavailable)` when
-not. An omitted LLM `model` displays `None` — which is different from a
-configured reference shown with `(unavailable)` when it is missing from
-Pi's catalog or lacks usable credentials. When the configured mode has no
-usable backend a warning names the relevant settings command; forced modes
-never switch to the other backend automatically.
-
-Both pickers are searchable (`Input` + `SelectList` + fuzzy matching over
-`provider/id` **and display names**), alphabetically ordered by
-`provider/modelid` including filtered results, with the configured model
-preselected at its real index. The native list excludes this plugin's own
-LLM-emulation provider. Opening either picker reads current settings; the open
-interaction keeps its original preselection even if another session saves.
-Confirmation patches only the selected fields against the file read for that
-save, preserving unrelated changes completed before that read and unknown keys.
-**Cancel at either step writes nothing and never rolls back another save.**
-Reopening reads the latest values. The read-only overview uses one snapshot for
-both its displayed settings and availability. Custom pickers are TUI-only;
-non-interactive sessions still get the overview and full service operation.
-The main-session model and thinking level are never touched.
+Both pickers are searchable, alphabetically ordered by `provider/modelid`,
+with the configured model preselected. The native list excludes this
+plugin's own LLM-emulation provider. Confirmation patches only the selected
+fields against the current file; **cancel at either step writes nothing**.
 
 ## Registered classifier provider
 
@@ -519,45 +314,30 @@ exposing the configured LLM as `getAvailableOfType("classifier")` entry
 `llm-as-jev/<provider>/<modelid>` with the chat model's `contextWindow` and
 cost — visible to codemode scripts and other extensions. It is LLM
 emulation: its compatibility numbers never enter native numeric policy, and
-it is excluded from the native picker/discovery. The next public listing reflects
-current target identity, context window and credential availability without a
-priming judgment or re-registration. Classifying through a previously retained
-descriptor uses the current configured target and reports its actual full model
-reference; removed/unavailable targets return an error rather than using the
-old target. A classification already in flight keeps its own snapshot through
-output repair.
+it is excluded from the native picker/discovery. The next public listing
+reflects current target identity, context window and credential availability
+without a priming judgment. Classifying through a previously retained
+descriptor uses the current configured target and reports its actual full
+model reference; removed/unavailable targets return an error rather than
+using the old target. A classification already in flight keeps its own
+snapshot through output repair. Direct `classify()` callers' `timeoutMs` is
+a whole-invocation hard deadline (see Waiting).
 
-## Session ledger
+## Session history
 
-The ledger is the service's **internal** reuse and metering record, not the
-consumer's progress or business memory; consumers persist their own state.
-Validated raw judgments, exact rejection envelopes, stage coverage and
-per-request diagnostics persist as non-context custom entries
-(`llm-as-jev-ledger`) — never bodies, secrets or provider replies — and are
-replayed **from the active branch only** on session start/tree/fork/switch.
-Legacy `judge` buffers new judgments until non-aborted settlement. `review`
-keeps already-durable pre-abort stages and individually validated native partial
-members; those are historical work, not successful final answers. Answers are
-written before checkpoint references. Failed appends cannot establish durable
-progress. Late results from an abandoned generation cannot enter a new branch's
-cache or ledger.
+Version two writes **no** `llm-as-jev-ledger` entries and restores none.
+Historical entries in existing sessions are untouched. Consumer-owned
+progress/history remains in each consumer's own session mechanism.
+Session navigation and shutdown still cancel owned in-flight work; a late
+result from a retired generation can never publish.
 
 ## Consumer migration
 
-`pi-jev-todo-audit`'s companion development change now uses `reviewVersion: 1`.
-Audit owns question construction, source projection, scheduling, business
-receipts, diagnostics and advisory/TODO safety. This service owns backend/model
-selection, policy, raw cache, capacity/recovery and judgment/attempt storage;
-Pi owns provider transport/authentication. Old audit `model`, `apiUrl`, `apiKey`,
-`apiKeyEnvVar` and `contextLimits` load but are ignored, with field-name-only
-notices. No credential import or automatic configuration rewrite occurs.
-Configure selection/limits here and endpoints/credentials in Pi before enabling
-audits in an installed host; a missing/incompatible service makes audit skip with a dependency notice,
-without disabling ordinary TODO/main-agent work.
-
-Watchdog migration is separate and has not been performed by this change.
-Neither these source changes nor offline tests activate an installed checkout,
-prove live quality/billing, or publish a release.
+Consumers require `version === 2` and pack every necessary fact into
+`state`. A version-one or absent service is an explicit dependency failure,
+never a direct-provider fallback or silent downgrade. Old v1 consumers
+already reject a v2 handle. `pi-jev-todo-audit` and `pi-continue-watchdog`
+carry their own linked migration changes.
 
 ## Development
 

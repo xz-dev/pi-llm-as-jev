@@ -1,13 +1,27 @@
 ## MODIFIED Requirements
 
 ### Requirement: Configuration file
-Settings SHALL remain in Pi's agent-directory `llm-as-jev.json`, read afresh at each configuration-dependent operation. `mode` SHALL remain `auto` by default with `auto-llm`, `classifier` and `llm` alternatives. Independent `classifierModel`, chat `model`, `thinkingLevel` and exact-model `contextLimits` overrides SHALL remain supported. Model references SHALL split at the first slash; neither slot nor thinking SHALL inherit main-session settings. Missing native selection SHALL retain default Jev discovery, while explicit unknown selections SHALL stay unavailable instead of selecting another native model.
+Settings SHALL remain in Pi's agent-directory `llm-as-jev.json`, read afresh at each configuration-dependent operation. `PI_CODING_AGENT_DIR` SHALL override the home-based directory; when `HOME` is unset, the OS home directory SHALL be used, with Windows separators supported. `mode` SHALL remain `auto` by default with `auto-llm`, `classifier` and `llm` alternatives. Independent `classifierModel`, chat `model`, `thinkingLevel` and exact-model `contextLimits` overrides SHALL remain supported. Model references SHALL split at the first slash; neither slot nor thinking SHALL inherit main-session settings. Missing native selection SHALL retain default Jev discovery, while explicit unknown selections SHALL stay unavailable instead of selecting another native model.
+
+The existing `classifierBaseUrl` SHALL remain an optional HTTP(S) endpoint override requiring an explicit `classifierModel`. Only this service's selected model copy SHALL use the override; Pi's catalog SHALL remain unchanged and credentials SHALL still come from the selected provider. Trailing slashes SHALL be normalized; a trailing `/systemone` SHALL be removed from System One API bases only, because that adapter appends the path. The endpoint SHALL be frozen with admitted settings. Atomic saves SHALL retain it only while the same explicit classifier remains selected; changing or clearing that selection SHALL remove it. Capacity v2 SHALL use explicit limits or model metadata, not old built-in channel profiles.
 
 Timing SHALL be represented by optional `timeouts.classifier` and `timeouts.llm` objects, each containing optional `idleTimeoutMs` and `modelTimeoutMs`. Idle defaults SHALL be classifier **10,000 ms** and LLM **15,000 ms**. A missing `modelTimeoutMs` SHALL mean no hard limit. Supplied values SHALL be positive integers within the platform timer range. No combined-operation limit or host-HTTP-default inheritance SHALL be introduced. An explicit per-call option SHALL override that field for each model attempt independently. Configuration SHALL be frozen for admitted work and reread for later calls; runtime fallback SHALL not mutate settings.
 
 The legacy top-level `timeoutMs` SHALL be recognized as requiring migration, not ignored as an unknown key or silently interpreted under different semantics. While it remains present, inference SHALL return an actionable configuration error without dispatch; read-only status SHALL identify the field and required explicit replacement. Settings inspection SHALL not rewrite the file. Users SHALL explicitly choose an idle override, a hard limit, or both when migrating; removing the legacy field uses the new defaults. No hard limit SHALL be inferred from an old value.
 
 For other malformed known fields or unreadable files, the existing all-known-fields-default behavior and once-per-session diagnostic SHALL remain; a missing file SHALL use defaults without warning. Unknown unrelated keys SHALL survive atomic patch saves. Error suppression SHALL not prevent rereading a repaired file. Shared-agent-directory sessions SHALL see completed saves on their next operation without polling, restart or reload; separate directories SHALL remain isolated. Confirmed model/mode saves SHALL preserve unrelated settings, including timeout slots, and cancellation SHALL not overwrite another session's save.
+
+#### Scenario: Classifier endpoint snapshot and catalog isolation
+- **WHEN** an explicit System One classifier uses `https://proxy.example/v1/systemone/` and settings change while its authentication is pending
+- **THEN** admitted work uses `https://proxy.example/v1`, the next operation reads the new endpoint and Pi's original catalog model remains unchanged
+
+#### Scenario: Endpoint validation and save retention
+- **WHEN** an endpoint is non-HTTP(S) or lacks an explicit classifier
+- **THEN** the file follows the all-known-fields-default rule; valid endpoints survive unrelated or same-classifier saves, but changing or clearing the classifier removes them
+
+#### Scenario: HOME unset
+- **WHEN** neither `PI_CODING_AGENT_DIR` nor `HOME` is set
+- **THEN** settings resolve under the OS home directory, including on Windows
 
 #### Scenario: Omitted timing settings
 - **WHEN** a valid configuration has no timeout objects

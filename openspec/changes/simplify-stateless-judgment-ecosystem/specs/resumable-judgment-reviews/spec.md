@@ -13,7 +13,7 @@
 **Migration**: Consumers maintain their existing factual scope/currentness checks and supply necessary original facts, not service checkpoint seeds or cached opinions.
 
 ### Requirement: Progressive recovery preserves predecessor capacity behavior
-**Reason**: Capacity learning and generic evidence/question subdivision are outside the two core responsibilities.
+**Reason**: Capacity learning and generic evidence/question subdivision are outside the two core responsibilities. This also supersedes the older predicted irreducible-overflow pre-dispatch exception; metadata never skips inference or starts service-owned recovery.
 **Migration**: Use lightweight declared metadata for consumer packing. Audit reduces whole-loop segments on explicit overflow; watchdog reports incomplete when required facts cannot fit.
 
 ### Requirement: Ordered opinions and finality

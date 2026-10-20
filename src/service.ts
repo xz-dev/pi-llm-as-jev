@@ -589,6 +589,7 @@ export function createJudgmentService(runtime: ServiceRuntime): CreatedService {
 			classifierModel: config.classifierModel,
 			classifierProvider: config.classifierProvider,
 			classifierModelId: config.classifierModelId,
+			classifierBaseUrl: config.classifierBaseUrl,
 		};
 	}
 

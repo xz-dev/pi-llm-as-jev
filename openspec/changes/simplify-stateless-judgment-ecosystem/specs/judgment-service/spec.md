@@ -329,7 +329,7 @@ Accepted answers, dropped ids, backend/model and capacity SHALL belong solely to
 **Migration**: `Per-call native confidence policy` preserves native numerical rules and LLM exemption, and replaces cached stricter-caller reuse with fresh inference under the new caller's rule.
 
 ### Requirement: Context capacity and splitting
-**Reason**: Service prediction, question splitting and cross-call rejected-envelope memory are removed.
+**Reason**: Service prediction, question splitting and cross-call rejected-envelope memory are removed, including the older predicted irreducible-overflow pre-dispatch alternate check. Both confirmed overflow and ordinary backend errors use the independent v2 alternate; a metadata estimate alone never skips dispatch.
 **Migration**: `Consumer-owned input capacity` preserves no-cropping, actual-backend metadata and terminal overflow, with full-request fallback instead of service subdivision.
 
 ### Requirement: Operation-scoped configuration snapshots

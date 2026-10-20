@@ -50,26 +50,6 @@ Reuse SHALL bind backend, full model reference, effective thinking, fixed facts,
 - **WHEN** evidence has arbitrary own JSON keys and caller metadata named `fragment`
 - **THEN** all text/order/metadata survives and recovery bounds come only from actual original text, not the caller's lookalike metadata
 
-### Requirement: Progressive recovery preserves predecessor capacity behavior
-The service SHALL own question and evidence recovery, without consumer transport or retry loops. It SHALL distinguish request-wide and state-plus-longest-question channel limits, use the actual serialized unanswered envelope including advisory state, learn from later successful lower-density input and restore learning on the active branch. Channel identity SHALL include transport configuration as well as backend/model. Service-owned configuration SHALL permit explicit channel limits; audit-owned limit fields SHALL NOT override it.
-
-Predictions SHALL not count as attempts or actual rejections. An over-limit fixed-state prediction SHALL receive one real admission check of the current unanswered batch unless that exact envelope was already rejected. A successful check SHALL finish the stage without validation-only or per-question repeats. An irreducible prediction SHALL not prove rejection. Confirmed overflow SHALL reduce the constrained dimension, terminate when required fixed state cannot fit, and never resend an identical known-rejected envelope. Authentication, quota, rate, payload-size, generic validation and unknown errors SHALL not authorize context subdivision.
-
-#### Scenario: Fixed-state prediction would multiply work
-- **WHEN** retained state is overestimated with 69 new records and 12 unresolved questions but the provider admits the full batch
-- **THEN** one attempt handles all questions, every record remains represented, and no 69-by-12 traversal occurs
-
-#### Scenario: Distinct channel limits
-- **WHEN** an envelope fits a TypeSafe-direct 64k request-wide and 32k per-question profile but exceeds an OpenRouter 32k single-window profile
-- **THEN** channel-specific prediction distinguishes them without imposing the smaller limit on all direct batches
-
-#### Scenario: Admission corrects the estimate
-- **WHEN** a later lower-density envelope is admitted
-- **THEN** future prediction and reload use the corrected observation, but exact earlier rejected envelopes remain protected
-
-#### Scenario: Required fixed facts cannot fit
-- **WHEN** the smallest necessary question and irreducible evidence still receive an explicit overflow
-- **THEN** the affected scope stops with an actionable incomplete-account diagnostic, retaining facts and completed work rather than traversing all remaining combinations
 
 ### Requirement: Ordered opinions and finality
 Intermediate opinions SHALL be advisory and replaced by later stage results, not accumulated by voting. Independent question batches SHALL evaluate the same frozen state. The consumer SHALL be able to project its stage-specific factual view and complete dynamic questions without owning the subdivision loop. No stage projection SHALL silently remove required original evidence or turn a missing question into complete coverage.

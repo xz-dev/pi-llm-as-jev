@@ -548,6 +548,41 @@ test("admission snapshots state, questions and nested policy before setup awaits
 	assert.ok(result.answers.ok, "admitted 0.8 threshold, not mutated 1");
 });
 
+test("admission freezes classifierBaseUrl and later calls observe settings changes", async () => {
+	const original = jevModel();
+	const registry = fakeRegistry({ native: [original] });
+	let release = () => {};
+	const gate = new Promise<void>((resolve) => {
+		release = resolve;
+	});
+	registry.getAuth = async () => {
+		await gate;
+		return { auth: {} };
+	};
+	const cfg = config({
+		mode: "classifier",
+		classifierModel: "typesafe/jev-1.13",
+		classifierBaseUrl: "https://first.example/v1/systemone/",
+	});
+	const endpoints: string[] = [];
+	const classify = registry.classify.bind(registry);
+	registry.classify = (model, context, options) => {
+		endpoints.push(model.baseUrl);
+		return classify(model, context, options);
+	};
+	const service = SERVICE(registry, cfg);
+	const pending = service.judge(request());
+	cfg.classifierBaseUrl = "https://second.example/v1";
+	release();
+	assert.equal((await pending).stopReason, "stop");
+	assert.equal((await service.judge(request())).stopReason, "stop");
+	assert.deepEqual(endpoints, [
+		"https://first.example/v1",
+		"https://second.example/v1",
+	]);
+	assert.equal(original.baseUrl, "https://unused.invalid");
+});
+
 test("alternate replays original state/questions after caller changes between attempts", async () => {
 	const req = structuredClone(request());
 	const registry = fakeRegistry({ native: [jevModel()], llm: chatModel() });

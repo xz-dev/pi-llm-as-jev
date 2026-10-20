@@ -1,5 +1,13 @@
 # Execution record
 
+## Current local baseline reconciliation (2026-10-20)
+
+This section supersedes earlier no-Git-write/signing-only checkpoints below; their evidence remains historical. Human explicitly authorized task-scoped `git commit --no-gpg-sign` without persistent Git/GPG changes. Sole service writer resumed exact preserved index and snapshot `/var/tmp/jev-service-reconciliation-96b39dca`. Approved v2 functional/test/CI commit `0fb2737` and approved docs commit `9613078` now exist locally. Existing origin/master fetched at fixed `16fa0a3f17eb43bd22432b6f169498a7db2bf556`; ordinary no-commit/no-ff merge is in progress, not published.
+
+Correction preserves nine older remote commits, not new product scope: classifier endpoint override/validation/normalization/catalog immutability/save behavior, HOME-unset OS home resolution, Pi1.3/security lock and all remote history/planning. Only old prediction/stateful overflow recovery is superseded by accepted v2. Removed affected obsolete main capacity/recovery requirements per existing delta; historical archive stays intact. Restored endpoint/Windows regressions plus endpoint admission snapshot and clearing cases cover compatibility. No consumer, private-runtime, dependency pin/policy, installation or shared-runtime changes.
+
+Affected root2.1/2.7/2.8 temporarily reopened for local proof; root5.1/5.4/7.1 reopened for reconciled-candidate integration/review/dependency/CI proof. Unaffected acceptance is not restarted. Fresh bounded local gates pending; merge must remain resolved but uncommitted for parent regate, then independent review. No final merge commit, push or installed activation authorized by this local phase.
+
 ## Authority and completion gates
 
 The human invoked apply for `simplify-stateless-judgment-ecosystem`, then explicitly confirmed edits and planned obsolete-code deletion in all three source repositories. A later human instruction adds publication and verified, meaningful CI/CD to delivery. Source publication is now requested; installation/activation, paid inference, credential changes and unrelated modifications remain unauthorized. Confirm concrete publication destinations/versions and Git write operations before performing them. No branch, commit or push has been performed by this apply session.

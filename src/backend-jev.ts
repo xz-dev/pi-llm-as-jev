@@ -125,6 +125,25 @@ export interface NativeSelection {
 	classifierProvider?: string;
 	/** Pre-split model id portion of `classifierModel` (may contain slashes). */
 	classifierModelId?: string;
+	/** Endpoint replacing the explicit model's catalog `baseUrl`. */
+	classifierBaseUrl?: string;
+}
+
+/**
+ * Point a selected model at a third-party host of the same API. Pi's System
+ * One clients append `systemone` themselves, so a pasted full endpoint
+ * (`.../v1/systemone`) is reduced to its base instead of doubling the path.
+ */
+export function withBaseUrl(
+	model: AnyClassifierModel,
+	baseUrl: string | undefined,
+): AnyClassifierModel {
+	if (baseUrl === undefined) return model;
+	const trimmed = baseUrl.replace(/\/+$/, "");
+	const base = /system-one$/.test(model.api)
+		? trimmed.replace(/\/systemone$/, "")
+		: trimmed;
+	return { ...model, baseUrl: base };
 }
 
 /** Split `provider/modelid` on the FIRST slash; undefined parts when malformed. */
@@ -175,7 +194,8 @@ export async function resolveNativeClassifier(
 		const found = compatible.find(
 			(model) => model.provider === provider && model.id === modelId,
 		);
-		if (found) return { model: found };
+		if (found)
+			return { model: withBaseUrl(found, selection.classifierBaseUrl) };
 		return {
 			error: `configured classifier ${provider}/${modelId} is not available`,
 			selection: `${provider}/${modelId}`,

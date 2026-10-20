@@ -16,6 +16,7 @@
 
 import { readFileSync } from "node:fs";
 import * as fs from "node:fs/promises";
+import { homedir } from "node:os";
 
 /** Declared context limits for one exact `provider/modelid` reference. */
 export interface ContextLimitProfile {
@@ -73,6 +74,10 @@ export interface JudgmentConfig {
 	classifierModelId?: string;
 	/** Provider portion of `classifierModel`, before the first slash. */
 	classifierProvider?: string;
+	/** Optional http(s) base URL replacing the explicit `classifierModel`'s
+	 * catalog endpoint (third-party/proxy host of the same API). Requires
+	 * `classifierModel`; credentials still come from that provider in Pi. */
+	classifierBaseUrl?: string;
 	/** `provider/modelid`; unset means no LLM backend is available — the
 	 * service must never fall back to the main-session model. */
 	model?: string;
@@ -158,6 +163,7 @@ const LEVELS: readonly JudgmentThinkingLevel[] = [
 const KNOWN_KEYS = [
 	"mode",
 	"classifierModel",
+	"classifierBaseUrl",
 	"model",
 	"thinkingLevel",
 	"timeoutMs",
@@ -166,13 +172,16 @@ const KNOWN_KEYS = [
 ] as const;
 let saveSeq = 0;
 
-/** Resolve `<agentDir>`: `PI_CODING_AGENT_DIR` or `~/.pi/agent`. */
+/**
+ * Resolve `<agentDir>`: `PI_CODING_AGENT_DIR` or `~/.pi/agent`. Windows has no
+ * `HOME` unless a shell injects it, so fall back to `os.homedir()` like Pi.
+ */
 export function agentDir(): string {
 	const env = process.env.PI_CODING_AGENT_DIR;
 	if (env && env.trim() !== "") {
 		return env;
 	}
-	const home = process.env.HOME ?? "";
+	const home = (process.env.HOME || homedir()).replace(/\\/g, "/");
 	return home === "" ? "" : `${home.replace(/\/+$/, "")}/.pi/agent`;
 }
 
@@ -221,6 +230,18 @@ function readModelField(
 	return { ok: true, provider: ref.provider, modelId: ref.modelId };
 }
 
+function readHttpUrl(value: unknown): string | undefined {
+	if (typeof value !== "string" || value.trim() === "") return undefined;
+	try {
+		const url = new URL(value.trim());
+		return url.protocol === "http:" || url.protocol === "https:"
+			? value.trim()
+			: undefined;
+	} catch {
+		return undefined;
+	}
+}
+
 function readContextLimits(value: unknown): ContextLimitOverrides | undefined {
 	if (value === null || typeof value !== "object" || Array.isArray(value))
 		return undefined;
@@ -264,6 +285,7 @@ export function validateConfig(raw: unknown): LoadedConfig {
 	const fields: {
 		mode?: JudgmentMode;
 		classifierModel?: { provider: string; modelId: string };
+		classifierBaseUrl?: string;
 		model?: { provider: string; modelId: string };
 		thinkingLevel?: JudgmentThinkingLevel;
 		timeouts?: JudgmentConfig["timeouts"];
@@ -302,6 +324,22 @@ export function validateConfig(raw: unknown): LoadedConfig {
 			provider: classifier.provider,
 			modelId: classifier.modelId as string,
 		};
+
+	if (obj.classifierBaseUrl !== undefined) {
+		const url = readHttpUrl(obj.classifierBaseUrl);
+		if (!url) {
+			invalid = true;
+			diagnostics.push({
+				message: `llm-as-jev.json: classifierBaseUrl ${JSON.stringify(obj.classifierBaseUrl)} is not an http(s) URL; using default settings`,
+			});
+		} else if (obj.classifierModel === undefined) {
+			invalid = true;
+			diagnostics.push({
+				message:
+					"llm-as-jev.json: classifierBaseUrl requires classifierModel; using default settings",
+			});
+		} else fields.classifierBaseUrl = url;
+	}
 
 	const llm = readModelField(obj, "model", diagnostics);
 	if (!llm.ok) invalid = true;
@@ -377,6 +415,8 @@ export function validateConfig(raw: unknown): LoadedConfig {
 		config.classifierProvider = fields.classifierModel.provider;
 		config.classifierModelId = fields.classifierModel.modelId;
 	}
+	if (fields.classifierBaseUrl !== undefined)
+		config.classifierBaseUrl = fields.classifierBaseUrl;
 	if (fields.model !== undefined) {
 		const value = obj.model as string;
 		config.model = value;
@@ -561,6 +601,13 @@ export async function saveConfig(
 	} else if (base.classifierModel !== undefined) {
 		candidate.classifierModel = base.classifierModel;
 	}
+	// The base URL belongs to the model it was configured for: keep it only
+	// while that same classifier stays selected.
+	if (
+		base.classifierBaseUrl !== undefined &&
+		candidate.classifierModel === base.classifierModel
+	)
+		candidate.classifierBaseUrl = base.classifierBaseUrl;
 	if (update.model === null) {
 		// removed — field stays absent
 	} else if (update.model !== undefined) {
@@ -611,6 +658,8 @@ export async function saveConfig(
 	if (merged.config.classifierModel !== undefined) {
 		next.classifierModel = merged.config.classifierModel;
 	}
+	if (merged.config.classifierBaseUrl !== undefined)
+		next.classifierBaseUrl = merged.config.classifierBaseUrl;
 
 	await fs.mkdir(dir, { recursive: true });
 	// pid alone can collide across concurrent test processes; add a monotonic

@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import * as fs from "node:fs/promises";
+import { homedir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 import {
@@ -354,6 +355,20 @@ test("invalid new timeouts member falls back to all-defaults", () => {
 	});
 	assert.equal(missing.diagnostics.length, 0);
 	assert.equal(missing.config.timeouts?.llm?.modelTimeoutMs, 100);
+});
+
+test("os home fallback when HOME unset (Windows)", () => {
+	const prev = process.env.PI_CODING_AGENT_DIR;
+	const home = process.env.HOME;
+	delete process.env.PI_CODING_AGENT_DIR;
+	delete process.env.HOME;
+	try {
+		const expected = `${homedir().replace(/\\/g, "/").replace(/\/+$/, "")}/.pi/agent`;
+		assert.equal(agentDir(), expected);
+	} finally {
+		if (home !== undefined) process.env.HOME = home;
+		if (prev !== undefined) process.env.PI_CODING_AGENT_DIR = prev;
+	}
 });
 
 test("home fallback when env unset", () => {
@@ -830,4 +845,61 @@ test("disk and returned config agree for independent slots (3.2)", async () => {
 	assert.equal(loaded.config.modelId, "claude/sonnet");
 	// Return value is the same effective config as the disk reload.
 	assert.deepEqual(loaded.config, saved.config);
+});
+
+test("classifierBaseUrl parses with classifierModel and rejects bad values", () => {
+	const ok = validateConfig({
+		classifierModel: "typesafe/jev-latest",
+		classifierBaseUrl: "https://proxy.example.com/v1",
+	});
+	assert.deepEqual(ok.diagnostics, []);
+	assert.equal(ok.config.classifierBaseUrl, "https://proxy.example.com/v1");
+	for (const raw of [
+		{ classifierBaseUrl: "https://proxy.example.com/v1" },
+		{ classifierModel: "typesafe/jev-latest", classifierBaseUrl: "ftp://x" },
+		{ classifierModel: "typesafe/jev-latest", classifierBaseUrl: "not a url" },
+		{ classifierModel: "typesafe/jev-latest", classifierBaseUrl: 1 },
+	]) {
+		const bad = validateConfig(raw);
+		assert.equal(bad.diagnostics.length, 1);
+		assert.equal(bad.config.classifierBaseUrl, undefined);
+		assert.equal(bad.config.classifierModel, undefined);
+	}
+});
+
+test("saveConfig keeps classifierBaseUrl only while the same classifier stays selected", async () => {
+	const dir = path.join(tmpRoot, "base-url");
+	await fs.mkdir(dir, { recursive: true });
+	await fs.writeFile(
+		configFilePath(dir),
+		JSON.stringify({
+			classifierModel: "typesafe/jev-latest",
+			classifierBaseUrl: "https://proxy.example.com/v1",
+		}),
+	);
+	const kept = await saveConfig({ mode: "classifier" }, dir);
+	assert.equal(kept.config.classifierBaseUrl, "https://proxy.example.com/v1");
+	const same = await saveConfig(
+		{ classifierModel: "typesafe/jev-latest" },
+		dir,
+	);
+	assert.equal(same.config.classifierBaseUrl, "https://proxy.example.com/v1");
+	const switched = await saveConfig(
+		{ classifierModel: "openrouter/typesafe/jev-1.13" },
+		dir,
+	);
+	assert.equal(switched.config.classifierBaseUrl, undefined);
+	const onDisk = JSON.parse(await fs.readFile(configFilePath(dir), "utf8"));
+	assert.equal(onDisk.classifierBaseUrl, undefined);
+	await fs.writeFile(
+		configFilePath(dir),
+		JSON.stringify({
+			classifierModel: "typesafe/jev-latest",
+			classifierBaseUrl: "https://proxy.example.com/v1",
+		}),
+	);
+	const cleared = await saveConfig({ classifierModel: null }, dir);
+	assert.equal(cleared.config.classifierModel, undefined);
+	assert.equal(cleared.config.classifierBaseUrl, undefined);
+	assert.deepEqual((await loadConfig(dir)).config, cleared.config);
 });

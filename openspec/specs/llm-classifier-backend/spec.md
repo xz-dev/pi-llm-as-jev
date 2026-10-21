@@ -22,23 +22,27 @@ The LLM backend SHALL answer a Pi-shaped request (`state` + `choice` / `bool` / 
 - **THEN** the answer has `type: "score"` with `score` in [0, 3] and `confidence` in [0, 1]
 
 ### Requirement: Structured output enforcement
-The backend SHALL obtain a discrete answer through a tool call whose schema constrains the allowed labels. A choice selects one criteria key, a bool selects true or false, and a score selects one integer level. The model SHALL NOT be asked to generate probability or confidence percentages. A response with no tool call, an unknown label, or malformed arguments SHALL be retried once and then reported as `stopReason: "error"` rather than guessed. Authentication, transport, caller-abort or deadline failures SHALL NOT be treated as malformed-output retries and SHALL resolve as structured errors/aborts, never rejected promises.
+The backend SHALL obtain discrete answers through constrained tool calls: a choice selects a legal label, a bool selects true/false and a score selects an integer level. It SHALL NOT ask the model for confidence percentages. Unknown labels, malformed arguments and absent expected tool calls SHALL permit exactly one output-repair request per question, then a structured error with empty final answers. Authentication, transport, cancellation and timeout SHALL NOT trigger output repair. Each question and repair SHALL remain inside its admitted model attempt's progress-idle and optional hard clocks, with no fresh hard budget. Questions SHALL remain serial in this change.
 
 #### Scenario: Model replies in prose
-- **WHEN** the model returns text without the expected tool call
-- **THEN** the backend retries once and, on a second failure, returns `stopReason: "error"` with no answers
+- **WHEN** the first response lacks the required tool call
+- **THEN** one repair is allowed if the same attempt remains live, and a second invalid response fails without guessed answers
+
+#### Scenario: Timeout during repair
+- **WHEN** the model hard limit expires during the allowed repair
+- **THEN** the backend cancels and returns an error rather than renewing the hard limit or starting another repair
+
+#### Scenario: Special choice key
+- **WHEN** the model selects the legal label `__proto__`
+- **THEN** its compatibility probabilities retain that own key and all legal keys, sum to one and do not mutate the prototype
 
 #### Scenario: Unknown label
-- **WHEN** the tool call names a choice key that is not in the question's criteria
-- **THEN** the answer is rejected and handled as a malformed response
+- **WHEN** a tool call selects a label absent from the question's criteria
+- **THEN** validation rejects it and permits only the remaining single output-repair attempt
 
 #### Scenario: Authentication or transport failure
 - **WHEN** streaming throws synchronously or its result rejects asynchronously
-- **THEN** the backend resolves a structured error with no answers and sends no malformed-output retry
-
-#### Scenario: Special choice key
-- **WHEN** the selected legal choice key is `__proto__`
-- **THEN** the locally encoded probabilities retain that own key, all legal keys and sum 1 without changing the map prototype
+- **THEN** the backend resolves a structured error with empty answers and sends no output-repair request
 
 ### Requirement: Thinking level pass-through
 The backend SHALL clamp the configured thinking level using Pi's own supported-level logic and send the effective reasoning level; when `off` is supported and selected, it SHALL send no reasoning request in Pi's provider-neutral simple API.
@@ -52,59 +56,69 @@ The backend SHALL clamp the configured thinking level using Pi's own supported-l
 - **THEN** the request is sent with `high`
 
 ### Requirement: Registered as a Pi classifier provider
-The extension SHALL register a classifier provider whose single classifier model reflects the configured chat model, so that `getAvailableOfType("classifier")` lists it whenever an LLM model is configured and the underlying chat model's provider has usable credentials, and `modelRegistry.classify()` on it yields the same result as the service's LLM backend. The classifier model's `contextWindow` SHALL equal the configured chat model's context window. When no LLM model is configured, the provider SHALL expose no classifier models.
+The extension SHALL retain the `llm-as-jev` provider exposing zero or one classifier derived from the configured chat model, with that model's context window and cost metadata. It SHALL expose no chat model, use delegated Pi authentication, remain visible through ordinary classifier listing, and stay excluded from native candidate discovery. Missing/unavailable target models SHALL return a structured error, without substituting the main model, a previous descriptor target or a native classifier.
 
-Provider model-metadata queries, availability/authentication checks and classification invocations SHALL each use current global file settings for that operation. Metadata and availability operations SHALL NOT write settings, run paid inference or expose chat models through this classifier provider.
+Metadata/authentication operations and direct classification SHALL read current settings for their own operation. A classification SHALL freeze target, thinking and timing through all questions and output repair. Classification through a retained descriptor SHALL use the current configured target and report its actual full identity. Metadata inspection SHALL not write settings or run inference.
 
-Each classification SHALL freeze its configured chat model, effective thinking and applicable timeout for the whole invocation, including any output-repair retry. The applicable timeout (caller-supplied, else configured) SHALL be a per-request transport-inactivity window: it bounds the wait for the first response and is reset by any response bytes (visible text, reasoning deltas, tool-argument deltas, keepalives) and by provider stream events; it SHALL NOT be passed to the chat provider as a whole-request timeout; a caller-supplied fetch or stream observer SHALL be composed with, not replaced by, the inactivity observer. An unavailable or removed current target SHALL produce a structured error rather than dispatch to the descriptor's old target, the main-session model or a native classifier.
+Direct emulated classification SHALL use the same LLM generation-progress idle policy as service-driven LLM work: default **15,000 ms**, an optional whole-model-attempt hard limit, and caller cancellation. Nonempty generated text, reasoning and tool-argument deltas SHALL renew idle waiting; headers, heartbeats, empty events and request starts SHALL NOT. Neither internal questions nor repair SHALL renew the hard cap. No configured hard cap SHALL mean none, regardless of host HTTP idle settings. The plugin SHALL NOT convert the idle duration into an SDK whole-request timeout.
+
+The standard Pi classifier option `timeoutMs`, when supplied to this direct provider entry, SHALL impose a finite whole-invocation deadline under the new contract, replacing this plugin's former idle interpretation and SHALL override the configured LLM hard limit; it SHALL NOT be interpreted as the new idle duration. Service callers SHALL use version-two named timing options instead. Supported caller transport/stream hooks SHALL remain composed with internal progress handling, not replaced. These hooks SHALL not reinstate plugin-owned transport accounting or make raw bytes qualify as generation progress.
 
 #### Scenario: Visible to codemode
-- **WHEN** an LLM model is configured and its provider has credentials
-- **THEN** a codemode script calling `models.getAvailableOfType("classifier")` sees the emulated classifier and can `classify()` with it
+- **WHEN** an LLM is configured and its provider has usable credentials
+- **THEN** `models.getAvailableOfType("classifier")` exposes its emulated classifier for ordinary `classify()` calls
 
 #### Scenario: Unconfigured
-- **WHEN** no LLM model is configured
-- **THEN** the provider lists no classifier models
+- **WHEN** no LLM is configured
+- **THEN** the provider exposes no classifier models
 
 #### Scenario: Reconfigured at runtime
-- **WHEN** the user changes the configured chat model in this session or another session sharing the configuration file
-- **THEN** the next emulated-provider operation reflects the new configuration without restarting or reloading Pi, while already-running classifications keep their previous snapshot
+- **WHEN** this or another session sharing settings changes the configured chat model
+- **THEN** the next provider operation observes it without restart while admitted classifications keep their snapshot
 
 #### Scenario: Independent classifier setting
-- **WHEN** only the native `classifierModel` changes
-- **THEN** the emulated model identity and its underlying chat model/thinking remain unchanged
+- **WHEN** only native `classifierModel` changes
+- **THEN** emulated identity and underlying chat model/thinking remain unchanged
 
 #### Scenario: Public model listing is the first operation after a save
-- **WHEN** A changes the configured chat model from X to Y and B's next operation is a public classifier-model listing
-- **THEN** B lists Y's emulated identity and context window, not X's, without a preparatory plugin command or classification
+- **WHEN** X is replaced by Y and the next operation is public model listing
+- **THEN** it lists Y's identity and context window without a preparatory command or inference
 
 #### Scenario: Current credential availability
-- **WHEN** A changes the configured chat target to a provider without usable credentials and B next queries classifier availability
-- **THEN** B does not advertise a usable emulated classifier based on the old target's credentials and sends no inference request
+- **WHEN** the new target lacks usable credentials
+- **THEN** availability does not advertise it using the old target's credentials and sends no inference request
 
 #### Scenario: Previously obtained descriptor
-- **WHEN** B retains an emulated-model descriptor for X, A saves a usable target Y, and B starts classification with its retained descriptor
-- **THEN** the operation uses Y's configured model/thinking and reports Y's actual full model reference without requiring B to reconfigure the plugin
+- **WHEN** a descriptor for X is used after usable Y is configured
+- **THEN** classification uses Y's configured model/thinking and reports Y's actual full reference
 
 #### Scenario: Removed target with a retained descriptor
-- **WHEN** the current LLM target is removed or unavailable after B obtained a descriptor
-- **THEN** a new classification through that descriptor resolves a structured error without invoking its former chat target or another backend
+- **WHEN** the current target is removed or unavailable after a descriptor was acquired
+- **THEN** classification returns a structured error without invoking its former target or another backend
 
 #### Scenario: In-flight emulated classification
-- **WHEN** the file changes after an emulated classification begins but before a response or output-repair retry completes
-- **THEN** its dispatches and result identity retain the initial snapshot and no request is restarted merely because of the edit
+- **WHEN** settings change during an admitted classification or its output repair
+- **THEN** all dispatches and result identity retain the initial snapshot without a settings-triggered restart
 
 #### Scenario: Model removal and restoration
-- **WHEN** another session removes the LLM model and later saves a usable model again
-- **THEN** successive public classifier-list operations expose zero and then one current emulated model without restarting or reloading the receiving session
+- **WHEN** another session removes the target and later restores a usable target
+- **THEN** successive public listings expose zero then one current emulated model without restart or reload
 
 #### Scenario: Reasoning-only activity
-- **WHEN** the chat model emits only reasoning deltas for longer than the inactivity window before any visible text
-- **THEN** the classification is not timed out
+- **WHEN** nonempty reasoning deltas arrive within each 15-second idle window for more than a minute and no hard limit exists
+- **THEN** classification continues without a fabricated total deadline
+
+#### Scenario: Heartbeats without generation
+- **WHEN** only transport heartbeats arrive for 15 seconds after the last genuine progress
+- **THEN** classification times out without an output-repair request
+
+#### Scenario: Direct caller hard deadline
+- **WHEN** an ordinary Pi classifier caller supplies `timeoutMs: 20000` and the model keeps generating
+- **THEN** the direct invocation still ends at its 20-second hard deadline, covering every question and repair
 
 #### Scenario: Composed observer
-- **WHEN** the caller passes its own `fetch` and `onProviderStreamEvent`
-- **THEN** both the caller's observers and the inactivity clock see every event
+- **WHEN** a caller supplies supported `fetch` and `onProviderStreamEvent` hooks
+- **THEN** caller hooks retain their events while internal progress handling renews idle only for genuine generation, not heartbeat or empty events
 
 ### Requirement: Fidelity disclosure
 The result SHALL identify the emulation provider. Numeric fields required by Pi's classifier contract SHALL be compatibility encodings, not model-reported certainty: a selected choice has a one-hot probability distribution and confidence 1, a bool becomes probability 0 or 1, and a selected score level has confidence 1. Documentation SHALL state that these fields represent a discrete selection, NOT measured or calibrated confidence. Listing this emulation as a Pi `classifier` SHALL NOT make it a native numerical-confidence source; the native picker and native discovery SHALL exclude it. Service consumers SHALL receive the discrete business answer without comparing these compatibility numbers to thresholds.

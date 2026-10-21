@@ -41,9 +41,9 @@
 
 ## 6. Activate and verify only when deployment is explicitly authorized
 
-- [ ] 6.1 [Release/integration owner] Before any authorized update, inspect effective installed source choices, pins, filters and legacy timeout-field presence; record the prior matched revisions and affected non-secret settings needed for recovery. Verify legacy overrides have an explicit migration decision and no credentials or unrelated settings enter the delivery record.
-- [ ] 6.2 [Release/integration owner] If publication is authorized, make compatible consumers available before the breaking service and activate the tested matched set through normal Pi package/reload mechanisms; verify all effective package revisions and client versions match the accepted matrix without overriding user pins, installing alternate authentication methods or updating unrelated packages.
-- [ ] 6.3 [Release/integration owner] Verify the effective installation after reload: single service ownership, both consumer status paths, effective timing settings and controlled non-paid integration behavior; record installed activation separately from source acceptance. If activation fails, use the recorded matched-set recovery procedure and verify health without deleting history or reverting unrelated work.
+- [x] 6.1 [Release/integration owner] Before any authorized update, inspect effective installed source choices, pins, filters and legacy timeout-field presence; record the prior matched revisions and affected non-secret settings needed for recovery. Verify legacy overrides have an explicit migration decision and no credentials or unrelated settings enter the delivery record.
+- [x] 6.2 [Release/integration owner] If publication is authorized, make compatible consumers available before the breaking service and activate the tested matched set through normal Pi package/reload mechanisms; verify all effective package revisions and client versions match the accepted matrix without overriding user pins, installing alternate authentication methods or updating unrelated packages.
+- [x] 6.3 [Release/integration owner] Verify the effective installation after reload: single service ownership, both consumer status paths, effective timing settings and controlled non-paid integration behavior; record installed activation separately from source acceptance. If activation fails, use the recorded matched-set recovery procedure and verify health without deleting history or reverting unrelated work.
 
 ## 7. Publish source releases with meaningful CI/CD
 

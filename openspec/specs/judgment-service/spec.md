@@ -7,160 +7,182 @@ An in-process service other Pi extensions call to get answers to Pi-shaped typed
 ## Requirements
 
 ### Requirement: Service discovery
-The extension SHALL publish one process-wide judgment service handle that other extensions can look up at call time without a load-order dependency. When the extension is not loaded, lookup SHALL yield nothing and callers SHALL be able to treat the feature as unavailable without error.
+The extension SHALL publish one process-wide judgment service with `version: 2`, discoverable at call time through the existing service key. Its judgment entry SHALL be `judge()`; it SHALL NOT advertise or implement `review`, `reviewVersion`, `reviewCacheVersion` or `reviewStagesVersion`. Missing or incompatible services SHALL be distinguishable without inference. A retiring activation SHALL NOT delete a newer activation's handle.
 
 #### Scenario: Consumer loads before the service
-- **WHEN** a consumer extension looks up the service during its own activation and the judgment extension has not activated yet
-- **THEN** lookup returns nothing, and a later lookup after the judgment extension activates returns the service
+- **WHEN** a consumer looks up the service before and after service activation
+- **THEN** the first lookup is absent and the later lookup returns the version-two service without reloading the consumer
 
 #### Scenario: Service absent
 - **WHEN** the judgment extension is not installed
 - **THEN** lookup returns nothing and the consumer continues without a judgment feature
 
+#### Scenario: Old consumer meets new service
+- **WHEN** a consumer requires version one or the review capability
+- **THEN** it detects incompatibility rather than invoking a misleading compatibility facade
+
 ### Requirement: Request and answer shape
-`judge()` SHALL accept a `state` JSON object and a `questions` map whose values are Pi-shaped `choice`, `bool`, or `score` questions. It SHALL return `answers` keyed by question id in Pi-shaped answer form, a list of `dropped` question ids, the `backend` that answered (`classifier` or `llm`), the actual `provider/modelid` used, a `stopReason` of `stop`, `error`, or `aborted`, and an `errorMessage` when not `stop`. Legal own JSON keys SHALL remain intact in questions, choice labels, answers and persisted/reused judgments.
+`judge()` SHALL accept a JSON `state` object and a nonempty map of Pi-shaped `choice`, `bool` and `score` questions. It SHALL return accepted `answers`, `dropped` ids, actual `backend` (`classifier` or `llm`) and `provider/modelid`, `stopReason` (`stop`, `error` or `aborted`) and a bounded `errorMessage` on failure. Provider-reported usage SHALL remain optional; it SHALL NOT claim complete operation billing. Version two SHALL omit reuse counters, review progress, checkpoints, attempt observations and learned input-dimension accounting. Removed evidence/stage/cache/freshness options and legacy `timeoutMs` SHALL be rejected explicitly, not silently ignored. Consumers SHALL place necessary factual input in `state`.
+
+Answers SHALL validate against the complete requested types, labels and numeric constraints before native threshold filtering. An incomplete or malformed raw result SHALL NOT publish partial final answers. Legal own JSON keys SHALL survive validation and serialization without prototype mutation; service persistence and reuse are removed by the explicit removals below.
 
 #### Scenario: Mixed question types
-- **WHEN** a request contains one `choice`, one `bool`, and one `score` question
-- **THEN** the result contains each answer in its matching answer type under the same question id
+- **WHEN** a request contains one choice, one bool and one score question
+- **THEN** each validated answer retains its matching type and question id
 
 #### Scenario: Special JSON identifiers
-- **WHEN** a valid question id or choice label is `__proto__`, `constructor`, or `toString`
-- **THEN** the own key and its answer/probability survive validation, serialization, cache reuse and branch restore without prototype mutation or data loss
+- **WHEN** a valid question id or choice label is `__proto__`, `constructor` or `toString`
+- **THEN** the own key and answer/probability survive validation and serialization without inherited-property lookup, prototype mutation or data loss
+
+#### Scenario: Legacy payload is not silently shortened
+- **WHEN** a caller supplies a separate legacy evidence array or checkpoint option
+- **THEN** the service returns an invalid-request error with no inference, rather than ignoring required facts
 
 ### Requirement: Never throws
-`judge()` and `review()` SHALL resolve for every input, abort, timeout, missing backend or provider failure. A backend failure recovered by automatic failover SHALL produce the successful alternate's result. A terminal error or abort SHALL be reported through `stopReason` and `errorMessage` with an empty `answers` map.
+Every public judgment SHALL resolve to a result, including invalid input, unavailable backends, exceptions, cancellation and timeout. Error and aborted results SHALL have empty final `answers`. Eligible automatic failures SHALL permit one unused alternate; forced modes SHALL remain terminal.
 
-For each backend attempt, duration precedence SHALL be the caller's `timeoutMs`, else the configured `timeoutMs` override, else the backend default. Backend setup (readiness, redaction preparation, discovery and authentication resolution) SHALL be bounded by the explicit duration or, when absent, 60 000 ms, even when underlying promises ignore cancellation. The native default SHALL be 60 000 ms, with one absolute deadline from admission of that backend attempt through setup and every internal stage, using remaining wall time and never resetting per stage. LLM execution SHALL use the explicit duration or the host's `httpIdleTimeoutMs` (Pi default 300 000 ms; `0` meaning disabled) as a per-request transport-inactivity window. That window SHALL restart for each provider request, including each question batch and the single output-repair attempt, reset on any raw response bytes or provider stream event, and SHALL NOT be forwarded to the SDK as a whole-request timeout.
+Each backend attempt SHALL have a generation-progress idle timer, defaulting to **10,000 ms for classifier** and **15,000 ms for LLM**, and an optional `modelTimeoutMs` hard limit. Caller `idleTimeoutMs` and `modelTimeoutMs`, when supplied, SHALL override the corresponding backend-slot setting for each attempt independently. An omitted hard limit with no configured hard limit SHALL mean no hard limit. The service SHALL NOT derive these values from the host HTTP idle setting or add a combined primary-plus-alternate deadline.
 
-In automatic modes, timeout of the preferred backend, including its setup, SHALL permit the one alternate backend attempt with a fresh window using that alternate's timeout semantics. An explicit timeout value SHALL apply independently to both attempts; without an override, each backend SHALL use its own default. It SHALL NOT be treated as a combined wall-clock limit for the automatic operation. Forced modes and exhausted automatic routes SHALL end on timeout without restarting the timed-out backend.
+Both timers SHALL start at backend-attempt admission, covering readiness, discovery, authentication, every question and the single permitted LLM output repair per question. Only nonempty generated text, reasoning or tool-argument deltas, or a completed validated question answer, SHALL renew the idle timer. Headers, heartbeats, empty/lifecycle events, retry starts, question dispatches and setup completion SHALL NOT renew it. The hard timer SHALL never renew. A non-streaming native adapter SHALL remain subject to idle expiry while waiting for its complete answer.
 
-Caller cancellation and session navigation SHALL remain terminal aborts across both attempts. A deadline or inactivity expiry SHALL be a backend error, not a caller abort. Caller cancellation observed before alternate admission SHALL prevent alternate dispatch. A late result from a cancelled or expired attempt SHALL NOT publish answers, judgments or checkpoints, or alter the alternate attempt's outcome.
+Timeout SHALL cancel cooperative work and settle even when an adapter ignores cancellation. Failover SHALL start independent timers and abandon the previous attempt's partial results. Caller cancellation, session navigation and shutdown SHALL terminate the operation, prevent alternate dispatch and fence late results; concurrent independent calls SHALL retain their own cancellation ownership.
 
 #### Scenario: No backend available
-- **WHEN** neither selected/default native classifier nor configured LLM is usable in an automatic mode
-- **THEN** the call resolves with `stopReason: "error"`, an `errorMessage` explaining both unavailable candidates, and no answers
+- **WHEN** neither native nor configured LLM is usable in an automatic mode
+- **THEN** the call resolves with error, no answers and a bounded explanation of both unavailable candidates
 
 #### Scenario: Caller aborts
-- **WHEN** the caller's abort signal fires while either backend attempt is in flight
-- **THEN** the call resolves with `stopReason: "aborted"`, no new backend is started and aborted work caches or persists no new judgments
+- **WHEN** caller cancellation occurs during either attempt
+- **THEN** the call resolves aborted with no answers, no alternate dispatch and no persisted judgments
 
 #### Scenario: Native logical deadline
-- **WHEN** a native backend attempt needs three internal stages and the caller passed 30000 ms
-- **THEN** setup and the three stages share that attempt's 30-second deadline; expiry fails the attempt and permits only the automatic route's unused alternate
+- **WHEN** a native attempt has `modelTimeoutMs: 30000`
+- **THEN** its setup and classification share one 30-second hard deadline; expiry permits only the automatic route's unused alternate
 
 #### Scenario: Healthy LLM stream outlasts the number
-- **WHEN** the LLM backend streams continuously for longer than `timeoutMs`
-- **THEN** the attempt does not time out or trigger failover while bytes keep arriving
+- **WHEN** genuine generation continues within each idle window for longer than `idleTimeoutMs`, with no hard cap configured
+- **THEN** idle expiry and an invented total deadline do not stop it
 
 #### Scenario: Stalled LLM stream
-- **WHEN** an LLM response produces no bytes or events for `timeoutMs`
-- **THEN** its request is cancelled and the attempt fails; `auto-llm` can try its unused native alternate, while forced `llm` or an already-used alternate ends with a timeout error
+- **WHEN** an LLM produces no genuine generation progress for its idle duration, even while receiving heartbeats
+- **THEN** its attempt fails and only an unused automatic alternate can continue
 
 #### Scenario: Hung discovery
-- **WHEN** preferred-backend discovery never resolves in an automatic mode but the alternate is usable
-- **THEN** the preferred attempt times out without dispatch, the alternate obtains a fresh setup window and can answer
+- **WHEN** preferred discovery or credential readiness never resolves, even after cancellation
+- **THEN** the attempt expires without late dispatch and a usable alternate obtains fresh clocks
 
 #### Scenario: Timeout
-- **WHEN** a forced backend exceeds the backend-specific interpretation of `timeoutMs`
-- **THEN** the call resolves with `stopReason: "error"` and that timed-out request is not retried or replaced by another backend
+- **WHEN** a forced backend exceeds idle or hard expiry
+- **THEN** the call resolves with error and does not restart that attempt or dispatch another backend
 
 #### Scenario: Fresh alternate window
-- **WHEN** `auto` uses `timeoutMs: 30000`, the native attempt times out, and the configured LLM is usable
-- **THEN** the LLM receives a fresh 30000 ms setup bound followed by a 30000 ms per-request inactivity window, rather than the native attempt's exhausted deadline or aborted timeout signal
+- **WHEN** `auto` uses caller overrides `idleTimeoutMs: 30000` and `modelTimeoutMs: 30000`, and native times out
+- **THEN** LLM receives its own fresh 30-second idle and hard clocks from admission, not the exhausted native deadline or aborted timeout signal
 
 #### Scenario: Alternate native deadline
-- **WHEN** `auto-llm` times out on the LLM with `timeoutMs: 30000` and switches to the classifier
-- **THEN** the classifier receives one fresh 30000 ms absolute deadline spanning its setup and all stages
+- **WHEN** `auto-llm` times out and caller `modelTimeoutMs: 30000` applies to its native alternate
+- **THEN** native receives a fresh 30-second hard deadline spanning its setup and classification
 
 #### Scenario: Defaults belong to each backend
-- **WHEN** automatic failover occurs without a caller or configured timeout override
-- **THEN** native execution uses its 60000 ms absolute deadline and LLM execution uses the host idle-timeout setting, without borrowing the preferred backend's default
+- **WHEN** automatic failover occurs without timing overrides
+- **THEN** classifier idle is 10,000 ms, LLM idle is 15,000 ms and neither attempt has a hard cap or borrows host HTTP idle settings
 
 #### Scenario: Cancellation wins between attempts
-- **WHEN** the preferred backend fails and caller cancellation is observed before the alternate starts
+- **WHEN** caller cancellation is observed after primary failure but before alternate admission
 - **THEN** the operation resolves aborted without dispatching the alternate
 
 #### Scenario: Timed-out backend resolves late
-- **WHEN** the preferred backend ignores cancellation and returns after failover has begun
-- **THEN** its late result cannot replace the alternate result, populate answers or publish new judgments or checkpoints
+- **WHEN** a retired primary ignores cancellation and returns after failover begins
+- **THEN** it cannot replace the alternate result, publish answers or affect a later call
+
+#### Scenario: Default native silence
+- **WHEN** native produces no answer or generation progress for 10,000 ms after admission
+- **THEN** it expires and an automatic route can start its unused LLM alternate with a fresh 15,000 ms idle window
+
+#### Scenario: Hard cap survives internal requests
+- **WHEN** an LLM has a 20,000 ms hard limit and remains active across setup, several questions and output repair
+- **THEN** it expires 20,000 ms after admission, not after its last request or delta
+
+#### Scenario: Alternate keeps its whole budget
+- **WHEN** a primary exhausts its hard limit and its alternate has a separately configured 30,000 ms hard limit
+- **THEN** the alternate receives 30,000 ms from its own admission without subtracting primary time
 
 ### Requirement: Backend selection
-The service SHALL use modes `auto`, `auto-llm`, `classifier` or `llm`. The native candidate SHALL be the explicitly configured `classifierModel` when present, otherwise an available Jev-family model using the existing default discovery preference. Explicit selection SHALL allow compatible Pi classifier models not named Jev; the service SHALL exclude its own LLM-emulation provider from native selection and SHALL NOT automatically substitute an arbitrary non-Jev classifier. A compatible native adapter SHALL support the existing question/answer contract and defined numeric-field semantics; model type alone SHALL NOT be treated as proof of calibrated confidence. Availability SHALL come from Pi's model registry, not independent credential resolution.
+Modes SHALL remain `auto`, `auto-llm`, `classifier` and `llm`. `auto` SHALL prefer the selected/default native classifier; `auto-llm` SHALL prefer the independently configured LLM. Forced modes SHALL never switch family. An explicit native model SHALL be honored exactly, including compatible non-Jev classifiers; an unavailable explicit model SHALL NOT be silently replaced by another native model. Omitted native selection SHALL retain existing Jev discovery. The emulation provider SHALL remain excluded from native selection. Compatibility SHALL require the defined answer and numerical-field semantics, not an assumption that every classifier has uniformly calibrated confidence. Availability SHALL come from Pi's registry. LLM model/thinking SHALL NOT inherit main-session settings.
 
-`auto` SHALL prefer the selected/default native candidate and use the independently configured LLM if that candidate is missing, unavailable or fails. `auto-llm` SHALL prefer the independently configured LLM and use the selected/default native candidate if the LLM is unconfigured, unavailable or fails. Both public judgment paths, `judge()` and `review()`, SHALL follow the same ordering. Each operation SHALL consider each backend family at most once, stop on success and never cycle back to a previously failed or unavailable family. This bound SHALL NOT remove existing within-backend question splitting, evidence recovery, output repair or adapter transport retry behavior.
-
-Eligible failures SHALL include backend discovery/authentication failure, transport/provider failure, invalid or incompatible output after applicable recovery, irreducible context failure, and setup or execution timeout. Invalid requests, invalid caller policy, caller cancellation and session navigation SHALL NOT trigger failover. A valid negative answer or confidence-filtered result, including all questions being dropped, SHALL count as backend success rather than failure.
-
-A missing, wrong-type or unavailable explicit native candidate SHALL NOT cause another native model to be silently selected. Forced `classifier` and `llm` SHALL never switch backend. The operation SHALL freeze its configuration; each backend attempt SHALL freeze its actual full model reference and effective thinking identity across dispatch, recovery, cache and ledger operations. Failover SHALL NOT reread settings or mutate the persisted mode or model slots. Each later public operation SHALL start with the configured preference again, not a sticky choice based on an earlier failure.
+Automatic modes SHALL consider each family at most once, sequentially. Missing/unavailable candidates, discovery/auth/provider errors, invalid output after the allowed repair, confirmed context overflow and timeout SHALL permit the unused alternate. Invalid requests/policy, caller cancellation, navigation and local consumer faults SHALL remain terminal. Valid negative answers and all-dropped native results SHALL count as success. Every alternate SHALL evaluate the complete immutable request, not a partial prefix or suffix. No operation SHALL rewrite settings or pin the last successful family for the next operation. Each attempt SHALL retain its selected full model identity through questions and repair.
 
 #### Scenario: Default auto with Jev available
-- **WHEN** mode is `auto`, no `classifierModel` is configured, and Pi reports an available Jev-family classifier that successfully answers
-- **THEN** that classifier answers, the result reports `backend: "classifier"` and its actual model reference, and the LLM is not dispatched
+- **WHEN** mode is auto, no explicit classifier is configured and an available Jev-family model succeeds
+- **THEN** it answers with its actual classifier identity and no LLM dispatch
 
 #### Scenario: Explicit non-Jev classifier
-- **WHEN** a compatible available classifier not named Jev is explicitly configured and a native attempt is needed
-- **THEN** the native request uses that exact model rather than the default Jev candidate
+- **WHEN** a compatible non-Jev classifier is explicitly configured and available
+- **THEN** a native attempt uses that exact model
 
 #### Scenario: Auto without a native candidate
-- **WHEN** mode is `auto`, the selected/default native candidate is unavailable, and a usable LLM model is configured
-- **THEN** the LLM answers and the result reports `backend: "llm"`
+- **WHEN** auto has no usable native candidate and a usable configured LLM
+- **THEN** LLM answers and the result identifies it
 
 #### Scenario: Missing explicit model does not select another native model
-- **WHEN** an explicit classifier is absent or unavailable but a different native classifier is available
-- **THEN** automatic modes can use only the configured LLM as the other family, while forced classifier mode errors; no mode silently substitutes that other native model
+- **WHEN** an explicit classifier is unavailable but another native model exists
+- **THEN** automatic mode can try only its configured LLM alternate and forced classifier mode errors
 
 #### Scenario: Forced classifier with none available
-- **WHEN** mode is `classifier` and its selected/default native candidate is unavailable
-- **THEN** the result is `stopReason: "error"` and the LLM is not used
+- **WHEN** forced classifier has no usable selected/default native model
+- **THEN** it returns error without LLM dispatch
 
 #### Scenario: Emulation is not a native candidate
-- **WHEN** this plugin's LLM-emulation provider is listed as a Pi classifier or explicitly named in `classifierModel`
-- **THEN** it is excluded from native selection and is never recursively dispatched as the native backend
+- **WHEN** the emulation provider appears in classifier listings or is explicitly selected as native
+- **THEN** it is excluded and never recursively dispatched as native
 
 #### Scenario: Native failure is not fallback permission
-- **WHEN** mode is forced `classifier` and the selected native model fails authentication, transport or answer validation after dispatch
-- **THEN** the service returns an error with no answers and does not call another native model or the LLM
+- **WHEN** forced classifier fails authentication, transport or validation
+- **THEN** it errors without another native model or LLM attempt
 
 #### Scenario: Native runtime failure permits one LLM attempt
-- **WHEN** mode is `auto`, the selected native model fails authentication, transport or answer validation after applicable recovery, and the configured LLM succeeds
-- **THEN** the operation succeeds with the LLM's answers and actual identity, without trying another native model
+- **WHEN** auto's native attempt fails and its configured LLM succeeds
+- **THEN** only the complete LLM answers and actual identity are returned
 
 #### Scenario: Selected identity survives registry changes
-- **WHEN** registry discovery changes while one backend attempt is subdivided or retried
-- **THEN** every part and stored judgment of that attempt retains its originally selected backend/model identity
+- **WHEN** registry results change between questions or during repair
+- **THEN** that attempt retains its initially selected backend/model identity
 
 #### Scenario: Auto-llm prefers LLM
-- **WHEN** mode is `auto-llm`, both candidates are usable and the LLM succeeds
-- **THEN** the LLM answers and no native inference is dispatched
+- **WHEN** auto-llm has two usable candidates and LLM succeeds
+- **THEN** no native inference is dispatched
 
 #### Scenario: Auto-llm with no usable LLM
-- **WHEN** mode is `auto-llm`, the LLM slot is unset, unknown or lacks usable credentials, and the selected/default classifier is usable
-- **THEN** that classifier answers without inheriting the main-session model or treating an unset classifier slot as disabling default Jev discovery
+- **WHEN** auto-llm's LLM is unset, unknown or lacks credentials, and selected/default native is usable
+- **THEN** native answers without main-model substitution or disabling default Jev discovery
 
 #### Scenario: LLM runtime failure permits one native attempt
-- **WHEN** mode is `auto-llm`, the LLM fails after applicable recovery and the selected/default native classifier succeeds
-- **THEN** the operation succeeds with only that classifier's answers and actual identity
+- **WHEN** auto-llm's LLM fails after permitted repair and native succeeds
+- **THEN** only native's complete answers and identity are returned
 
 #### Scenario: Both backend attempts fail
-- **WHEN** the preferred and alternate backends both fail in either automatic mode
-- **THEN** the operation ends with `stopReason: "error"`, no answers and redacted diagnostics identifying both failures; neither backend is tried again by automatic routing
+- **WHEN** both candidates fail in either automatic mode
+- **THEN** error contains no answers and a redacted summary of both outcomes, with neither family tried again
 
 #### Scenario: Forced backend fails
-- **WHEN** a forced `llm` or `classifier` attempt fails while the other family is usable
-- **THEN** the failure remains terminal and the other family is not dispatched
+- **WHEN** a forced family fails while the other is usable
+- **THEN** the failure remains terminal
 
 #### Scenario: No failover for valid business outcomes
-- **WHEN** the preferred backend returns valid `false` answers or succeeds with all classifier answers dropped by confidence policy
-- **THEN** the operation reports that backend's successful result without trying the alternate
+- **WHEN** valid false answers or an all-dropped native result is returned
+- **THEN** that successful business outcome is final without consulting the alternate
 
 #### Scenario: Invalid request does not select an alternate
-- **WHEN** a request or threshold policy fails validation
-- **THEN** the call returns an invalid-request error without inference on either backend
+- **WHEN** a request or threshold policy is invalid
+- **THEN** neither backend runs inference
 
 #### Scenario: Next call restores configured priority
-- **WHEN** an earlier automatic operation succeeded through its alternate and a new public operation starts
-- **THEN** the new operation starts from its current configured preference rather than pinning the previous alternate
+- **WHEN** a previous call succeeded through fallback
+- **THEN** the next call starts with its current configured preference
+
+#### Scenario: Runtime failure and full fallback
+- **WHEN** primary fails after answering part of a multi-question request
+- **THEN** its alternate evaluates all original questions against the original state once
 
 ### Requirement: Backend availability
 `availability()` SHALL expose optional `classifier` and `llm` full model references for usable selected/default native and configured chat candidates. It SHALL NOT expose a `jev` compatibility alias or treat an unconfigured LLM as the main-session model.
@@ -169,194 +191,144 @@ A missing, wrong-type or unavailable explicit native candidate SHALL NOT cause a
 - **WHEN** a native classifier and an independently configured chat model are both usable
 - **THEN** availability reports their respective actual references under `classifier` and `llm`
 
-### Requirement: Confidence policy
-When the backend is `classifier`, the service SHALL apply the caller's default `minConfidence` to the adapter's defined choice/score confidence and bool certainty (`max(p, 1-p)`). The caller SHALL also be able to specify a per-question threshold rule that overrides that default: confidence, or the probability of a named choice label. Values SHALL be validated against the defined contract, without inventing missing probabilities, guessing a scale or claiming uniform calibration across models. Dropped ids SHALL be listed in `dropped`. Thresholds SHALL be checked on every call, including cached, joined and restored answers. When the backend is `llm`, every numeric threshold SHALL be ignored: the model directly selects the business answer and `dropped` SHALL be empty. Without a threshold rule, nothing is dropped on either backend.
-
-#### Scenario: Native classifier below threshold
-- **WHEN** backend is `classifier`, `minConfidence` is 0.8, and a choice answer has confidence 0.6
-- **THEN** that question id appears in `dropped` and not in `answers`
-
-#### Scenario: LLM ignores threshold
-- **WHEN** backend is `llm` and `minConfidence` is 0.8
-- **THEN** every answered question appears in `answers` and `dropped` is empty
-
-#### Scenario: Named-choice probability threshold
-- **WHEN** backend is `classifier`, a question's rule requires `contradicted` probability of at least 0.8, and the response has that probability 0.85 with overall confidence 0.7
-- **THEN** the answer is accepted using 0.85, not rejected using 0.7
-
-#### Scenario: A stricter caller reads cached data
-- **WHEN** an answer with confidence 0.85 was accepted at threshold 0.8 and a later identical request uses threshold 0.9
-- **THEN** the cached answer is dropped for the later caller without sending another provider request
-
-### Requirement: Exact-match caching
-The service MAY reuse a previously validated raw judgment internally when backend identity, model, effective thinking level, state, question id and complete question definition are identical, and SHALL join in-flight work for the same identity. It SHALL NOT reuse across backends, models or thinking levels, and SHALL apply thresholds per caller. Consumer-supplied cache lookup/store callbacks are deprecated: existing `version:1` callers that pass them SHALL keep working, new consumers SHALL NOT be required to supply them, and the service SHALL NOT depend on them for correctness.
-
-#### Scenario: Consumer passes no cache callbacks
-- **WHEN** a consumer calls the service with state, questions and options only
-- **THEN** the call is accepted and judged normally
-
-#### Scenario: Legacy consumer passes callbacks
-- **WHEN** a `reviewVersion:1` consumer passes cache callbacks and checkpoints
-- **THEN** behavior is unchanged from the previous release
-
-#### Scenario: Same question twice
-- **WHEN** the same state and question are judged twice on the same backend and model
-- **THEN** the second call sends no provider request and returns the cached answer
-
-#### Scenario: Backend switch
-- **WHEN** a question was answered on `classifier` and the mode is changed so the same question is judged on `llm`
-- **THEN** a new provider request is sent
-
-#### Scenario: Native model switch
-- **WHEN** the configured classifier changes from one model to another and the state/question remain identical
-- **THEN** the next request uses the new model, does not reuse the old model's judgment, and records the new actual model identity
-
-
-### Requirement: Ordered evidence recovery
-Ordered evidence with service-owned fragmentation SHALL remain available for callers that supply it, with the same completeness and metadata guarantees as before. It SHALL NOT be required: callers SHALL be able to embed ordered input inside `state` and rely on capacity disclosure and question splitting only. Business stage callbacks (`planStages`, `projectStage`, `onProgress`) and service checkpoints are deprecated and SHALL NOT be required for a complete result.
-
-Recovery SHALL operate within one frozen backend identity. When that attempt fails and automatic failover remains, the alternate SHALL process the complete logical request, not only the first backend's unanswered questions or evidence suffix. Early-stage answers SHALL NOT become final answers for a failed or aborted attempt, and checkpoints SHALL only be reusable under compatible backend/model/thinking identity.
-
-#### Scenario: Consumer packs its own input
-- **WHEN** a consumer sends state that fits the selected backend's capacity, with no evidence array
-- **THEN** a successful attempt judges it in one provider request per question batch without fragmentation
-
-#### Scenario: Evidence dominates the request size
-- **WHEN** even a single question over all evidence exceeds a backend's capacity
-- **THEN** the service reduces evidence batches and carries previous-stage judgments forward within that backend attempt until all supplied evidence is processed
-
-#### Scenario: One large evidence record
-- **WHEN** a single evidence record is too large and its text can be divided
-- **THEN** the service processes ordered fragments, preserving source identity and completeness metadata
-
-#### Scenario: Original metadata survives fragmentation
-- **WHEN** an oversized record has caller metadata, including its own `fragment` key
-- **THEN** all original metadata is preserved alongside separate recovery bounds and every text fragment is processed in order
-
-#### Scenario: Failure on a later stage
-- **WHEN** an early evidence batch succeeds but a later batch fails or is aborted
-- **THEN** no early-stage answer is returned as a final judgment; resume can reuse persisted validated stages only under the matching identity, and eligible failover starts a complete alternate attempt
-
-#### Scenario: Fixed state cannot fit
-- **WHEN** fixed state with one minimum fragment is rejected for input size
-- **THEN** the attempt fails with context overflow rather than deleting evidence or repeatedly resending the same envelope; only an unused automatic alternate can continue the operation
-
-### Requirement: Session-branch ledger
-The service SHALL persist internal raw judgments, size rejections and per-request diagnostics as non-context custom session entries for its own reuse and metering only, restored from the active branch at session start or branch change, never containing credentials, provider bodies or request state/evidence. The ledger SHALL NOT be the consumer's progress or business memory; consumers persist their own judgment state. Aborted work SHALL NOT persist new judgments.
-
-#### Scenario: Consumer progress survives a ledger-free branch
-- **WHEN** a consumer switches to a branch without service ledger entries
-- **THEN** the consumer's own persisted state is unaffected and the service simply has no internal reuse for that branch
-
-#### Scenario: Ledger entries stay out of model context
-- **WHEN** a ledger entry is written
-- **THEN** it is not shown in the transcript and not sent to the agent's model
-
-#### Scenario: Resume restores verdicts
-- **WHEN** a session is resumed after internal raw judgments were persisted
-- **THEN** judging the same state and question returns the persisted answer without a provider request
-
-#### Scenario: Abandoned branch
-- **WHEN** the user navigates to a branch that does not contain a persisted answer
-- **THEN** that answer is not available for internal reuse on the new branch
-
-#### Scenario: Legacy prototype backend tags
-- **WHEN** the active branch contains old `jev`-tagged prototype judgments
-- **THEN** they are not relabeled or accepted as new `classifier` identity matches, and existing session entries are not rewritten
-
 ### Requirement: Redaction
-State sent to any backend SHALL have every API key known to the service redacted, and error messages returned to callers SHALL not contain credentials.
+State sent to a backend SHALL redact every credential known to the operation. The selected provider's credential resolution and redaction readiness SHALL complete before dispatch under the same attempt timers. The service SHALL use Pi's credential mechanisms, not an independent credential store. Readiness SHALL NOT wait for credential resolution of unrelated providers; it SHALL still redact keys already available in the host/runtime snapshot and selected-provider keys. Errors SHALL be bounded and credential-free, without raw provider bodies. A selected-provider readiness failure SHALL NOT dispatch unsanitized input.
 
 #### Scenario: Key inside state text
-- **WHEN** the state contains the literal value of a resolved provider key
-- **THEN** the backend receives the state with that value replaced by a placeholder
+- **WHEN** state contains a credential already known to the operation or resolved for its selected provider
+- **THEN** the value is replaced before dispatch and is absent from returned errors
 
-### Requirement: Operation-scoped configuration snapshots
-Each public `judge()`, `review()` and `availability()` call SHALL obtain current global file settings at operation admission, including calls through a service handle acquired before the settings changed. The configuration snapshot SHALL be fixed for that entire call. Internal stages, splitting, malformed-output retries, recovery and automatic failover SHALL NOT become new configuration-reading boundaries. A later public review call, including a resumed review, SHALL obtain a new snapshot.
+#### Scenario: Unrelated provider hangs
+- **WHEN** an unrelated provider's authentication would hang but the selected provider is ready
+- **THEN** that unrelated lookup does not delay or cause a failure of the judgment
 
-Backend order, configured native and LLM references, effective thinking level, configured timeout and applicable context-limit overrides SHALL derive from that snapshot. Existing explicit caller-option precedence SHALL remain, including a caller timeout overriding the configured timeout. Helpers, error reporting and cache/ledger identities SHALL NOT combine settings from different snapshots. Configuration refresh SHALL preserve public service and review versions and SHALL NOT require consumers to replace their handle or call a refresh API.
+### Requirement: Stateless judgment execution
+The service SHALL retain only configuration and active-operation lifecycle state, not completed answers, cross-call pending joins, rejection caches, learned capacity, checkpoints or persistent accounting. Identical calls SHALL perform independent inference. Shutdown/navigation SHALL still cancel owned active operations. Existing session records SHALL remain untouched and SHALL NOT be restored as reusable judgments. Consumers SHALL own durable business state; this service SHALL not execute the business action selected by a judgment.
 
-Observing a changed configuration SHALL NOT itself cancel, restart or duplicate already-running work, clear the active branch ledger or invalidate otherwise reusable judgments. Caller abort, shutdown and branch navigation SHALL remain terminal; deadlines SHALL follow the per-backend-attempt contract, including the one automatic failover. Cache lookup, in-flight joining and review-checkpoint reuse SHALL require matching actual backend, model and effective thinking identity; neither a configuration change nor failover SHALL enable cross-identity reuse.
+#### Scenario: Identical independent calls
+- **WHEN** two callers request identical judgments
+- **THEN** both execute independently and cancelling either does not cancel the other
+
+#### Scenario: Reload with old ledger entries
+- **WHEN** a session contains historical `llm-as-jev-ledger` records
+- **THEN** the new service neither rewrites/deletes them nor restores their answers or emits replacement ledger entries
+
+### Requirement: Per-call native confidence policy
+Native confidence rules SHALL retain choice/score confidence, bool certainty `max(p, 1-p)`, or named-choice probability. Per-question rules SHALL replace, not stack with, `minConfidence`. Invalid rules or missing/invalid required native numerical fields SHALL be rejected rather than guessed. Dropped ids SHALL be absent from answers. LLM answers SHALL ignore numeric thresholds and have no dropped ids because their compatibility numbers are not measured confidence. Without a rule no valid answer SHALL be dropped. Each call SHALL apply policy to its own newly validated inference, with no cached/joined/restored answers.
+
+#### Scenario: Native classifier below threshold
+- **WHEN** native confidence is 0.6 under minimum 0.8
+- **THEN** the question is dropped and absent from answers
+
+#### Scenario: LLM ignores threshold
+- **WHEN** LLM answers under caller minimum 0.8
+- **THEN** all valid answers are accepted with no numeric gating
+
+#### Scenario: Named-choice probability threshold
+- **WHEN** a per-question rule requires contradicted probability 0.8 and the response has 0.85 with confidence 0.7
+- **THEN** it uses 0.85 instead of the default confidence threshold
+
+#### Scenario: Stricter repeat call runs fresh inference
+- **WHEN** confidence 0.85 passed threshold 0.8 and an identical later request uses 0.9
+- **THEN** the later call runs new inference and applies 0.9 to that new result, without reusing the old answer
+
+### Requirement: Consumer-owned input capacity
+Consumers SHALL own factual packing and business subdivision. The service SHALL NOT fragment evidence, automatically subdivide overflowing requests, learn capacity or retain rejected envelopes. Confirmed overflow SHALL permit the unused alternate on complete original input, then return structured failure if no candidate succeeds. Facts SHALL never be cropped or summarized to manufacture success. A terminal error's `contextOverflow` flag SHALL describe its terminal model failure, not a hidden earlier failure or an unrelated error.
+
+#### Scenario: Batch overflow is not subdivided
+- **WHEN** a provider rejects an eight-question request for input size
+- **THEN** service tries only its unused automatic alternate on complete input or returns overflow, without a subdivision loop
+
+#### Scenario: Irreducible overflow
+- **WHEN** one question and its state overflow with no successful alternate
+- **THEN** that operation returns structured overflow without resending to the rejecting model; a later independent call is not suppressed by a rejection cache
+
+#### Scenario: Backend-specific limit
+- **WHEN** fallback changes from native to an LLM with a different declared window
+- **THEN** disclosed capacity belongs to that LLM and does not imply learned prediction or successful fit
+
+#### Scenario: Thinking level changes
+- **WHEN** thinking changes from low to high before an identical new judgment
+- **THEN** new inference uses high, without reusing a low-thinking answer
+
+#### Scenario: Smaller alternate cannot fit
+- **WHEN** the alternate also rejects complete input for size
+- **THEN** service returns overflow without cropping facts, borrowing primary limits or cycling back
+
+#### Scenario: Overflow followed by authentication failure
+- **WHEN** primary overflows but terminal alternate fails authentication
+- **THEN** final error describes authentication and does not authorize consumer overflow retries using a stale overflow flag
+
+### Requirement: Immutable stateless operation configuration
+Every `judge()`, availability and capacity query SHALL obtain current global settings at admission. One judgment SHALL freeze mode, both model slots, effective thinking, timeout policies and declared capacity overrides through setup, questions, repair and failover. Explicit caller options SHALL retain precedence. Later saves SHALL affect later operations through existing handles without restarting, cancelling or duplicating admitted work. Inspection SHALL remain free of inference and writes. Review resumes, checkpoints, cache invalidation and cross-call joining SHALL NOT be part of configuration refresh.
 
 #### Scenario: Existing service handle observes the next save
-- **WHEN** B retains a service handle, A completes a save selecting a different usable backend/model, and B then calls `judge()` through that same handle
-- **THEN** the call uses the new selection without reload or a configuration command in B, and reports the actual answering identity
+- **WHEN** a retained v2 handle is called after a settings save
+- **THEN** it uses the new selection without reload and reports the actual answering identity
 
-#### Scenario: Review spans an external edit
-- **WHEN** a review starts with configuration X and the file changes to Y between evidence stages
-- **THEN** stages, retries, any failover, result metadata and stored judgments retain X's settings and the identity of their respective backend attempt; the edit alone sends no replacement request
+#### Scenario: Judgment spans an external edit
+- **WHEN** settings change from X to Y between questions or during repair
+- **THEN** admitted work retains X and the edit sends no replacement request
 
 #### Scenario: New call overlaps old work
-- **WHEN** a judgment using X is still running and another judgment starts after configuration Y has been saved
-- **THEN** the new call uses Y while the existing call finishes using X, without one call mutating the other's settings
+- **WHEN** an X call is running and another starts after Y is saved
+- **THEN** each keeps its own settings and cancellation without sharing inference
 
 #### Scenario: Edit during backend discovery
-- **WHEN** a call captures X and the file changes to Y while model discovery or authentication is pending
-- **THEN** the call selects and reports its backend using X, without mixing X's mode or timeout with Y's model or thinking level
+- **WHEN** settings change during discovery or authentication
+- **THEN** selection, timing, thinking and result identity retain the admitted snapshot
 
 #### Scenario: Failure retains the operation identity
-- **WHEN** a call admitted with X ends in error after the file has changed to Y
-- **THEN** its structured error identifies candidates or attempts derived from X, not an unrelated model from Y
+- **WHEN** a call admitted with X fails after Y is saved
+- **THEN** its diagnostic identifies X's candidates, not Y's unrelated models
 
 #### Scenario: Availability is independently fresh
-- **WHEN** another session changes either model slot before B calls `availability()`
-- **THEN** B evaluates the current selected/default native and configured LLM candidates without a preceding judgment, inference request or settings mutation
+- **WHEN** model slots change before availability or capacity inspection
+- **THEN** inspection uses current selection without a priming judgment or settings mutation
 
 #### Scenario: Configured timeout and limits change
-- **WHEN** a new call starts after `timeoutMs` or applicable context-limit overrides change
-- **THEN** that call uses the new defaults while explicit caller overrides keep their precedence and older calls retain their earlier snapshot for both backend attempts
+- **WHEN** new idle/hard settings or declared capacity overrides change
+- **THEN** later calls observe them, caller overrides retain precedence and earlier calls keep their snapshot for both attempts
 
-#### Scenario: No stale cache or in-flight identity
-- **WHEN** identical questions are cached or in flight under one backend/model/thinking identity and a save selects a different identity before the next call
-- **THEN** the next call does not reuse or join the older identity's work or restore an incompatible review checkpoint
-
-#### Scenario: Unchanged settings still permit reuse
-- **WHEN** a new operation rereads settings yielding the same effective identity and an exact matching judgment is available
-- **THEN** it reuses that judgment under the existing policy without an extra provider request or a configuration-triggered branch reset
-
-#### Scenario: A resumed review uses current selection
-- **WHEN** a review returns and a later public `review()` call resumes the same evidence after the configured identity changes
-- **THEN** the later call uses current settings and reuses only checkpoints compatible with the selected identity
+#### Scenario: Unchanged settings still require independent inference
+- **WHEN** repeated calls have identical effective settings and input
+- **THEN** each performs new inference without a branch reset or cross-call join
 
 #### Scenario: Failover ignores an intervening settings save
-- **WHEN** an automatic call captures X, its preferred backend fails, and a save to Y changes the alternate model before failover starts
-- **THEN** the call uses X's alternate model, thinking level, timeout override and limits; the next public call observes Y
+- **WHEN** a call captures X and Y changes its alternate model before fallback
+- **THEN** fallback uses X's model, thinking, timing and capacity; the next call observes Y
 
-### Requirement: Automatic failover result isolation
-After automatic failover, final answers, dropped ids, backend/model identity, capacity and capacity-related input measurements SHALL describe the terminal backend attempt, not a mixture of both attempts. The alternate SHALL evaluate the complete logical request under its own confidence policy. A successful result SHALL contain no terminal `errorMessage` from the failed preferred attempt. If neither candidate succeeds, the result SHALL have no answers and SHALL describe both failures or unavailable candidates in a bounded, redacted `errorMessage`. If a model was resolved for the terminal attempt, its backend/model SHALL identify that attempt.
-
-Validated cached judgments and persisted review checkpoints from the first backend SHALL NOT be relabeled or reused as alternate-backend judgments. Reuse under the exact same backend/model/thinking identity SHALL remain supported. Review transport diagnostics SHALL account for actual attempts from both backends using existing observation and redaction rules, while final progress and unresolved questions SHALL describe the terminal attempt. Failed-attempt diagnostics SHALL NOT falsely claim that its partial judgments form part of a successful alternate result. Aborting one caller SHALL NOT cancel other callers' independently live work or make a cancelled caller start its alternate.
-
-Read-only selection and capacity queries SHALL describe the first currently usable candidate in the configured order, without inference or cache/settings mutation. They SHALL NOT promise that inference will succeed or predict runtime failover. Final results SHALL disclose the backend and capacity actually used by the terminal attempt, which can differ from the earlier query.
+### Requirement: Stateless failover result isolation
+Accepted answers, dropped ids, backend/model and capacity SHALL belong solely to the terminal attempt. Alternate success SHALL replace rather than merge primary partial answers and SHALL have no primary terminal error. Both-failed outcomes SHALL have empty answers and a bounded redacted summary of both candidates. Optional usage SHALL retain its stated reporting scope without implying complete transport billing across failures. Read-only queries SHALL describe the first usable candidate, not promise inference success. Historical judgments/checkpoints SHALL never seed an alternate. Cancellation SHALL remain local to each independent caller.
 
 #### Scenario: Partial primary results are not merged
-- **WHEN** the preferred backend answers one batch and fails later, and the alternate succeeds
-- **THEN** every final answer belongs to the alternate's complete evaluation, with its identity and capacity; preferred-backend answers are not spliced into the result
+- **WHEN** primary answers A but fails B and alternate answers both
+- **THEN** both final answers, policy and identity belong solely to alternate
 
 #### Scenario: Confidence follows the answering backend
-- **WHEN** an automatic operation fails over from classifier to LLM with numeric thresholds configured
-- **THEN** the successful LLM result ignores those thresholds and has no dropped ids; failover in the reverse direction applies the classifier's normal thresholds
+- **WHEN** fallback moves native to LLM with numeric thresholds configured
+- **THEN** LLM ignores them; reverse fallback applies native thresholds
 
-#### Scenario: Alternate has a compatible cache entry
-- **WHEN** the preferred backend fails and an exact alternate-backend judgment is already cached
-- **THEN** the alternate can reuse it without another inference request, but cannot use a preferred-backend cache entry
+#### Scenario: Historical alternate answer is not reused
+- **WHEN** a prior session has a matching alternate-model judgment
+- **THEN** fallback still runs fresh inference without restoring history
 
-#### Scenario: Review reports both attempts honestly
-- **WHEN** a review dispatches the preferred backend, fails over, and completes on the alternate
-- **THEN** existing transport diagnostics retain actual observable work from both attempts, while final answers, progress, unresolved ids and capacity describe the alternate
+#### Scenario: Usage does not fabricate attempt coverage
+- **WHEN** fallback succeeds after primary did observable work
+- **THEN** final answers describe alternate and any usage names its reporting scope, without claiming complete billing or observation coverage
 
 #### Scenario: Query and execution differ after failure
-- **WHEN** a read-only selection query reports the usable preferred candidate and a later automatic operation fails over after that candidate's inference fails
-- **THEN** the query has performed no inference and the operation reports the alternate's actual identity and capacity rather than the earlier prediction
+- **WHEN** a query reports primary and subsequent inference fails over
+- **THEN** query ran no inference and result identifies actual alternate and capacity
 
 #### Scenario: Failure message remains private
-- **WHEN** both candidates fail and provider errors contain credentials or raw response bodies
-- **THEN** the combined error identifies the two outcomes without exposing credentials or raw response bodies
+- **WHEN** both providers fail with credentials or raw bodies in their errors
+- **THEN** combined error identifies outcomes without exposing that content
 
-#### Scenario: Deprecated checkpoint seed is not replayed on the alternate
-- **WHEN** a `review()` call supplies the deprecated `checkpoint` seed, its preferred backend fails, and automatic failover would otherwise start the alternate
-- **THEN** the alternate is not dispatched; the call ends with `stopReason: "error"`, no answers, and an `errorMessage` stating that a checkpoint-seeded review cannot fail over and the complete input must be resubmitted without `checkpoint`
+#### Scenario: Legacy checkpoint input is rejected before dispatch
+- **WHEN** a caller supplies a removed checkpoint seed
+- **THEN** request validation rejects it before either backend runs and directs the caller to submit complete state without the legacy option
 
-#### Scenario: Joined caller cancellation remains local
-- **WHEN** two callers share compatible backend work and one cancels while the other remains live
-- **THEN** the cancelled caller returns aborted without failover and the other caller retains its own completion and failover eligibility
+#### Scenario: Independent caller cancellation remains local
+- **WHEN** two identical calls run and one cancels
+- **THEN** that call aborts without fallback while the other keeps its own completion and fallback eligibility

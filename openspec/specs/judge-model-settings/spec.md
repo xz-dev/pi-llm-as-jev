@@ -7,83 +7,135 @@ Lets the user independently select a compatible native classifier and an LLM cha
 ## Requirements
 
 ### Requirement: Configuration file
-Settings SHALL be read from the global `llm-as-jev.json` file in Pi's agent directory at the start of each configuration-dependent operation, not only at extension activation. It SHALL hold `mode` (`auto` | `auto-llm` | `classifier` | `llm`, default `auto`), optional `classifierModel` and independently configured LLM `model` as `provider/modelid` strings, LLM-only `thinkingLevel` as one of Pi's levels including `off`, and `timeoutMs`. Model references SHALL split on the first slash, retaining any remaining slashes in the model id. The file SHALL NOT inherit model or thinking settings from the main session.
+Settings SHALL remain in Pi's agent-directory `llm-as-jev.json`, read afresh at each configuration-dependent operation. `PI_CODING_AGENT_DIR` SHALL override the home-based directory; when `HOME` is unset, the OS home directory SHALL be used, with Windows separators supported. `mode` SHALL remain `auto` by default with `auto-llm`, `classifier` and `llm` alternatives. Independent `classifierModel`, chat `model`, `thinkingLevel` and exact-model `contextLimits` overrides SHALL remain supported. Model references SHALL split at the first slash; neither slot nor thinking SHALL inherit main-session settings. Missing native selection SHALL retain default Jev discovery, while explicit unknown selections SHALL stay unavailable instead of selecting another native model.
 
-An unreadable or invalid file SHALL be reported once per session and all known settings SHALL use defaults rather than partially accepting the invalid file or retaining a previous valid configuration. A missing file SHALL use defaults without an invalid-file warning. Unknown extra keys SHALL be preserved when saving and SHALL NOT alone invalidate a file. An unknown configured chat model SHALL be unavailable, with no main-session fallback. A syntactically valid explicit classifier absent from the catalog SHALL remain an unavailable explicit candidate, not be erased so that another native model can silently replace it. An omitted `classifierModel` SHALL retain the existing default Jev discovery.
+The existing `classifierBaseUrl` SHALL remain an optional HTTP(S) endpoint override requiring an explicit `classifierModel`. Only this service's selected model copy SHALL use the override; Pi's catalog SHALL remain unchanged and credentials SHALL still come from the selected provider. Trailing slashes SHALL be normalized; a trailing `/systemone` SHALL be removed from System One API bases only, because that adapter appends the path. The endpoint SHALL be frozen with admitted settings. Atomic saves SHALL retain it only while the same explicit classifier remains selected; changing or clearing that selection SHALL remove it. Capacity v2 SHALL use explicit limits or model metadata, not old built-in channel profiles.
 
-The existing optional `classifierBaseUrl` SHALL require an explicit `classifierModel` and a valid HTTP(S) URL. It SHALL override only the service-owned selected model copy, with selected-provider credentials and no catalog mutation. System One bases SHALL normalize trailing slashes and `/systemone`; other APIs SHALL retain that path. Saves SHALL retain the URL only while the same explicit classifier stays selected, removing it when that selection changes or clears. The version-two delta preserves this endpoint behavior while replacing timing and learned capacity semantics. If `HOME` is unset, the agent directory SHALL use the OS home directory with Windows separators supported.
+Timing SHALL be represented by optional `timeouts.classifier` and `timeouts.llm` objects, each containing optional `idleTimeoutMs` and `modelTimeoutMs`. Idle defaults SHALL be classifier **10,000 ms** and LLM **15,000 ms**. A missing `modelTimeoutMs` SHALL mean no hard limit. Supplied values SHALL be positive integers within the platform timer range. No combined-operation limit or host-HTTP-default inheritance SHALL be introduced. An explicit per-call option SHALL override that field for each model attempt independently. Configuration SHALL be frozen for admitted work and reread for later calls; runtime fallback SHALL not mutate settings.
 
-Each new operation SHALL obtain a fresh snapshot even after earlier successful reads, cache hits or configuration errors. Diagnostic suppression SHALL NOT suppress future reads or recovery. Operations in sessions sharing the same agent directory SHALL observe a save completed before the operation starts without a settings command, process restart or extension reload in the receiving session. Separate agent directories SHALL remain isolated. Refresh SHALL NOT rewrite the settings file or introduce background polling or watching while idle.
+The legacy top-level `timeoutMs` SHALL be recognized as requiring migration, not ignored as an unknown key or silently interpreted under different semantics. While it remains present, inference SHALL return an actionable configuration error without dispatch; read-only status SHALL identify the field and required explicit replacement. Settings inspection SHALL not rewrite the file. Users SHALL explicitly choose an idle override, a hard limit, or both when migrating; removing the legacy field uses the new defaults. No hard limit SHALL be inferred from an old value.
 
-`auto-llm` SHALL change only backend preference and automatic failover behavior, not create another model slot or implicitly configure an LLM. Omitting `mode` SHALL continue to select `auto`, including when an LLM is configured. Runtime failover SHALL NOT rewrite the mode or either model slot.
+For other malformed known fields or unreadable files, the existing all-known-fields-default behavior and once-per-session diagnostic SHALL remain; a missing file SHALL use defaults without warning. Unknown unrelated keys SHALL survive atomic patch saves. Error suppression SHALL not prevent rereading a repaired file. Shared-agent-directory sessions SHALL see completed saves on their next operation without polling, restart or reload; separate directories SHALL remain isolated. Confirmed model/mode saves SHALL preserve unrelated settings, including timeout slots, and cancellation SHALL not overwrite another session's save.
+
+#### Scenario: Classifier endpoint snapshot and catalog isolation
+- **WHEN** an explicit System One classifier uses `https://proxy.example/v1/systemone/` and settings change while its authentication is pending
+- **THEN** admitted work uses `https://proxy.example/v1`, the next operation reads the new endpoint and Pi's original catalog model remains unchanged
+
+#### Scenario: Endpoint validation and save retention
+- **WHEN** an endpoint is non-HTTP(S) or lacks an explicit classifier
+- **THEN** the file follows the all-known-fields-default rule; valid endpoints survive unrelated or same-classifier saves, but changing or clearing the classifier removes them
+
+#### Scenario: HOME unset
+- **WHEN** neither `PI_CODING_AGENT_DIR` nor `HOME` is set
+- **THEN** settings resolve under the OS home directory, including on Windows
+
+#### Scenario: Omitted timing settings
+- **WHEN** a valid configuration has no timeout objects
+- **THEN** native idle is 10,000 ms, LLM idle is 15,000 ms and both hard limits are absent
+
+#### Scenario: LLM-only hard limit
+- **WHEN** only `timeouts.llm.modelTimeoutMs` is set to 45000
+- **THEN** LLM attempts have a 45-second hard cap, native attempts remain uncapped, and idle defaults remain 10 and 15 seconds respectively
+
+#### Scenario: Caller override through fallback
+- **WHEN** a caller supplies `idleTimeoutMs: 5000` and `modelTimeoutMs: 20000`
+- **THEN** each attempted family independently gets those values from its own admission, with no shared 20-second deadline
+
+#### Scenario: Legacy timeout migration
+- **WHEN** the configuration contains top-level `timeoutMs`, including alongside new fields
+- **THEN** status explains the required migration and inference sends nothing until the ambiguity is removed, without rewriting settings or silently setting a hard cap
+
+#### Scenario: Invalid new timing value
+- **WHEN** a new timeout field is zero, negative, fractional or outside the timer range
+- **THEN** it follows the existing invalid-known-settings diagnostic/default behavior rather than disabling a timer
+
+#### Scenario: Independent slots and slash-containing model
+- **WHEN** the file contains native and LLM selections and a chat reference `provider/family/model`
+- **THEN** the full model id is `family/model`, each slot remains independent and no main-session setting changes
+
+#### Scenario: Live settings and recovery
+- **WHEN** another session sharing the directory saves new settings or repairs an invalid file
+- **THEN** the next operation observes them without restarting, while admitted work retains its earlier snapshot
+
+#### Scenario: Explicit unknown model
+- **WHEN** either explicit model reference is syntactically valid but unavailable
+- **THEN** it remains unavailable; it is not erased, replaced by another same-family model or inherited from the main session
+
+#### Scenario: Missing file or separate directory
+- **WHEN** the file is removed, or another session saves into a different agent directory
+- **THEN** the first case uses defaults without rewriting a file, and the second case leaves this session's configuration unchanged
+
+#### Scenario: Atomic unrelated save
+- **WHEN** a picker confirms an LLM model after another session changed native timeout settings
+- **THEN** the save preserves those timeout settings and unrelated keys; cancellation writes nothing and failed persistence publishes no tentative configuration
 
 #### Scenario: Valid file
 - **WHEN** the file sets `model: "anthropic/claude-sonnet-4-5"` and `thinkingLevel: "low"`
-- **THEN** an LLM backend attempt uses that model with low reasoning
+- **THEN** an LLM attempt uses that model with low reasoning and the applicable explicit/default timing settings
 
 #### Scenario: Independent native selection
 - **WHEN** the file also sets a compatible non-Jev `classifierModel`
-- **THEN** native requests use that classifier while LLM model/thinking settings remain unchanged
+- **THEN** native requests use that classifier without changing LLM model or thinking
 
 #### Scenario: Unknown chat model id
-- **WHEN** `model` names a chat model not in Pi's catalog
-- **THEN** the LLM is unavailable and the user is notified once; the main session model is not substituted
+- **WHEN** the configured chat model is absent from Pi's catalog
+- **THEN** it remains unavailable, the bounded diagnostic is shown and the main-session model is not substituted
 
 #### Scenario: Unknown explicit classifier id
-- **WHEN** `classifierModel` names an absent model and another native model is available
-- **THEN** the selection remains unavailable; automatic modes can use the configured LLM, while forced classifier mode errors instead of selecting that other native model
+- **WHEN** an explicit native reference is unavailable but another native model exists
+- **THEN** the reference remains selected; automatic mode can try its LLM alternate and forced mode errors
 
 #### Scenario: Invalid known field with otherwise valid fields
-- **WHEN** a file has a valid chat model but an invalid known mode, model-reference syntax, level or timeout
-- **THEN** all known settings use defaults and the invalid-file diagnostic is emitted once per session
+- **WHEN** a file has a valid chat reference but a malformed new timing field, mode or thinking level
+- **THEN** all known settings use defaults and the invalid-file diagnostic is bounded to once per session
 
 #### Scenario: Unreadable file
-- **WHEN** reading the global file fails for a reason other than a missing file
-- **THEN** configuration loading does not throw, uses defaults and reports the failure once per session
+- **WHEN** reading settings fails for a reason other than absence
+- **THEN** loading uses defaults without throwing and reports the failure once per session
 
 #### Scenario: Model id contains a slash
-- **WHEN** a model reference is `provider/family/model`
-- **THEN** provider is `provider` and the complete model id is `family/model`
+- **WHEN** the model reference is `provider/family/model`
+- **THEN** provider is `provider` and model id is `family/model`
 
 #### Scenario: Clear explicit classifier
-- **WHEN** the user removes `classifierModel` from the global file while a session is already running
-- **THEN** its next operation uses default Jev discovery for native selection without changing LLM model/thinking settings or requiring a new session
+- **WHEN** `classifierModel` is removed from a valid file during a session
+- **THEN** the next native selection uses default Jev discovery without changing LLM settings or reloading
 
 #### Scenario: Hand edit
-- **WHEN** the user completes a valid edit outside Pi while a session is already running
-- **THEN** that session's next configuration-dependent operation uses the new values without a settings command or reload
+- **WHEN** an external edit completes before a new operation
+- **THEN** that operation observes it without a settings command or restart
 
 #### Scenario: Two already-running sessions
-- **WHEN** sessions A and B share an agent directory and A successfully saves new settings after both sessions started
-- **THEN** B's next configuration-dependent operation observes those settings without repeating A's configuration action
+- **WHEN** sessions A and B share an agent directory and A completes a save
+- **THEN** B's next configuration-dependent operation observes that save without reconfiguration
 
 #### Scenario: Invalid configuration after a valid operation
-- **WHEN** a session has used valid settings and the file subsequently becomes invalid or unreadable
-- **THEN** the next operation uses defaults for all known settings, not the earlier valid settings, and diagnostic emission remains bounded to once per session
+- **WHEN** previously valid settings become unreadable or invalid, excluding the explicit legacy migration case
+- **THEN** the next operation uses defaults rather than stale or partially accepted settings
 
 #### Scenario: Recovery after a reported error
-- **WHEN** a session has already reported invalid settings and the file is repaired
-- **THEN** its next operation uses the repaired configuration even though the diagnostic has already been emitted
+- **WHEN** an invalid or migration-required file is repaired after its diagnostic was shown
+- **THEN** subsequent operations read the repaired settings despite diagnostic suppression
 
 #### Scenario: File removed after initial configuration
-- **WHEN** the configuration file is removed after a session has used explicit model settings
-- **THEN** its next operation uses defaults rather than retaining the removed selections, without creating a replacement file
+- **WHEN** the configured file is removed
+- **THEN** subsequent operations use defaults without writing a replacement
 
 #### Scenario: Independent agent directories
-- **WHEN** session A saves settings in a different agent directory from session B
-- **THEN** B continues to read only its own configuration file
+- **WHEN** a different agent directory receives a settings save
+- **THEN** this session continues to read only its own directory
 
 #### Scenario: Auto-llm is a valid persisted mode
-- **WHEN** an otherwise valid file sets `mode: "auto-llm"`
-- **THEN** the mode and independent model slots load without an invalid-file diagnostic, and subsequent judgments prefer the configured LLM
+- **WHEN** a valid file selects `auto-llm`
+- **THEN** operations prefer the configured LLM with native fallback without implicitly selecting a chat model
 
 #### Scenario: Default remains classifier-first
-- **WHEN** the file is absent or omits `mode`, including when an LLM model is configured
-- **THEN** effective mode is `auto`, not `auto-llm`, and no migration write is performed
+- **WHEN** mode is absent, even if a chat model is configured
+- **THEN** effective mode is `auto` and no migration write occurs
 
 #### Scenario: Failover leaves settings unchanged
-- **WHEN** an `auto-llm` operation succeeds on the classifier after an LLM failure
-- **THEN** the saved mode and both model slots remain unchanged and the next operation still starts with LLM preference
+- **WHEN** an automatic operation succeeds through its alternate
+- **THEN** mode and model slots remain unchanged and the next call starts with the configured preference
 
 ### Requirement: Model picker command
 The `/llm-as-jev llm` command SHALL open a searchable list of available chat models from Pi, ordered alphabetically by `provider/modelid`, with the currently configured LLM model preselected (not moved to the top) when present. Typing SHALL fuzzy-match ids or display names while retaining alphabetical order; arrow keys move, confirm selects, and cancel leaves file and in-memory configuration unchanged. Confirmed chat selection SHALL NOT change `classifierModel` or `mode`. The command SHALL continue to the existing thinking-level step and save the model and level only after both selections are confirmed. The bare `/llm-as-jev` command SHALL NOT open this picker.
@@ -283,3 +335,10 @@ A confirmed save SHALL update only the confirmed fields against the file read fo
 #### Scenario: Failed confirmation
 - **WHEN** a confirmed settings save fails
 - **THEN** the command reports failure without publishing the unsaved choice as active, and a subsequent operation reads the configuration actually on disk
+
+### Requirement: Waiting policy is inspectable
+The existing read-only overview SHALL show each backend's effective idle duration and hard duration or an explicit disabled indication. It SHALL identify legacy-timeout migration problems without inference, settings writes or a picker. Timing configuration SHALL remain file-based in this change; no new timing wizard or command hierarchy SHALL be required.
+
+#### Scenario: Default overview
+- **WHEN** status is shown with omitted timing settings
+- **THEN** classifier idle is shown as 10 seconds, LLM idle as 15 seconds, and both model hard limits as disabled
